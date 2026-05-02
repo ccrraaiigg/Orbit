@@ -36,10 +36,10 @@ install_for() {
     echo "symlinked components/$f"
   done
 
-  # Symlink lam.html
-  rm -f "$EXT_DIR/public/lam.html"
-  ln -s "$WEBSITE/public/lam.html" "$EXT_DIR/public/lam.html"
-  echo "symlinked lam.html"
+  # Symlink orbit.html
+  rm -f "$EXT_DIR/public/orbit.html"
+  ln -s "$WEBSITE/public/orbit.html" "$EXT_DIR/public/orbit.html"
+  echo "symlinked orbit.html"
 
   # Symlink vm.js
   rm -f "$DST_SQUEAKJS/vm.js"

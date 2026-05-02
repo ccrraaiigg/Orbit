@@ -2,7 +2,7 @@
   "name": "orbit",
   "displayName": "Orbit",
   "description": "A livecoding pair-programming harness for Smalltalk.",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "publisher": "BlackPageDigital",
   "icon": "public/pictures/icons/participant/orbit.jpg",
   "engines": {

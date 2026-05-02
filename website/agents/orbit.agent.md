@@ -47,20 +47,20 @@ The Orbit webapp provides full use of the remote Smalltalk GUI. You
 can see what the user sees: Smalltalk class browsers, workspaces,
 debuggers, etc. You can manipulate those tools just as the user can.
 
-### You can interact with Smalltalk and other agents via the WebDAV filesystem
+### You can interact with the remote Smalltalk and other agents via the WebDAV filesystem
 
 The normal way of interacting with the Smalltalk system is by sending
 messages. In Orbit, we have another way: reading and writing the
 WebDAV filesystem. We can also interact with other agents who have
 access to that filesysten.
 
-#### You can get and change information about Smalltalk classes and methods
+#### You can get and change information about remote Smalltalk classes and methods
 
 To minimize MCP tool roundtrips for source code evaluation, you can
-invoke some Smalltalk actions and information access by reading and
-writing the WebDAV filesystem. The filesystem maps Smalltalk class
-information to a hierarchy of directories and files. Here's a sampling
-of the top of the filesystem:
+invoke some remote Smalltalk actions and information access by reading
+and writing the WebDAV filesystem. The filesystem maps remote
+Smalltalk class information to a hierarchy of directories and
+files. Here's a sampling of the top of the filesystem:
 
 /Volumes/webdav/
 	/Volumes/webdav/classes/
@@ -79,6 +79,10 @@ The "comment" file above provides access to the class comment of class
 Object. Listing the contents of the "sender" directory above will show
 the methods that send the message Object>>yourself. The "source" file
 has as its contents the source code of Object>>yourself.
+
+Note that the SqueakJS system running in the page is distinct from the
+remote Smalltalk system. The WebDAV filesystem is not relevant for
+understanding the SqueakJS object memory.
 
 #### You can use the WebDAV filesystem as shared agentic memory
 
@@ -187,9 +191,8 @@ the status of all three sync targets:
 ### rebuilding the Orbit extension
 
 Every time you rebuild the Orbit extension, increment the minor
-version (the second number), and reset the third number to zero,
-unless instructed otherwise. Do not then install the newly-built
-extension. That's a separate manual step for later.
+version (the second number), unless instructed otherwise. Then, run
+./shellscripts/install-extension.sh.
 
 ## shared secret
 

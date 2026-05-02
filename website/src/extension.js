@@ -9,7 +9,7 @@ function activate(context) {
     const startCmd = vscode.commands.registerCommand('orbit.start', async () => {
         if (server) {
             const addr = server.address();
-            const url = `http://localhost:${addr.port}/lam.html`;
+            const url = `http://localhost:${addr.port}/orbit.html`;
             await vscode.commands.executeCommand('simpleBrowser.show', url);
             return;
         }
@@ -19,7 +19,7 @@ function activate(context) {
 
         server.listen(8089, () => {
             const addr = server.address();
-            const url = `http://localhost:${addr.port}/lam.html`;
+            const url = `http://localhost:${addr.port}/orbit.html`;
             vscode.window.showInformationMessage(`Orbit running on port ${addr.port}`);
             vscode.commands.executeCommand('simpleBrowser.show', url);
         });

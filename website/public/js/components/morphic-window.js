@@ -881,6 +881,11 @@ class MorphicWindow extends HTMLElement {
     outline.style.width = rect.width + 'px';
     outline.style.height = rect.height + 'px';
 
+    // Switch to cutout and fade contents out so the stale canvas
+    // doesn't show during the drag. Frame chrome remains visible.
+    this._setCutoutMode(true);
+    this._fadeContentsTo(0, this._scaledMs(150));
+
     this.setPointerCapture(e.pointerId);
     this._resizePointerId = e.pointerId;
     e.preventDefault();
@@ -936,7 +941,7 @@ class MorphicWindow extends HTMLElement {
     outline.style.height = height + 'px';
   }
 
-  _onResizePointerUp(e) {
+  async _onResizePointerUp(e) {
     if (!this._resizing) return;
     this._resizing = false;
     this.releasePointerCapture(this._resizePointerId);
@@ -969,6 +974,12 @@ class MorphicWindow extends HTMLElement {
         height: Math.round(newHeight) - titlebar - sideBorder
       });
     }
+
+    // Yield once so the VM has a chance to repaint at the new size
+    // before we fade the contents back in over the cutout.
+    await this._yieldToRenderer();
+    await this._fadeContentsTo(1, this._scaledMs(150));
+    this._setCutoutMode(false);
   }
 
   _onPointerMove(e) {
