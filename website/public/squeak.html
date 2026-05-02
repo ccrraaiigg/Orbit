@@ -1,0 +1,63 @@
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Lam 2300</title>
+
+    <link rel="icon"
+	  type="image/png"
+	  href="pictures/squeakjs.png">
+
+    <link rel="stylesheet"
+	  href="css/squeakjs.css"></head>
+
+  <body>
+    <canvas id="squeak"
+	    width="1000"
+	    height="400"
+	    style="visibility: 'invisible';
+		   overflow: hidden;
+		   position: absolute;
+		   top: 0px;
+		   left: 0px"></canvas>
+
+    <div id="sqSpinner">
+      <div></div></div>
+
+    <script src="js/squeakjs/squeak.js"></script>
+    <script src="js/html/utilities.js"></script>
+    <script src="js/zlib/bower_components/pako/dist/pako_inflate.min.js"></script>
+
+    <script>
+      window.top.timedOutCallbacks = []
+      
+      window.onload = function () {
+	var magicWindow,
+	    squeakDisplay,
+	    snapshot
+
+	const urlParams = new URLSearchParams(window.top.location.search)
+
+	snapshot = "caffeine"
+	
+	if (urlParams.has('snapshot'))
+	  snapshot = urlParams.get('snapshot')
+
+	console.log('Starting Snowglobe')
+
+	try {magicWindow = window.top.magicWindow}
+	catch (exception) {magicWindow = null}
+
+	squeakDisplay = (
+	  window.startCaffeine(
+	    squeak,
+	    snapshot,
+	    "SqueakV46",
+	    {
+              appID: "b7837a39-aead-40a9-818e-48bf196d55d9",
+              appName: "Lam2300"}))
+	
+	if (magicWindow) {magicWindow.squeakDisplay = squeakDisplay}}
+      </script>
+
+  </body>
+</html>

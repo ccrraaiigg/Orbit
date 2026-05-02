@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Editor backups
+*~
+*.swp
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# VS Code extension build output
+*.vsix
+
+# Logs
+logs/
+*.log

@@ -1,0 +1,19 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"chat.tools.terminal.autoApprove": {
+			"/^cd /Users/craig/me/behavior/forks/orbit/website && npm run package -- --allow-missing-repository$/": {
+				"approve": true,
+				"matchCommandLine": true
+			},
+			"/^cd /Users/craig/me/behavior/forks/orbit/website && npm run package$/": {
+				"approve": true,
+				"matchCommandLine": true
+			}
+		}
+	}
+}

@@ -1,0 +1,89 @@
+{
+  "name": "orbit",
+  "displayName": "Orbit",
+  "description": "A livecoding pair-programming harness for Smalltalk.",
+  "version": "0.12.0",
+  "publisher": "BlackPageDigital",
+  "icon": "public/pictures/icons/participant/orbit.jpg",
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "main": "./src/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "commands": [
+      {
+        "command": "orbit.start",
+        "title": "Orbit: Start"
+      },
+      {
+        "command": "orbit.stop",
+        "title": "Orbit: Stop"
+      },
+      {
+        "command": "orbit.openSteering",
+        "title": "Orbit: Open Steering"
+      }
+    ],
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "orbit.2300-backend",
+        "label": "2300 Backend"
+      }
+    ],
+    "chatParticipants": [
+      {
+        "id": "orbit.orbit",
+        "fullName": "Orbit",
+        "name": "orbit",
+        "description": "Orbit livecoding pair-programming agent for Smalltalk",
+        "isSticky": true
+      }
+    ],
+    "walkthroughs": [
+      {
+        "id": "orbit.getStarted",
+        "title": "Get Started with Orbit",
+        "description": "Set up your livecoding pair-programming environment for Smalltalk.",
+        "steps": [
+          {
+            "id": "orbit.startServer",
+            "title": "Start Orbit",
+            "description": "Launch the Orbit web server and open the integrated browser.\n\n[Start Orbit](command:orbit.start)",
+            "media": {
+              "image": "public/pictures/icons/participant/orbit.jpg",
+              "altText": "Orbit logo"
+            }
+          },
+          {
+            "id": "orbit.viewSteering",
+            "title": "View Steering Instructions",
+            "description": "Open the agent steering file that defines how Orbit behaves.\n\n[Open Steering](command:orbit.openSteering)",
+            "media": {
+              "image": "public/pictures/icons/participant/orbit.jpg",
+              "altText": "Orbit logo"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "scripts": {
+    "start": "node --inspect=9230 ./bin/www",
+    "package": "vsce package --allow-missing-repository --baseContentUrl ."
+  },
+  "dependencies": {
+    "cookie-parser": "~1.4.3",
+    "debug": "~2.6.9",
+    "express": "~4.16.0",
+    "http-errors": "~1.6.2",
+    "jade": "~1.11.0",
+    "morgan": "~1.9.0"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.0.0"
+  }
+}

@@ -1,0 +1,103 @@
+<html>
+  <head id="magic">
+
+    <title>Lam 2300</title>
+
+    <link rel="stylesheet"
+	  href="css/caffeine.css">
+
+    <script src="js/caffeine.js"></script>
+    <!-- <script type="module" src="https://unpkg.com/deep-chat@2.1.1/dist/deepChat.bundle.js"></script> -->
+    <script type="module" src="js/components/morphic-window.js"></script>
+    <script type="module" src="js/components/transient-window.js"></script>
+    <script type="module" src="js/components/icon-manager.js"></script>
+
+    <script>
+      document.addEventListener('keydown', function(e) {
+        if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Tab', 'Space'].indexOf(e.key) !== -1) {
+          e.preventDefault();
+        }
+      }, { passive: false });
+    </script>
+
+  </head>
+
+  <body bgcolor="black"
+	style="margin: 0px;">
+
+    <br>
+
+    <!--
+	
+	This is version 1.0 of the Orbit webapp. During a session, the
+	VisualWorks app and my window system collaborate, so that the
+	VisualWorks app can manipulate this web page, and the window
+	system can manipulate the VisualWorks app. Along with the
+	Orbit Store bundle in VisualWorks, I'm part of the Orbit
+	extension for Visual Studio Code. That extension also
+	configures access to a MCP server hosted by VisualWorks, and
+	that server has tools supporting managed remote method
+	execution. Finally, the Orbit bundle also provides a WebDAV
+	virtual filesystem, with which an agent can invoke actions,
+	access information about classes and methods, and share
+	agentic memory with itself, other agents, and human
+	pair-programmers.
+
+	The webapp has its own window, providing a webdev IDE, which
+	can be collapsed like any other window.
+
+	The window system is implemented with Caffeine
+	(caffeine.js.org), a webapp framework powered by SqueakJS
+	(squeak.js.org).
+    
+	Craig Latta
+	Black Page Digital
+	1 May 2026
+	
+      -->
+
+    <morphic-window id="embeddedSqueak"
+		    caption="Caffeine"
+		    style="pointer-events: all;
+			   top: 280;
+			   left: 120;
+			   opacity: 1;">
+
+      <center>
+	<iframe style="overflow: hidden;"
+		src="squeak.html"
+		id="Caffeine"
+		marginheight="0"
+		marginwidth="0"
+		width="1000"
+		height="400"
+		frameborder="0"
+		scrolling="no"
+		allowfullscreen></iframe></center></morphic-window>
+
+    <div id="dashboard"
+	 style="position: fixed;
+		right: 10px;
+		bottom: 10px;
+		z-index: 2000;
+		opacity: 0;
+		transition: opacity 2000ms;">
+
+      <div id="sqSpinner"
+	   style="position: absolute;
+		  right: 0px;
+		  bottom: 0px;
+		  width: 50px;
+		  height: 50px;
+		  opacity: 0;
+		  transition: opacity 500ms;">
+
+	<!-- no "spokes" div, so the spinner just glows -->
+
+      </div>
+
+      <icon-manager></icon-manager>
+
+    </div>
+  </body>
+</html>

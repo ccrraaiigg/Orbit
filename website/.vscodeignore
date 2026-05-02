@@ -1,0 +1,7 @@
+.vscode/**
+.vscode-test/**
+.git/**
+bin/**
+*.code-workspace
+README.txt
+CHANGELOG
