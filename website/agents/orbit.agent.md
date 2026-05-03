@@ -68,17 +68,16 @@ files. Here's a sampling of the top of the filesystem:
 			/Volumes/webdav/classes/Object/comment
 			/Volumes/webdav/classes/Object/subclasses/
 			/Volumes/webdav/classes/Object/methods/
-				/Volumes/webdav/classes/Object/methods/categories/
-					/Volumes/webdav/classes/Object/methods/categories/accessing/
-					/Volumes/webdav/classes/Object/methods/categories/accessing/yourself/
-					/Volumes/webdav/classes/Object/methods/categories/accessing/yourself/source
-					/Volumes/webdav/classes/Object/methods/categories/accessing/yourself/senders/
-					/Volumes/webdav/classes/Object/methods/categories/accessing/yourself/implementors/
+				/Volumes/webdav/classes/Object/methods/
+					/Volumes/webdav/classes/Object/methods/yourself/
 
 The "comment" file above provides access to the class comment of class
-Object. Listing the contents of the "sender" directory above will show
-the methods that send the message Object>>yourself. The "source" file
-has as its contents the source code of Object>>yourself.
+Object. The content of the "yourself" file above is the source code of
+Object>>yourself.
+
+Given the name of a class, it's helpful to know the superclasses of
+that class in order to traverse the classes hierarchy. You can use the
+"getClassHierarchy" tool for that.
 
 Note that the SqueakJS system running in the page is distinct from the
 remote Smalltalk system. The WebDAV filesystem is not relevant for

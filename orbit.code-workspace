@@ -13,6 +13,10 @@
 			"/^cd /Users/craig/me/behavior/forks/orbit/website && npm run package$/": {
 				"approve": true,
 				"matchCommandLine": true
+			},
+			"/^git remote -v && which gh$/": {
+				"approve": true,
+				"matchCommandLine": true
 			}
 		}
 	}
