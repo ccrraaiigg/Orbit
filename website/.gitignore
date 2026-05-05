@@ -1,2 +1,6 @@
 
 *.js~
+
+# Local secrets (e.g. GitHub OAuth App client secret) — never commit.
+secrets/*.json
+!secrets/*.example.json

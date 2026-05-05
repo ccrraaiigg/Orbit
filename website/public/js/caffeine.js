@@ -121,21 +121,65 @@ document.addEventListener('contextmenu', function(e) { e.preventDefault(); }, tr
 (function() {
   var hidden = false;
   var modifierOnly = { Meta: 1, Shift: 1, Alt: 1, Control: 1, CapsLock: 1 };
+  var attachedDocs = [];
 
-  document.addEventListener('keydown', function(e) {
+  function setHidden(v) {
+    hidden = v;
+    attachedDocs.forEach(function(d) {
+      d.documentElement.classList.toggle('cursor-hidden', v);
+    });
+  }
+
+  function onKeydown(e) {
     if (hidden || modifierOnly[e.key]) return;
-    document.documentElement.classList.add('cursor-hidden');
-    hidden = true;
-  }, true);
-
-  document.addEventListener('mousemove', function() {
+    setHidden(true);
+  }
+  function onMouseMove() {
     if (!hidden) return;
-    document.documentElement.classList.remove('cursor-hidden');
-    hidden = false;
-  }, true);
+    setHidden(false);
+  }
 
-  var style = document.createElement('style');
-  style.textContent = '.cursor-hidden, .cursor-hidden * { cursor: none !important; }';
-  document.head.appendChild(style);
+  function ensureStyle(doc) {
+    if (doc.__cursorHideStyleAttached) return;
+    doc.__cursorHideStyleAttached = true;
+    var style = doc.createElement('style');
+    style.textContent = '.cursor-hidden, .cursor-hidden * { cursor: none !important; }';
+    (doc.head || doc.documentElement).appendChild(style);
+  }
+  function attachToDoc(doc) {
+    if (!doc || doc.__cursorHideAttached) return;
+    doc.__cursorHideAttached = true;
+    attachedDocs.push(doc);
+    ensureStyle(doc);
+    doc.addEventListener('keydown', onKeydown, true);
+    doc.addEventListener('mousemove', onMouseMove, true);
+  }
+  function attachToIframe(iframe) {
+    var doc;
+    try { doc = iframe.contentDocument; } catch (_) { return; }
+    attachToDoc(doc);
+  }
+  function attachToAllIframes() {
+    document.querySelectorAll('iframe').forEach(function(iframe) {
+      // Re-attach on every load (iframe nav resets contentDocument).
+      iframe.addEventListener('load', function() { attachToIframe(iframe); });
+      attachToIframe(iframe);
+    });
+  }
+
+  attachToDoc(document);
+  attachToAllIframes();
+  window.addEventListener('load', attachToAllIframes);
+  document.addEventListener('DOMContentLoaded', attachToAllIframes);
+  new MutationObserver(function(muts) {
+    muts.forEach(function(m) {
+      m.addedNodes && m.addedNodes.forEach(function(n) {
+        if (n.tagName === 'IFRAME') {
+          n.addEventListener('load', function() { attachToIframe(n); });
+          attachToIframe(n);
+        }
+      });
+    });
+  }).observe(document.documentElement, { subtree: true, childList: true });
 })();
 

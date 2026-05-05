@@ -121,6 +121,8 @@ represented in JSON, you get that JSON representation. When it isn't,
 you get a remote object reference, in the form of an opaque large
 integer.
 
+There is no need to escape "<" and other HTML-related strings.
+
 #### You can detect and manipulate unhandled exceptions
 
 When source code you evaluate causes an unhandled exception, the

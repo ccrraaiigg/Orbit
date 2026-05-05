@@ -214,6 +214,10 @@ class MorphicWindow extends HTMLElement {
     this.style.removeProperty('background');
     this.style.backgroundColor = color;
     this.getBoundingClientRect();
+    // Don't leave 'transition: none' lingering on the host — later
+    // transitions (collapse fade, etc.) would be silently suppressed
+    // or concatenated into invalid values like 'none, opacity 250ms'.
+    this.style.removeProperty('transition');
   }
 
   async _fadeTransitionOverlayTo(opacity, durationMs) {
@@ -661,15 +665,6 @@ class MorphicWindow extends HTMLElement {
           pointer-events: none;
           z-index: -1;
         }
-        .resize-outline {
-          display: none;
-          position: fixed;
-          border: 4px dashed white;
-          box-shadow: 0 0 0 1px black, inset 0 0 0 1px black;
-          pointer-events: none;
-          z-index: 999999;
-          box-sizing: border-box;
-        }
       </style>
       <div class="titlebar">
         <svg class="btn" id="close-button" width="15" height="15" viewBox="0 0 15 15">
@@ -694,7 +689,6 @@ class MorphicWindow extends HTMLElement {
       </div>
       <img class="transition-overlay" alt="" aria-hidden="true" />
       <div class="content-bg"></div>
-      <div class="resize-outline"></div>
       <slot></slot>
     `;
   }
@@ -874,15 +868,9 @@ class MorphicWindow extends HTMLElement {
     var rect = this.getBoundingClientRect();
     this._resizeStartRect = { top: rect.top, left: rect.left, width: rect.width, height: rect.height };
 
-    var outline = this.shadowRoot.querySelector('.resize-outline');
-    outline.style.display = 'block';
-    outline.style.top = rect.top + 'px';
-    outline.style.left = rect.left + 'px';
-    outline.style.width = rect.width + 'px';
-    outline.style.height = rect.height + 'px';
-
     // Switch to cutout and fade contents out so the stale canvas
-    // doesn't show during the drag. Frame chrome remains visible.
+    // doesn't show during the drag. Frame chrome remains visible and
+    // is what the user sees being dragged/resized in real time.
     this._setCutoutMode(true);
     this._fadeContentsTo(0, this._scaledMs(150));
 
@@ -934,11 +922,12 @@ class MorphicWindow extends HTMLElement {
       }
     }
 
-    var outline = this.shadowRoot.querySelector('.resize-outline');
-    outline.style.top = top + 'px';
-    outline.style.left = left + 'px';
-    outline.style.width = width + 'px';
-    outline.style.height = height + 'px';
+    // Animate the cutout window itself by updating its geometry live.
+    this.style.transition = 'none';
+    this.style.left = left + 'px';
+    this.style.top = top + 'px';
+    this.style.width = width + 'px';
+    this.style.height = height + 'px';
   }
 
   async _onResizePointerUp(e) {
@@ -946,39 +935,43 @@ class MorphicWindow extends HTMLElement {
     this._resizing = false;
     this.releasePointerCapture(this._resizePointerId);
 
-    var outline = this.shadowRoot.querySelector('.resize-outline');
-    var newLeft = parseFloat(outline.style.left);
-    var newTop = parseFloat(outline.style.top);
-    var newWidth = parseFloat(outline.style.width);
-    var newHeight = parseFloat(outline.style.height);
-    outline.style.display = 'none';
+    // _onResizePointerMove pinned style.transition to 'none' on every
+    // move to prevent animating live geometry changes. Clear it now so
+    // later transitions (collapse fade, maximize, etc.) aren't blocked
+    // or concatenated into an invalid 'none, opacity 250ms' value.
+    this.style.removeProperty('transition');
 
-    // Apply the new geometry
-    this.style.left = newLeft + 'px';
-    this.style.top = newTop + 'px';
-    this.style.width = newWidth + 'px';
-    this.style.height = newHeight + 'px';
+    var newLeft = parseFloat(this.style.left);
+    var newTop = parseFloat(this.style.top);
+    var newWidth = parseFloat(this.style.width);
+    var newHeight = parseFloat(this.style.height);
 
     this.style.cursor = '';
 
-    // Call the resize callback with origin and canvas extent.
-    // Chrome (titlebar + side/bottom borders) is owned entirely by this
-    // component; the callback receives only the inner canvas dimensions.
+    // Chrome (titlebar + side/bottom borders) is owned entirely by
+    // this component; the callback receives only the inner canvas
+    // dimensions. The callback must invoke the `done` function when
+    // the remote resize has actually finished (e.g. after the
+    // SqueakJS VM has processed the WebSocket round-trip and
+    // repainted). The fade-in is held until `done` is called.
+    var remoteDonePromise = Promise.resolve();
     if (typeof this.onResizeComplete === 'function') {
       var sideBorder = this.sideBorderThickness();
       var titlebar = this.titlebarThickness();
+      var resolveDone;
+      remoteDonePromise = new Promise(function(resolve) { resolveDone = resolve; });
+      var done = function() { resolveDone(); };
       this.onResizeComplete({
         x: Math.round(newLeft) + sideBorder,
         y: Math.round(newTop) + titlebar,
         width: Math.round(newWidth) - 2 * sideBorder,
-        height: Math.round(newHeight) - titlebar - sideBorder
+        height: Math.round(newHeight) - titlebar - sideBorder,
+        done: done
       });
     }
 
-    // Yield once so the VM has a chance to repaint at the new size
-    // before we fade the contents back in over the cutout.
-    await this._yieldToRenderer();
-    await this._fadeContentsTo(1, this._scaledMs(150));
+    await remoteDonePromise;
+    await this._fadeContentsTo(1, this._scaledMs(350));
     this._setCutoutMode(false);
   }
 

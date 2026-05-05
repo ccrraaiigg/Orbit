@@ -2,9 +2,9 @@
 
 A livecoding pair-programming harness for Smalltalk in VSCode. It provides interactive remote access to Smalltalk, through Smalltalk's user interface, managed method execution, and a WebDAV virtual filesystem.
 
-## Architectural Details
+## Getting Started
 
-See [the Confluence page](https://lamrc.atlassian.net.mcas.ms/wiki/spaces/2FD/pages/668663889/Orbit+a+visual+agentic+workspace) for architectural details.
+To get started, run the "Orbit: Start" command, and use the @orbit agent.
 
 ## Steering
 
