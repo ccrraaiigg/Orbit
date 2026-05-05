@@ -19,10 +19,10 @@ classes, and handle exceptions in the running system.
   backend, giving the agent a `evaluate` tool for running Smalltalk
   expressions, plus tools for class/method introspection and
   refactoring.
-- **A WebDAV virtual filesystem** (mounted at `/Volumes/webdav/`) that
-  exposes the remote Smalltalk system as files and directories — class
-  comments, method source, senders, implementors, and a shared
-  `sessions/` area usable as agentic memory.
+- **A WebDAV virtual filesystem** that exposes the remote Smalltalk
+  system as files and directories — class comments, method source,
+  senders, implementors, and a shared `sessions/` area usable as
+  agentic memory.
 
 ## Repository layout
 
