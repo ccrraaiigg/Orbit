@@ -560,8 +560,6 @@ class MorphicWindow extends HTMLElement {
       titlebar.removeEventListener('pointermove', this._onPointerMove);
       titlebar.removeEventListener('pointerup', this._onPointerUp);
     }
-    this.removeEventListener('pointermove', this._onCursorMove, true);
-    this.removeEventListener('pointerleave', this._onCursorLeave, true);
     this.removeEventListener('pointermove', this._onResizePointerMove);
     this.removeEventListener('pointerup', this._onResizePointerUp);
     window.removeEventListener('resize', this._onViewportResize);
@@ -583,6 +581,16 @@ class MorphicWindow extends HTMLElement {
 
   _render() {
     var title = this.getAttribute('caption') || '';
+    // SVG url() cursors take a different NSCursor allocation path on macOS
+    // than the named system cursors and avoid the position-dependent
+    // invalidation flicker observed in Electron/VS Code on some machines.
+    // The NS and NWSE arrows are authored once; EW and NESW are rotations.
+    var nsArrow   = 'M12 2 L16.25 6.25 L13.13 6.25 L13.13 17.75 L16.25 17.75 L12 22 L7.75 17.75 L10.87 17.75 L10.87 6.25 L7.75 6.25 Z';
+    var nwseArrow = 'M5 5 L11 5 L8.8 7.2 L16.8 15.2 L19 13 L19 19 L13 19 L15.2 16.8 L7.2 8.8 L5 11 Z';
+    var arrowCursor = function (d, deg) {
+      var rot = deg ? ` transform='rotate(${deg} 12 12)'` : '';
+      return `url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'><path d='${d}'${rot} fill='black' stroke='white' stroke-width='1' stroke-linejoin='round'/></svg>") 12 12`;
+    };
     this.shadowRoot.innerHTML = `
       <style>
         :host {
@@ -665,6 +673,34 @@ class MorphicWindow extends HTMLElement {
           pointer-events: none;
           z-index: -1;
         }
+        .resize-zone {
+          position: absolute;
+          /* Small non-zero alpha forces participation in painting & hit-testing
+             across browsers/compositor states; pure transparent has been
+             observed to be optimized out, causing position-dependent cursor
+             flicker. The chosen alpha is below the human visibility threshold. */
+          background: rgba(0, 0, 0, 0.012);
+          z-index: 10;
+        }
+        /* SVG url() cursors take a different NSCursor allocation path on
+           macOS than the named system cursors and avoid the position-dependent
+           invalidation flicker observed in Electron/VS Code on some machines. */
+        .resize-zone.edge-top,
+        .resize-zone.edge-bottom { cursor: ${arrowCursor(nsArrow)}, ns-resize; }
+        .resize-zone.edge-left,
+        .resize-zone.edge-right  { cursor: ${arrowCursor(nsArrow, 90)}, ew-resize; }
+        .resize-zone.corner-tl,
+        .resize-zone.corner-br   { cursor: ${arrowCursor(nwseArrow)}, nwse-resize; }
+        .resize-zone.corner-tr,
+        .resize-zone.corner-bl   { cursor: ${arrowCursor(nwseArrow, 90)}, nesw-resize; }
+        .resize-zone.edge-top    { top: 0;    left: 7px;  right: 7px; height: 5px; }
+        .resize-zone.edge-bottom { bottom: 0; left: 7px;  right: 7px; height: 5px; }
+        .resize-zone.edge-left   { left: 0;   top: 7px;  bottom: 7px; width: 5px;  }
+        .resize-zone.edge-right  { right: 0;  top: 7px;  bottom: 7px; width: 5px;  }
+        .resize-zone.corner-tl   { top: 0;    left: 0;  width: 7px;  height: 7px; }
+        .resize-zone.corner-tr   { top: 0;    right: 0; width: 7px;  height: 7px; }
+        .resize-zone.corner-bl   { bottom: 0; left: 0;  width: 7px;  height: 7px; }
+        .resize-zone.corner-br   { bottom: 0; right: 0; width: 7px;  height: 7px; }
       </style>
       <div class="titlebar">
         <svg class="btn" id="close-button" width="15" height="15" viewBox="0 0 15 15">
@@ -690,6 +726,14 @@ class MorphicWindow extends HTMLElement {
       <img class="transition-overlay" alt="" aria-hidden="true" />
       <div class="content-bg"></div>
       <slot></slot>
+      <div class="resize-zone edge-top"    data-edges="t"></div>
+      <div class="resize-zone edge-bottom" data-edges="b"></div>
+      <div class="resize-zone edge-left"   data-edges="l"></div>
+      <div class="resize-zone edge-right"  data-edges="r"></div>
+      <div class="resize-zone corner-tl"   data-edges="tl"></div>
+      <div class="resize-zone corner-tr"   data-edges="tr"></div>
+      <div class="resize-zone corner-bl"   data-edges="bl"></div>
+      <div class="resize-zone corner-br"   data-edges="br"></div>
     `;
   }
 
@@ -698,36 +742,31 @@ class MorphicWindow extends HTMLElement {
     var titlebar = this.shadowRoot.querySelector('.titlebar');
     var buttons = this.shadowRoot.querySelectorAll('.btn');
 
-    // Pointerdown on side/bottom border brings window to front.
-    if (this._onBorderPointerDown) {
-      this.removeEventListener('pointerdown', this._onBorderPointerDown, true);
-    }
-
-    function isOnSideOrBottomBorder(ev) {
-      var rect = self.getBoundingClientRect();
-      var x = ev.clientX - rect.left;
-      var y = ev.clientY - rect.top;
-      var onSideBorder = x < 5 || x > (rect.width - 5);
-      var onBottomBorder = y > (rect.height - 5);
-      var onTopEdge = y >= 0 && y <= 5;
-      var outsideTitlebar = y >= 25;
-      return (outsideTitlebar && (onSideBorder || onBottomBorder)) || onTopEdge || (onSideBorder && y < 25);
-    }
-
-    // Capture-phase pointerdown so canvas event handlers cannot block edge raise.
-    this._onBorderPointerDown = function(e) {
-      if (isOnSideOrBottomBorder(e)) {
-        self._bringToFront();
-        self._startResize(e);
-      }
+    // Resize zones in the shadow DOM provide native CSS cursors and
+    // pointerdown handlers. Native cursor styles avoid the one-frame
+    // lag of setting host.style.cursor from a pointermove handler.
+    var edgesByCode = {
+      t:  { top: true,  bottom: false, left: false, right: false },
+      b:  { top: false, bottom: true,  left: false, right: false },
+      l:  { top: false, bottom: false, left: true,  right: false },
+      r:  { top: false, bottom: false, left: false, right: true  },
+      tl: { top: true,  bottom: false, left: true,  right: false },
+      tr: { top: true,  bottom: false, left: false, right: true  },
+      bl: { top: false, bottom: true,  left: true,  right: false },
+      br: { top: false, bottom: true,  left: false, right: true  }
     };
-    this.addEventListener('pointerdown', this._onBorderPointerDown, true);
-    this.removeEventListener('pointermove', this._onCursorMove, true);
-    this.removeEventListener('pointerleave', this._onCursorLeave, true);
+    this.shadowRoot.querySelectorAll('.resize-zone').forEach(function(zone) {
+      zone.addEventListener('pointerdown', function(e) {
+        if (self._isMaximized()) return;
+        var edges = edgesByCode[zone.dataset.edges];
+        if (!edges) return;
+        self._bringToFront();
+        self._startResizeWithEdges(e, edges);
+      });
+    });
+
     this.removeEventListener('pointermove', this._onResizePointerMove);
     this.removeEventListener('pointerup', this._onResizePointerUp);
-    this.addEventListener('pointermove', this._onCursorMove, true);
-    this.addEventListener('pointerleave', this._onCursorLeave, true);
     this.addEventListener('pointermove', this._onResizePointerMove);
     this.addEventListener('pointerup', this._onResizePointerUp);
 
@@ -822,7 +861,10 @@ class MorphicWindow extends HTMLElement {
     if (titlebar) titlebar.style.cursor = cursor || '';
   }
 
-  _onCursorLeave() {
+  _onCursorLeave(e) {
+    // Capture-phase pointerleave fires for descendants too (e.g. the
+    // slotted iframe). Only clear cursor when the host itself is left.
+    if (e && e.target !== this) return;
     if (!this._dragging && !this._resizing) {
       this.style.cursor = '';
       var titlebar = this.shadowRoot.querySelector('.titlebar');
@@ -859,6 +901,10 @@ class MorphicWindow extends HTMLElement {
   _startResize(e) {
     var edges = this._edgesForPoint(e.clientX, e.clientY);
     if (!edges) return false;
+    return this._startResizeWithEdges(e, edges);
+  }
+
+  _startResizeWithEdges(e, edges) {
     if (this._isMaximized()) return false;
 
     this._resizing = true;

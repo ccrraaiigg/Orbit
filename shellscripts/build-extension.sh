@@ -1,0 +1,74 @@
+#!/bin/sh
+# build-extension.sh — bump version, package a fresh VSIX, install it into
+# VS Code (Stable + Insiders if present), then replace selected installed
+# files with symlinks to the workspace source for livecoding.
+#
+# For symlink-only refresh against an existing VSIX install, use
+# install-extension.sh instead.
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+WEBSITE="$SCRIPT_DIR/../website"
+
+. "$SCRIPT_DIR/_symlink-extension.sh"
+
+# Bump the minor version (second number) in website/package.json before
+# packaging, unless SKIP_VERSION_BUMP is set. Uses an in-place regex edit
+# to preserve the file's existing formatting.
+if [ -z "$SKIP_VERSION_BUMP" ]; then
+  node -e "
+    const fs = require('fs');
+    const path = '$WEBSITE/package.json';
+    const src = fs.readFileSync(path, 'utf8');
+    const m = src.match(/(\"version\"\s*:\s*\")(\d+)\.(\d+)\.(\d+)(\")/);
+    if (!m) { throw new Error('version field not found'); }
+    const next = m[1] + m[2] + '.' + (Number(m[3]) + 1) + '.0' + m[5];
+    fs.writeFileSync(path, src.replace(m[0], next));
+    console.log('Bumped version to ' + (Number(m[3]) + 1) + '.0 (was ' + m[3] + '.' + m[4] + ')');
+  "
+fi
+
+VERSION="$(node -p "require('$WEBSITE/package.json').version")"
+PUBLISHER="$(node -p "require('$WEBSITE/package.json').publisher.toLowerCase()")"
+NAME="$(node -p "require('$WEBSITE/package.json').name")"
+VSIX="$WEBSITE/$NAME-$VERSION.vsix"
+
+# Package the extension into a .vsix.
+echo "=== Packaging $NAME-$VERSION ==="
+(cd "$WEBSITE" && npx --yes vsce package --allow-missing-repository --out "$VSIX")
+
+install_for() {
+  LABEL="$1"
+  CODE_BIN="$2"
+  EXT_ROOT="$3"
+
+  if [ ! -x "$CODE_BIN" ]; then
+    echo "Skipping $LABEL: $CODE_BIN not found"
+    return 0
+  fi
+
+  echo "=== Installing for $LABEL ==="
+  "$CODE_BIN" --install-extension "$VSIX" --force
+
+  EXT_DIR="$EXT_ROOT/$PUBLISHER.$NAME-$VERSION"
+  symlink_extension "$EXT_DIR" "$WEBSITE"
+
+  # Remove any older installed versions so VS Code can't fall back onto a
+  # stale extension dir whose symlinks may point at moved sources.
+  for d in "$EXT_ROOT/$PUBLISHER.$NAME-"*; do
+    [ -d "$d" ] || continue
+    [ "$d" = "$EXT_DIR" ] && continue
+    rm -rf "$d"
+    echo "removed stale $d"
+  done
+}
+
+install_for "VS Code" \
+  "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code" \
+  "$HOME/.vscode/extensions"
+
+install_for "VS Code Insiders" \
+  "/Applications/Visual Studio Code - Insiders.app/Contents/Resources/app/bin/code" \
+  "$HOME/.vscode-insiders/extensions"
+
+echo "Done. Reload the VS Code window(s) to pick up changes."

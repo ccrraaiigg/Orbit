@@ -193,7 +193,14 @@ the status of all three sync targets:
 
 Every time you rebuild the Orbit extension, increment the minor
 version (the second number), unless instructed otherwise. Then, run
-./shellscripts/install-extension.sh.
+./shellscripts/build-extension.sh, which bumps the version, packages
+a fresh VSIX, installs it, and re-establishes the livecoding
+symlinks.
+
+If you only need to repair the livecoding symlinks against the
+already-installed VSIX (e.g. after a manual reinstall overwrote
+them), run ./shellscripts/install-extension.sh instead. It does no
+build and no version bump.
 
 ## shared secret
 
