@@ -23,6 +23,13 @@
 // dragging) brings the window to the front. The send-to-back button moves
 // the window behind all siblings. The window background tints teal on hover.
 
+// Note: the resize-zone cursors use the platform's built-in `*-resize`
+// cursors. Many alternatives were tried (SVG url() data-URI cursors,
+// rotated SVG cursors, a `cursor: none` + JS-driven overlay <div>) to
+// work around an Electron-on-macOS NSCursor invalidation flicker that
+// shows the wrong cursor at certain border pixels. None defeated the
+// underlying bug; see /memories/orbit-electron-cursor-flicker.md.
+
 class MorphicWindow extends HTMLElement {
 
   static get observedAttributes() {
@@ -581,16 +588,6 @@ class MorphicWindow extends HTMLElement {
 
   _render() {
     var title = this.getAttribute('caption') || '';
-    // SVG url() cursors take a different NSCursor allocation path on macOS
-    // than the named system cursors and avoid the position-dependent
-    // invalidation flicker observed in Electron/VS Code on some machines.
-    // The NS and NWSE arrows are authored once; EW and NESW are rotations.
-    var nsArrow   = 'M12 2 L16.25 6.25 L13.13 6.25 L13.13 17.75 L16.25 17.75 L12 22 L7.75 17.75 L10.87 17.75 L10.87 6.25 L7.75 6.25 Z';
-    var nwseArrow = 'M5 5 L11 5 L8.8 7.2 L16.8 15.2 L19 13 L19 19 L13 19 L15.2 16.8 L7.2 8.8 L5 11 Z';
-    var arrowCursor = function (d, deg) {
-      var rot = deg ? ` transform='rotate(${deg} 12 12)'` : '';
-      return `url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'><path d='${d}'${rot} fill='black' stroke='white' stroke-width='1' stroke-linejoin='round'/></svg>") 12 12`;
-    };
     this.shadowRoot.innerHTML = `
       <style>
         :host {
@@ -682,17 +679,14 @@ class MorphicWindow extends HTMLElement {
           background: rgba(0, 0, 0, 0.012);
           z-index: 10;
         }
-        /* SVG url() cursors take a different NSCursor allocation path on
-           macOS than the named system cursors and avoid the position-dependent
-           invalidation flicker observed in Electron/VS Code on some machines. */
         .resize-zone.edge-top,
-        .resize-zone.edge-bottom { cursor: ${arrowCursor(nsArrow)}, ns-resize; }
+        .resize-zone.edge-bottom { cursor: ns-resize; }
         .resize-zone.edge-left,
-        .resize-zone.edge-right  { cursor: ${arrowCursor(nsArrow, 90)}, ew-resize; }
+        .resize-zone.edge-right  { cursor: ew-resize; }
         .resize-zone.corner-tl,
-        .resize-zone.corner-br   { cursor: ${arrowCursor(nwseArrow)}, nwse-resize; }
+        .resize-zone.corner-br   { cursor: nwse-resize; }
         .resize-zone.corner-tr,
-        .resize-zone.corner-bl   { cursor: ${arrowCursor(nwseArrow, 90)}, nesw-resize; }
+        .resize-zone.corner-bl   { cursor: nesw-resize; }
         .resize-zone.edge-top    { top: 0;    left: 7px;  right: 7px; height: 5px; }
         .resize-zone.edge-bottom { bottom: 0; left: 7px;  right: 7px; height: 5px; }
         .resize-zone.edge-left   { left: 0;   top: 7px;  bottom: 7px; width: 5px;  }
