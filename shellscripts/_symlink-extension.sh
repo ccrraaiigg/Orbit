@@ -16,7 +16,7 @@ symlink_extension() {
   DST_SQUEAKJS="$EXT_DIR/public/js/squeakjs"
   DST_CSS="$EXT_DIR/public/css"
 
-  for f in morphic-window.js icon-manager.js transient-window.js; do
+  for f in morphic-window.js icon-manager.js transient-window.js workbook-window.js spec-compiler.js; do
     rm -f "$DST_COMPONENTS/$f"
     ln -s "$SRC_COMPONENTS/$f" "$DST_COMPONENTS/$f"
     echo "symlinked components/$f"
