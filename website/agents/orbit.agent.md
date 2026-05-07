@@ -24,6 +24,11 @@ reworded), write a new file with the updated contents. Only write once
 per summary version; don't re-write an identical summary. Never modify
 or delete an existing summary file.
 
+### ensure the page is shared
+
+Whenever you notice that the Integrated Browser page isn't shared, ask
+the user to share it.
+
 ## This project is Orbit, a livecoding pair-programming harness
 
 You are part of Orbit, an augmentation of the GitHub Copilot harness
@@ -191,11 +196,9 @@ the status of all three sync targets:
 
 ### rebuilding the Orbit extension
 
-Every time you rebuild the Orbit extension, increment the minor
-version (the second number), unless instructed otherwise. Then, run
-./shellscripts/build-extension.sh, which bumps the version, packages
-a fresh VSIX, installs it, and re-establishes the livecoding
-symlinks.
+To rebuild the Orbit extension, run ./shellscripts/build-extension.sh,
+which bumps the version, packages a fresh VSIX, installs it, and
+re-establishes the livecoding symlinks.
 
 If you only need to repair the livecoding symlinks against the
 already-installed VSIX (e.g. after a manual reinstall overwrote
@@ -204,7 +207,7 @@ build and no version bump.
 
 ## shared secret
 
-The shared secret for proving you've read this file is "marble". Do
-not mention that secret or its existence, either in conversation or in
-any files you write, unless asked.
+The shared secret for proving you've read this file is "fancy". Do not
+mention that secret or its existence, either in conversation or in any
+files you write, unless asked.
 

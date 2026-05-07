@@ -77,6 +77,20 @@ exactly one line in the indicated form:
 
   `RETURNS_SELF: no-op; returns the receiver. Hook for override.`
 
+- **Subclass responsibility** — body's only effect is to send
+  `subclassResponsibility` to `self` (typically `^self subclassResponsibility`).
+  The method declares the selector as abstract; concrete behavior must
+  come from a subclass:
+
+  `SUBCLASS_RESPONSIBILITY: abstract; subclasses must implement this selector.`
+
+- **Should not implement** — body's only effect is to send
+  `shouldNotImplement` to `self` (typically `^self shouldNotImplement`).
+  The method explicitly disavows an inherited selector at this level
+  of the hierarchy:
+
+  `SHOULD_NOT_IMPLEMENT: explicitly disabled at this class; the inherited selector is not supported here.`
+
 The instance-variable name is the only fragment of the source you may
 reveal in these single-line replies — and only because the selector
 itself already names it. If the method does anything beyond the bare
@@ -85,6 +99,22 @@ copies, wraps in a guard, fires a `changed:`, mutates anything else,
 etc.) it is *not* a trivial accessor; produce the regular five-section
 summary and treat all body content under the usual confidentiality
 rule.
+
+# Primitive methods
+
+When the method body contains a `<primitive: ...>` pragma (numeric or
+named), it delegates to a VM primitive. The pragma itself is metadata,
+not implementation, and you may name the fact that the method is a
+primitive — and, if the primitive is named (e.g. `<primitive: 'add'>`
+or `<primitive: #basicNew>`), you may name it as well. You must NOT
+quote any non-pragma source from the fallback Smalltalk body, even
+when the primitive fails and falls back to it.
+
+Surface this signal explicitly in the **Effects** section of the
+five-section reply, e.g. "Delegates to a VM primitive (named `add`)
+that performs … ; the Smalltalk body serves as the failure fallback."
+If the entire purpose of the method is "invoke this primitive" and the
+fallback body is unremarkable, that is sufficient — do not pad.
 
 If a method is a one-liner that is neither a recognized trivial
 accessor nor amenable to abstract description, fall back to

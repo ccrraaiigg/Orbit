@@ -26,11 +26,12 @@
     <script src="js/squeakjs/squeak.js"></script>
     <script src="js/html/utilities.js"></script>
     <script src="js/zlib/bower_components/pako/dist/pako_inflate.min.js"></script>
+    <script src="js/orbit-version-check.js"></script>
 
     <script>
       window.top.timedOutCallbacks = []
-      
-      window.onload = function () {
+
+      window.onload = async function () {
 	var magicWindow,
 	    squeakDisplay,
 	    snapshot
@@ -38,9 +39,15 @@
 	const urlParams = new URLSearchParams(window.top.location.search)
 
 	snapshot = "caffeine"
-	
+
 	if (urlParams.has('snapshot'))
 	  snapshot = urlParams.get('snapshot')
+
+	// Detect new-version-of-extension by comparing zip-entry sizes;
+	// may prompt the user and erase the "squeak" IndexedDB before
+	// SqueakJS boots.
+	try {await window.orbitCheckCaffeineZipVersion()}
+	catch (e) {console.warn('orbit version check failed', e)}
 
 	console.log('Starting Snowglobe')
 
@@ -55,7 +62,7 @@
 	    {
               appID: "b7837a39-aead-40a9-818e-48bf196d55d9",
               appName: "Lam2300"}))
-	
+
 	if (magicWindow) {magicWindow.squeakDisplay = squeakDisplay}}
       </script>
 

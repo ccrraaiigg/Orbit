@@ -11,6 +11,7 @@
     <script type="module" src="js/components/morphic-window.js"></script>
     <script type="module" src="js/components/transient-window.js"></script>
     <script type="module" src="js/components/icon-manager.js"></script>
+    <script type="module" src="js/components/markdown-viewer.js"></script>
     <script src="js/orbit-paste.js"></script>
     <script src="js/orbit-clipboard.js"></script>
 
@@ -76,6 +77,14 @@
 		frameborder="0"
 		scrolling="no"
 		allowfullscreen></iframe></center></morphic-window>
+
+    <markdown-viewer url="docs/getting-started.md"
+		     caption="Getting Started with Orbit"
+		     style="position: absolute;
+			    top: 60px;
+			    left: 80px;
+			    width: 760px;
+			    height: 600px;"></markdown-viewer>
 
     <div id="dashboard"
 	 style="position: fixed;

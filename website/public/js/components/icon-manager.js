@@ -11,6 +11,7 @@ class IconManager extends HTMLElement {
     this._observer = null;
     this._refreshTimer = null;
     this._iconified = false;
+    this._suppressed = new WeakSet();
     this._hovering = false;
     this._altDown = false;
     this._lastPointerX = 0;
@@ -42,6 +43,7 @@ class IconManager extends HTMLElement {
         e.preventDefault();
         e.stopImmediatePropagation();
         self._iconified = false;
+        self._suppressed = new WeakSet();
         self.refresh();
         return;
       }
@@ -60,8 +62,7 @@ class IconManager extends HTMLElement {
       var cell = e.target.closest('.cell');
       if (!cell) return;
       var idx = parseInt(cell.dataset.windowIndex, 10);
-      var wins = Array.from(document.querySelectorAll('morphic-window'));
-      wins.sort(function(a, b) { return self._compareWindows(a, b); });
+      var wins = self._visibleWindows();
       if (wins[idx]) self._toggleWindow(wins[idx]);
     });
     listEl.addEventListener('pointerover', function(e) {
@@ -78,6 +79,14 @@ class IconManager extends HTMLElement {
     });
     this.refresh();
     this._bindWindowHoverTracking();
+
+    document.addEventListener('morphic-collapse', function(e) {
+      var win = e.target;
+      if (win && win.id === 'embeddedSqueak') {
+        self._suppressed.add(win);
+        self.refresh();
+      }
+    }, true);
   }
 
   disconnectedCallback() {
@@ -197,12 +206,17 @@ class IconManager extends HTMLElement {
     return document.getElementById('Morphic') || document.body;
   }
 
+  _visibleWindows() {
+    var self = this;
+    var wins = Array.from(document.querySelectorAll('morphic-window'));
+    wins = wins.filter(function(w) { return !self._suppressed.has(w); });
+    wins.sort(function(a, b) { return self._compareWindows(a, b); });
+    return wins;
+  }
+
   _windowForCell(cell) {
     var idx = parseInt(cell.dataset.windowIndex, 10);
-    var wins = Array.from(document.querySelectorAll('morphic-window'));
-    var self = this;
-    wins.sort(function(a, b) { return self._compareWindows(a, b); });
-    return wins[idx] || null;
+    return this._visibleWindows()[idx] || null;
   }
 
   _windowTitle(windowEl) {
@@ -396,8 +410,7 @@ class IconManager extends HTMLElement {
     var list = this.shadowRoot.querySelector('.list');
     if (!list) return;
 
-    var windows = Array.from(document.querySelectorAll('morphic-window'));
-    windows.sort((a, b) => this._compareWindows(a, b));
+    var windows = this._visibleWindows();
 
     list.innerHTML = '';
 
@@ -453,9 +466,7 @@ class IconManager extends HTMLElement {
   }
 
   _cellForWindow(windowEl) {
-    var windows = Array.from(document.querySelectorAll('morphic-window'));
-    var self = this;
-    windows.sort(function(a, b) { return self._compareWindows(a, b); });
+    var windows = this._visibleWindows();
     var idx = windows.indexOf(windowEl);
     if (idx < 0) return null;
     return this.shadowRoot.querySelector('.cell[data-window-index="' + idx + '"]');

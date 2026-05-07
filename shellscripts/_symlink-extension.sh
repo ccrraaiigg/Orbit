@@ -22,7 +22,7 @@ symlink_extension() {
     echo "symlinked components/$f"
   done
 
-  for f in orbit-paste.js orbit-clipboard.js caffeine.js; do
+  for f in orbit-paste.js orbit-clipboard.js caffeine.js orbit-version-check.js; do
     rm -f "$DST_JS/$f"
     ln -s "$SRC_JS/$f" "$DST_JS/$f"
     echo "symlinked js/$f"
@@ -31,6 +31,10 @@ symlink_extension() {
   rm -f "$EXT_DIR/public/orbit.html"
   ln -s "$WEBSITE/public/orbit.html" "$EXT_DIR/public/orbit.html"
   echo "symlinked orbit.html"
+
+  rm -f "$EXT_DIR/public/squeak.html"
+  ln -s "$WEBSITE/public/squeak.html" "$EXT_DIR/public/squeak.html"
+  echo "symlinked squeak.html"
 
   rm -f "$DST_SQUEAKJS/vm.js"
   ln -s "$SRC_SQUEAKJS/vm.js" "$DST_SQUEAKJS/vm.js"
@@ -75,6 +79,10 @@ EOF
     ln -s "$WEBSITE/routes/$f" "$EXT_DIR/routes/$f"
     echo "symlinked routes/$f"
   done
+
+  rm -rf "$EXT_DIR/bin"
+  ln -s "$WEBSITE/bin" "$EXT_DIR/bin"
+  echo "symlinked bin/"
 
   rm -rf "$EXT_DIR/secrets"
   ln -s "$WEBSITE/secrets" "$EXT_DIR/secrets"

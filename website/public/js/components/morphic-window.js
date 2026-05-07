@@ -63,6 +63,12 @@ class MorphicWindow extends HTMLElement {
     this._resizeStartX = 0;
     this._resizeStartY = 0;
     this.onResizeComplete = null; // callback: function({x, y, width, height})
+    // When true (default) the window switches to a chrome-only "cutout"
+    // and fades its contents out during a resize drag, restoring them
+    // when the drag ends. When false, contents stay visible and reflow
+    // live as the window geometry changes (suitable for HTML content
+    // such as <markdown-viewer>).
+    this.useCutout = true;
   }
 
   static _allWindows() {
@@ -642,6 +648,11 @@ class MorphicWindow extends HTMLElement {
         .title-text + .btn {
           margin-left: 3px;
         }
+        ::slotted([slot="titlebar-extras"]) {
+          margin-left: 3px;
+          margin-right: 12px;
+          flex-shrink: 0;
+        }
         .transition-overlay {
           position: absolute;
           top: 25px;
@@ -703,6 +714,7 @@ class MorphicWindow extends HTMLElement {
           <line x1="10.5" y1="4.5" x2="4.5" y2="10.5" stroke="white" stroke-width="1.5" stroke-linecap="round"/>
         </svg>
         <span class="title-text">${title}</span>
+        <slot name="titlebar-extras"></slot>
         <svg class="btn" id="send-to-back-button" width="15" height="15" viewBox="0 0 15 15">
           <circle cx="7.5" cy="7.5" r="6.5" fill="#5b86e5" stroke="#4a6fc0" stroke-width="0.5"/>
           <polyline points="4.5,6 7.5,10 10.5,6" fill="none" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
@@ -735,6 +747,12 @@ class MorphicWindow extends HTMLElement {
     var self = this;
     var titlebar = this.shadowRoot.querySelector('.titlebar');
     var buttons = this.shadowRoot.querySelectorAll('.btn');
+
+    // Modifier-click handling (cmd/opt/ctrl) is installed once per
+    // page at the window level so it runs before any per-instance
+    // capture-phase handlers in transient-window/workbook-window/etc.
+    MorphicWindow._installGlobalModifierClickHandler();
+    this._installIframeModifierClickHandlers();
 
     // Resize zones in the shadow DOM provide native CSS cursors and
     // pointerdown handlers. Native cursor styles avoid the one-frame
@@ -800,6 +818,15 @@ class MorphicWindow extends HTMLElement {
 
     // Drag by titlebar using pointer capture
     titlebar.addEventListener('pointerdown', function(e) {
+      // Don't start a drag for clicks on user-supplied titlebar extras
+      // (e.g. a markdown-viewer reload button slotted into the titlebar).
+      // Such elements opt out by carrying [data-no-drag] or by being
+      // assigned to the named titlebar-extras slot.
+      var t = e.target;
+      if (t && (t.closest && (t.closest('[data-no-drag]') ||
+                              t.closest('[slot="titlebar-extras"]')))) {
+        return;
+      }
       if (self._isMaximized()) {
         self._bringToFront();
         e.preventDefault();
@@ -911,8 +938,12 @@ class MorphicWindow extends HTMLElement {
     // Switch to cutout and fade contents out so the stale canvas
     // doesn't show during the drag. Frame chrome remains visible and
     // is what the user sees being dragged/resized in real time.
-    this._setCutoutMode(true);
-    this._fadeContentsTo(0, this._scaledMs(150));
+    // Skipped when useCutout is false so the contents (e.g. HTML)
+    // can reflow live during the drag.
+    if (this.useCutout) {
+      this._setCutoutMode(true);
+      this._fadeContentsTo(0, this._scaledMs(150));
+    }
 
     this.setPointerCapture(e.pointerId);
     this._resizePointerId = e.pointerId;
@@ -1011,8 +1042,10 @@ class MorphicWindow extends HTMLElement {
     }
 
     await remoteDonePromise;
-    await this._fadeContentsTo(1, this._scaledMs(350));
-    this._setCutoutMode(false);
+    if (this.useCutout) {
+      await this._fadeContentsTo(1, this._scaledMs(350));
+      this._setCutoutMode(false);
+    }
   }
 
   _onPointerMove(e) {
@@ -1041,6 +1074,156 @@ class MorphicWindow extends HTMLElement {
 
   toggleMaximize() {
     return this._toggleMaximize();
+  }
+
+  // Modifier-click model:
+  //   cmd-click  -> raise only
+  //   opt-click  -> collapse
+  //   ctrl-click -> drag (without raising)
+  //
+  // Installed once at the window level (capture phase) so it runs
+  // before per-instance pointerdown handlers (transient-window and
+  // workbook-window register raise-on-pointerdown listeners). Iframes
+  // get their own document-level installer because their pointerdown
+  // events never bubble out to the parent document.
+  static _installGlobalModifierClickHandler() {
+    if (window._morphicModifierClickInstalled) return;
+    var topHandler = function(e) {
+      MorphicWindow._handleModifierEvent(e, null);
+    };
+    // Both pointerdown and mousedown: on macOS, ctrl-click reports
+    // button=2 (right-click) and may be observed by other handlers
+    // listening to mousedown. We listen at capture phase on both.
+    window.addEventListener('pointerdown', topHandler, true);
+    window.addEventListener('mousedown', topHandler, true);
+    // Suppress the macOS ctrl-click contextmenu over windows.
+    window.addEventListener('contextmenu', function(e) {
+      if (!e.ctrlKey) return;
+      if (MorphicWindow._findWindowInPath(e.composedPath())) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+      }
+    }, true);
+    window._morphicModifierClickInstalled = true;
+  }
+
+  static _isWindowEl(el) {
+    return el && el.tagName &&
+      /^(morphic-window|transient-window|workbook-window)$/i.test(el.tagName);
+  }
+
+  static _findWindowInPath(path) {
+    for (var i = 0; i < path.length; i++) {
+      if (MorphicWindow._isWindowEl(path[i])) return path[i];
+    }
+    return null;
+  }
+
+  static _findWindowAncestor(el) {
+    var node = el;
+    while (node) {
+      if (MorphicWindow._isWindowEl(node)) return node;
+      node = node.parentElement || (node.getRootNode && node.getRootNode().host) || null;
+    }
+    return null;
+  }
+
+  static _handleModifierEvent(e, sourceIframe) {
+    var meta = !!e.metaKey, alt = !!e.altKey, ctrl = !!e.ctrlKey;
+    var n = (meta?1:0) + (alt?1:0) + (ctrl?1:0);
+    if (n !== 1) return;
+    // ctrl-click on macOS reports button=2 (secondary click). Allow
+    // that here; cmd/opt-click come through as button=0.
+    if (!ctrl && e.button !== 0) return;
+    var win = sourceIframe
+      ? MorphicWindow._findWindowAncestor(sourceIframe)
+      : MorphicWindow._findWindowInPath(e.composedPath());
+    if (!win) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    e.stopPropagation();
+    if (meta) { if (typeof win._bringToFront === 'function') win._bringToFront(); return; }
+    if (alt)  { if (typeof win.collapse === 'function') win.collapse(); return; }
+    if (ctrl) { MorphicWindow._startCtrlDrag(win, e, sourceIframe); return; }
+  }
+
+  static _startCtrlDrag(win, e, sourceIframe) {
+    if (win._isMaximized && win._isMaximized()) return;
+    var iframeOX = 0, iframeOY = 0;
+    if (sourceIframe) {
+      var r = sourceIframe.getBoundingClientRect();
+      iframeOX = r.left; iframeOY = r.top;
+    }
+    var startX = e.clientX + iframeOX;
+    var startY = e.clientY + iframeOY;
+    var rect = win.getBoundingClientRect();
+    var offX = startX - rect.left;
+    var offY = startY - rect.top;
+    win._ctrlDragging = true;
+    var prevSel = document.body.style.userSelect;
+    document.body.style.userSelect = 'none';
+    var allIframes = Array.from(document.querySelectorAll('iframe'));
+    var prevPE = allIframes.map(function(f) { return f.style.pointerEvents; });
+    allIframes.forEach(function(f) { f.style.pointerEvents = 'none'; });
+    var onMove = function(ev) {
+      if (!win._ctrlDragging) return;
+      ev.preventDefault();
+      var sd = (ev.target && ev.target.ownerDocument) || document;
+      var ox = 0, oy = 0;
+      if (sd !== document && sourceIframe) {
+        var r2 = sourceIframe.getBoundingClientRect();
+        ox = r2.left; oy = r2.top;
+      }
+      win.style.left = (ev.clientX + ox - offX) + 'px';
+      win.style.top  = (ev.clientY + oy - offY) + 'px';
+    };
+    var onUp = function() {
+      if (!win._ctrlDragging) return;
+      win._ctrlDragging = false;
+      window.removeEventListener('pointermove', onMove, true);
+      window.removeEventListener('pointerup', onUp, true);
+      if (sourceIframe) {
+        try {
+          sourceIframe.contentDocument.removeEventListener('pointermove', onMove, true);
+          sourceIframe.contentDocument.removeEventListener('pointerup', onUp, true);
+        } catch (_) {}
+      }
+      document.body.style.userSelect = prevSel;
+      allIframes.forEach(function(f, i) { f.style.pointerEvents = prevPE[i] || ''; });
+    };
+    window.addEventListener('pointermove', onMove, true);
+    window.addEventListener('pointerup', onUp, true);
+    if (sourceIframe) {
+      try {
+        sourceIframe.contentDocument.addEventListener('pointermove', onMove, true);
+        sourceIframe.contentDocument.addEventListener('pointerup', onUp, true);
+      } catch (_) {}
+    }
+  }
+
+  _installIframeModifierClickHandlers() {
+    var iframes = this.querySelectorAll('iframe');
+    iframes.forEach(function(iframe) {
+      var attach = function() {
+        var doc;
+        try { doc = iframe.contentDocument; } catch (_) { return; }
+        if (!doc) return;
+        if (doc._morphicModifierClickInstalled) return;
+        var pd = function(e) { MorphicWindow._handleModifierEvent(e, iframe); };
+        doc.addEventListener('pointerdown', pd, true);
+        doc.addEventListener('mousedown', pd, true);
+        doc.addEventListener('contextmenu', function(e) {
+          if (!e.ctrlKey) return;
+          if (MorphicWindow._findWindowAncestor(iframe)) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+          }
+        }, true);
+        doc._morphicModifierClickInstalled = true;
+      };
+      attach();
+      iframe.addEventListener('load', attach);
+    });
   }
 
   collapse() {

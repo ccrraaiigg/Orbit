@@ -2,7 +2,7 @@
     "name": "orbit-agentic-pair-programming-for-smalltalk",
     "displayName": "Orbit: Agentic Pair Programming for Smalltalk",
     "description": "A livecoding pair-programming harness for Smalltalk.",
-    "version": "0.42.0",
+    "version": "0.63.0",
     "publisher": "BlackPageDigital",
     "icon": "public/pictures/icons/participant/orbit.jpg",
     "engines": {
@@ -16,6 +16,7 @@
     ],
     "main": "./src/extension.js",
     "activationEvents": [
+	"onStartupFinished",
 	"onCommand:orbit.start",
 	"onCommand:orbit.stop",
 	"onCommand:orbit.openSteering",
@@ -23,6 +24,21 @@
 	"onChatParticipant:orbit.orbit"
     ],
     "contributes": {
+	"configuration": {
+	    "title": "Orbit",
+	    "properties": {
+		"orbit.autoStart": {
+		    "type": "boolean",
+		    "default": true,
+		    "description": "Automatically start the Orbit web server when VS Code starts. This lets browser tabs left open at the Orbit URL reconnect after a restart."
+		},
+		"orbit.mountWebdav": {
+		    "type": "boolean",
+		    "default": true,
+		    "description": "Mount the Orbit WebDAV filesystem when Orbit starts, and unmount it when Orbit stops. Mounts at /Volumes/webdav on macOS and W: on Windows."
+		}
+	    }
+	},
 	"commands": [
 	    {
 		"command": "orbit.start",
@@ -35,6 +51,36 @@
 	    {
 		"command": "orbit.openSteering",
 		"title": "Orbit: Open Steering"
+	    },
+	    {
+		"command": "orbit.runIsolatedSubagent",
+		"title": "Orbit: Run Isolated Subagent (Copilot CLI)"
+	    }
+	],
+	"languageModelTools": [
+	    {
+		"name": "orbit_runIsolatedSubagent",
+		"displayName": "Run Isolated Subagent (Copilot CLI)",
+		"modelDescription": "Spawn a GitHub Copilot CLI subprocess to perform a task with access to the Orbit MCP backend (and the spawned process's own tools). The subprocess is its own tool-calling harness, so intermediate tool calls and their outputs do NOT appear in the VSCode chat activity UI; only the subagent's final text response is returned to the orchestrator. USE FOR: tasks where intermediate tool outputs (e.g. fetched method source code) must remain hidden from the VSCode UI. The subagent's final text WILL be visible \u2014 only intermediate work is isolated.",
+		"userDescription": "Runs a GitHub Copilot CLI subprocess with isolated tool calls; only the final response surfaces.",
+		"canBeReferencedInPrompt": true,
+		"toolReferenceName": "orbitIsolatedSubagent",
+		"icon": "$(robot)",
+		"tags": ["orbit", "subagent"],
+		"inputSchema": {
+		    "type": "object",
+		    "required": ["prompt"],
+		    "properties": {
+			"prompt": {
+			    "type": "string",
+			    "description": "Detailed task description for the isolated subagent. Include all context the subagent needs; it does not share your conversation."
+			},
+			"model": {
+			    "type": "string",
+			    "description": "Optional Copilot CLI model name (e.g. 'gpt-5.4', 'claude-sonnet-4'). Omit to use the CLI default."
+			}
+		    }
+		}
 	    }
 	],
 	"mcpServerDefinitionProviders": [
