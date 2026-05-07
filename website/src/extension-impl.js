@@ -277,6 +277,11 @@ module.exports = function (vscode) {
 
     function activate(context) {
         const startCmd = vscode.commands.registerCommand('orbit.start', async () => {
+            try {
+                await vscode.commands.executeCommand('orbit.stop');
+            } catch (e) {
+                console.error('[orbit.start] orbit.stop failed:', e && e.message);
+            }
             await startServer(context, true);
             if (webdavMountEnabled()) await mountWebdav();
             // Best-effort: also start the Orbit MCP backend server so

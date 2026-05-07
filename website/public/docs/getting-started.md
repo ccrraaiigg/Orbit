@@ -1,32 +1,36 @@
 # Getting Started with Orbit
 
-Orbit is a livecoding pair-programming harness that lets you and an AI
-agent collaborate inside a running Smalltalk image — through VSCode,
-a web browser, and a shared filesystem.
+With Orbit, you can pair-program in Smalltalk with VSCode GitHub
+Copilot agents.
 
-## What Orbit gives you
+## You should already be connected
 
-- A **VSCode extension** that runs this Orbit webapp.
-- Remote Smalltalk GUI access.
-- An **MCP server** in the remote Smalltalk, so agents can evaluate
-  code, browse classes, and run tests through structured tools.
-- A **WebDAV virtual filesystem** mounted at `/Volumes/webdav/`
-  (macOS) or `W:` (Windows) that exposes the Smalltalk image as files:
-  classes, methods, comments, package contents, and a shared
-  `sessions/` area for agentic memory.
+When the Orbit extension starts, it connects to a preset remote
+Smalltalk. It configures access to an MCP server in that Smalltalk,
+and creates a network drive to it as well. If you don't already see
+the windows of your Smalltalk system reproduced here, something went
+wrong.
 
 ## Your first agent session
 
 The Copilot agent has access to the remote Smalltalk in three ways:
 
-- Direct manipulation of the Smalltalk GUI, through Playwright.
+- Direct manipulation of the Smalltalk GUI (through Playwright in this
+  web browser).
 - Execution of workspace methods in the remote Smalltalk, managed with
   capabilities.
-- Reading and writing the Smalltalk system through the WebDAV
-  filesystem.
+- Reading and writing the Smalltalk system through the network drive.
   
 You can discuss Smalltalk system tasks with the agent, just as you
 would with a fellow Smalltalk programmer.
+
+To see that the agent can access Smalltalk, try these prompts:
+
+"@orbit How many classes are in the system?"
+
+"@orbit Show me the source code for method 'do:' in class Collection."
+
+"@orbit Evaluate '3 + 4'."
 
 ### Subagents
 
@@ -38,7 +42,7 @@ that agents can use when creating subagents.
 
 ## Browsing the image as files
 
-The WebDAV mount makes the image feel like a directory tree:
+The network drive presents Smalltalk as a directory tree:
 
 ```
 /Volumes/webdav/
@@ -48,12 +52,12 @@ The WebDAV mount makes the image feel like a directory tree:
       subclasses/
       methods/
         yourself
-  sessions/        <- shared agentic memory
+  sessions/
 ```
 
 - Read `classes/<Class>/methods/<selector>` to get source code without
-  burning an MCP roundtrip.
-- Write to those same paths to install or patch methods.
+  using an MCP roundtrip.
+- Write to those same paths to compile methods.
 - Drop notes into `sessions/` so the next session — yours or another
   agent's — picks up where this one left off.
 

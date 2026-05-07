@@ -108,14 +108,16 @@ class MarkdownViewer extends HTMLElement {
     mw.setAttribute('caption', caption);
 
     // Reload button slotted into the titlebar, left of the right-side
-    // traffic-light cluster.
-    var reloadBtn = MarkdownViewer._buildReloadButton();
-    var self = this;
-    reloadBtn.addEventListener('click', function(e) {
-      e.stopPropagation();
-      self.reload();
-    });
-    mw.appendChild(reloadBtn);
+    // traffic-light cluster. Only shown on dev hosts (melody, rhythm).
+    if (MarkdownViewer._isDevHost()) {
+      var reloadBtn = MarkdownViewer._buildReloadButton();
+      var self = this;
+      reloadBtn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        self.reload();
+      });
+      mw.appendChild(reloadBtn);
+    }
 
     var content = document.createElement('div');
     content.className = 'markdown-viewer-content';
@@ -257,6 +259,18 @@ class MarkdownViewer extends HTMLElement {
   }
 
   // ---- statics ----
+
+  static _isDevHost() {
+    // The Orbit extension only adds the `?backend=192.168.1.140` query
+    // param when serving the page on the dev hosts (melody, rhythm).
+    // See orbitUrl() in website/src/extension-impl.js.
+    try {
+      var p = new URLSearchParams(location.search);
+      return p.get('backend') === '192.168.1.140';
+    } catch (_) {
+      return false;
+    }
+  }
 
   static _buildReloadButton() {
     var ns = 'http://www.w3.org/2000/svg';

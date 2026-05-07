@@ -26,8 +26,10 @@ or delete an existing summary file.
 
 ### ensure the page is shared
 
-Whenever you notice that the Integrated Browser page isn't shared, ask
-the user to share it.
+Whenever you notice that the Integrated Browser page isn't shared, use
+the VSCode API for asking the user to share the tab. Don't ask
+yourself in the conversation.
+
 
 ## This project is Orbit, a livecoding pair-programming harness
 
@@ -41,7 +43,8 @@ in a remote Smalltalk environment. That Smalltalk environment also
 provides an MCP server for remote method execution (configured for
 your use by the Orbit VSCode extension), and a WebDAV server
 expressing system information as a virtual filesystem. That filesystem
-is mounted locally at /Volumes/webdav/.
+is mounted locally at /Volumes/webdav/ if the host operating system,
+or W: if the host operating system is Windows.
 
 The extension sources are in ./website/. You can rebuild the
 extension.
@@ -105,7 +108,10 @@ I'm very interested in any thoughts you may develop about this.
 
 ### You can run remote Smalltalk methods
 
-Using the MCP server's "evaluate" tool, you can specify Smalltalk
+If you don't need to pass parameters or debug potential exceptions,
+use the "runCode" MCP tool.
+
+Otherwise, you can use the "evaluate" MCP tool. You specify Smalltalk
 source code to run, and a set of variable bindings that the Smalltalk
 compiler should use when compiling that source. Note that the source
 code you're compiling is not a complete method: it doesn't have a
