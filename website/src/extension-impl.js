@@ -279,6 +279,20 @@ module.exports = function (vscode) {
         const startCmd = vscode.commands.registerCommand('orbit.start', async () => {
             await startServer(context, true);
             if (webdavMountEnabled()) await mountWebdav();
+            // Best-effort: also start the Orbit MCP backend server so
+            // the user doesn't have to start it separately. The server
+            // id is `<extKey>/<label>`, where extKey is the lowercased
+            // extension identifier and label is the McpHttpServerDefinition
+            // label ('2300-backend').
+            try {
+                await vscode.commands.executeCommand(
+                    'workbench.mcp.startServer',
+                    'blackpagedigital.orbit-agentic-pair-programming-for-smalltalk/2300-backend',
+                    { autoTrustChanges: true }
+                );
+            } catch (e) {
+                console.error('[orbit] MCP startServer failed:', e && e.message);
+            }
         });
 
         const stopCmd = vscode.commands.registerCommand('orbit.stop', async () => {
@@ -301,6 +315,41 @@ module.exports = function (vscode) {
                 vscode.window.showInformationMessage('Orbit stopped.');
             } else {
                 vscode.window.showInformationMessage('Orbit is not running.');
+            }
+            // Close any browser tabs showing the Orbit page (Simple
+            // Browser viewType `mainThreadWebview-simpleBrowser.view`,
+            // or the new Integrated Browser editor with typeId
+            // `workbench.editor.browser`).
+            try {
+                const tabsToClose = [];
+                for (const group of vscode.window.tabGroups.all) {
+                    for (const tab of group.tabs) {
+                        const input = tab.input;
+                        const viewType = input && input.viewType;
+                        const editorId = input && (input.id || input.editorId);
+                        const ctorName = input && input.constructor && input.constructor.name;
+                        const label = (tab.label || '').toLowerCase();
+                        const matches =
+                            (viewType && /simpleBrowser|browser/i.test(viewType)) ||
+                            (editorId && /browser/i.test(editorId)) ||
+                            (ctorName && /browser/i.test(ctorName)) ||
+                            label.includes('orbit');
+                        console.log('[orbit.stop] tab', JSON.stringify({
+                            label: tab.label,
+                            viewType,
+                            editorId,
+                            ctorName,
+                            inputKeys: input ? Object.keys(input) : null,
+                            matches
+                        }));
+                        if (matches) tabsToClose.push(tab);
+                    }
+                }
+                if (tabsToClose.length) {
+                    await vscode.window.tabGroups.close(tabsToClose, true);
+                }
+            } catch (e) {
+                console.error('[orbit] closing browser tab failed:', e && e.message);
             }
             if (webdavMountEnabled()) await unmountWebdav();
         });

@@ -33,6 +33,15 @@ PUBLISHER="$(node -p "require('$WEBSITE/package.json').publisher.toLowerCase()")
 NAME="$(node -p "require('$WEBSITE/package.json').name")"
 VSIX="$WEBSITE/$NAME-$VERSION.vsix"
 
+# Remove any older packaged VSIX files so the workspace doesn't accumulate
+# stale builds.
+for old in "$WEBSITE/$NAME-"*.vsix; do
+  [ -f "$old" ] || continue
+  [ "$old" = "$VSIX" ] && continue
+  rm -f "$old"
+  echo "removed stale $old"
+done
+
 # Package the extension into a .vsix.
 echo "=== Packaging $NAME-$VERSION ==="
 (cd "$WEBSITE" && npx --yes vsce package --allow-missing-repository --out "$VSIX")
