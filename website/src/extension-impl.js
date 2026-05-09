@@ -23,6 +23,14 @@ module.exports = function (vscode) {
 
     let server = null;
 
+    // Timestamp (ms since epoch) of the most recent orbit.stop. Used to
+    // suppress an immediately-following orbit.start that fires when the
+    // welcome view re-renders the "Start Orbit" link under the same
+    // pointer/keyboard activation that just triggered Stop. Observed on
+    // Windows; harmless on other platforms.
+    let lastStopAt = 0;
+    const POST_STOP_START_SUPPRESSION_MS = 750;
+
     // MCP server visibility/availability. The MCP definition provider
     // returns the orbit backend definition only while `mcpEnabled` is
     // true; orbit.stop flips it to false and fires the change emitter
@@ -430,6 +438,14 @@ module.exports = function (vscode) {
         }
 
         const startCmd = vscode.commands.registerCommand('orbit.start', async () => {
+            const sinceStop = Date.now() - lastStopAt;
+            if (sinceStop < POST_STOP_START_SUPPRESSION_MS) {
+                console.log(
+                    '[orbit.start] suppressed: fired ' + sinceStop +
+                    'ms after orbit.stop (welcome-view re-render race)'
+                );
+                return;
+            }
             try {
                 await vscode.commands.executeCommand('orbit.stop');
             } catch (e) {
@@ -460,6 +476,7 @@ module.exports = function (vscode) {
         });
 
         const stopCmd = vscode.commands.registerCommand('orbit.stop', async () => {
+            lastStopAt = Date.now();
             if (server) {
                 server.close();
                 server = null;
@@ -610,6 +627,15 @@ module.exports = function (vscode) {
             });
             const maybeAutoStart = () => {
                 if (server) return;
+                const sinceStop = Date.now() - lastStopAt;
+                if (sinceStop < POST_STOP_START_SUPPRESSION_MS) {
+                    console.log(
+                        '[orbit] activity-bar auto-start suppressed: fired ' +
+                        sinceStop + 'ms after orbit.stop ' +
+                        '(welcome-view re-render visibility race)'
+                    );
+                    return;
+                }
                 startServer(context, true).catch((e) => {
                     console.error('[orbit] auto-start from activity bar failed:', e && e.message);
                 });
