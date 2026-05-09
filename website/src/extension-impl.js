@@ -23,6 +23,15 @@ module.exports = function (vscode) {
 
     let server = null;
 
+    // MCP server visibility/availability. The MCP definition provider
+    // returns the orbit backend definition only while `mcpEnabled` is
+    // true; orbit.stop flips it to false and fires the change emitter
+    // so VS Code drops the definition from its server list.
+    let mcpEnabled = true;
+    let mcpDefinitionsChanged = null;
+    const ORBIT_MCP_SERVER_ID =
+        'blackpagedigital.orbit-agentic-pair-programming-for-smalltalk/2300-backend';
+
     // ---- Clipboard bridge ------------------------------------------------
     // The VS Code Integrated Browser swallows Cmd+V and refuses
     // navigator.clipboard.readText. The Orbit webapp therefore GETs/POSTs
@@ -428,6 +437,12 @@ module.exports = function (vscode) {
             }
             await startServer(context, true);
             if (webdavMountEnabled()) addWebdavWorkspaceFolder();
+            // Re-publish the Orbit MCP definition (orbit.stop withdrew
+            // it) before asking VS Code to start the server.
+            if (!mcpEnabled) {
+                mcpEnabled = true;
+                if (mcpDefinitionsChanged) mcpDefinitionsChanged.fire();
+            }
             // Best-effort: also start the Orbit MCP backend server so
             // the user doesn't have to start it separately. The server
             // id is `<extKey>/<label>`, where extKey is the lowercased
@@ -436,7 +451,7 @@ module.exports = function (vscode) {
             try {
                 await vscode.commands.executeCommand(
                     'workbench.mcp.startServer',
-                    'blackpagedigital.orbit-agentic-pair-programming-for-smalltalk/2300-backend',
+                    ORBIT_MCP_SERVER_ID,
                     { autoTrustChanges: true }
                 );
             } catch (e) {
@@ -502,6 +517,20 @@ module.exports = function (vscode) {
                 console.error('[orbit] closing browser tab failed:', e && e.message);
             }
             if (webdavMountEnabled()) removeWebdavWorkspaceFolder();
+            // Stop the Orbit MCP backend connection and withdraw its
+            // definition so it disappears from the MCP servers list.
+            try {
+                await vscode.commands.executeCommand(
+                    'workbench.mcp.stopServer',
+                    ORBIT_MCP_SERVER_ID
+                );
+            } catch (e) {
+                console.error('[orbit.stop] MCP stopServer failed:', e && e.message);
+            }
+            if (mcpEnabled) {
+                mcpEnabled = false;
+                if (mcpDefinitionsChanged) mcpDefinitionsChanged.fire();
+            }
         });
 
         context.subscriptions.push(startCmd, stopCmd);
@@ -826,8 +855,11 @@ module.exports = function (vscode) {
         }
 
         try {
+            mcpDefinitionsChanged = new vscode.EventEmitter();
             const mcpProvider = vscode.lm.registerMcpServerDefinitionProvider('orbitBackend', {
+                onDidChangeMcpServerDefinitions: mcpDefinitionsChanged.event,
                 provideMcpServerDefinitions() {
+                    if (!mcpEnabled) return [];
                     return [
                         new vscode.McpHttpServerDefinition(
                             '2300-backend',
@@ -836,7 +868,7 @@ module.exports = function (vscode) {
                     ];
                 }
             });
-            context.subscriptions.push(mcpProvider);
+            context.subscriptions.push(mcpProvider, mcpDefinitionsChanged);
             console.log('[orbit] MCP provider registered');
         } catch (e) {
             console.error('[orbit] MCP provider registration failed:', e && e.message);
@@ -851,12 +883,61 @@ module.exports = function (vscode) {
                 .getConfiguration('orbit')
                 .get('autoStart', true);
             if (autoStart) {
-                startServer(context, false).catch((e) => {
+                // Open the browser tab if one isn't already open for
+                // the Orbit URL. (Reloads where the user had a tab
+                // open will already have it; we don't want to spawn
+                // a duplicate.)
+                let hasOrbitTab = false;
+                try {
+                    for (const group of vscode.window.tabGroups.all) {
+                        for (const tab of group.tabs) {
+                            const label = (tab.label || '').toLowerCase();
+                            const input = tab.input;
+                            const viewType = input && input.viewType;
+                            if (label.includes('orbit') ||
+                                (viewType && /simpleBrowser|browser/i.test(viewType))) {
+                                hasOrbitTab = true;
+                            }
+                        }
+                    }
+                } catch (_) {}
+                startServer(context, !hasOrbitTab).catch((e) => {
                     console.error('[orbit] auto-start failed:', e && e.message);
                 });
                 if (webdavMountEnabled()) {
                     try { addWebdavWorkspaceFolder(); }
                     catch (e) { console.error('[orbit] webdav folder add failed:', e && e.message); }
+                }
+                // Ensure the Orbit MCP backend is started too, so the
+                // user doesn't see it sitting in the MCP servers list
+                // in a stopped state. On a fresh window reload, VS
+                // Code hasn't yet enumerated this provider's
+                // definitions when activate() runs, so an immediate
+                // startServer call is a no-op. Retry a few times with
+                // a short delay until it takes effect.
+                try {
+                    if (!mcpEnabled) {
+                        mcpEnabled = true;
+                        if (mcpDefinitionsChanged) mcpDefinitionsChanged.fire();
+                    }
+                    const tryStart = (attempt) => {
+                        vscode.commands.executeCommand(
+                            'workbench.mcp.startServer',
+                            ORBIT_MCP_SERVER_ID,
+                            { autoTrustChanges: true }
+                        ).then(() => {
+                            console.log('[orbit] auto-start MCP startServer ok (attempt ' + attempt + ')');
+                        }, (e) => {
+                            console.error('[orbit] auto-start MCP startServer failed (attempt ' +
+                                attempt + '):', e && e.message);
+                            if (attempt < 5) {
+                                setTimeout(() => tryStart(attempt + 1), 500 * attempt);
+                            }
+                        });
+                    };
+                    setTimeout(() => tryStart(1), 500);
+                } catch (e) {
+                    console.error('[orbit] auto-start MCP failed:', e && e.message);
                 }
             }
         } catch (e) {
