@@ -70,7 +70,7 @@ and writing the WebDAV filesystem. The filesystem maps remote
 Smalltalk class information to a hierarchy of directories and
 files. Here's a sampling of the top of the filesystem:
 
-/Volumes/webdav/
+/Volumes/webdav/ (or W: on Microsoft Windows)
 	/Volumes/webdav/classes/
 		/Volumes/webdav/classes/Object/
 			/Volumes/webdav/classes/Object/comment
@@ -91,6 +91,10 @@ Note that the SqueakJS system running in the page is distinct from the
 remote Smalltalk system. The WebDAV filesystem is not relevant for
 understanding the SqueakJS object memory.
 
+We're getting some users reporting trouble mounting the WebDAV
+filesystem on Windows 11. For now, use the MCP tools first. Only use
+WebDAV when asked by the user.
+
 #### You can use the WebDAV filesystem as shared agentic memory
 
 In /Volumes/webdav/sessions/ (the session memory) you can externalize
@@ -108,11 +112,13 @@ I'm very interested in any thoughts you may develop about this.
 
 ### You can run remote Smalltalk methods
 
-If you don't need to pass parameters or debug potential exceptions,
-use the "runCode" MCP tool.
+If you don't need to pass parameters or debug potential unhandled
+exceptions, use the "runCode" MCP tool rather than the "evaluate" MCP
+tool.
 
-Otherwise, you can use the "evaluate" MCP tool. You specify Smalltalk
-source code to run, and a set of variable bindings that the Smalltalk
+If you do need to pass parameters or debug potential unhandled
+exceptions, use the "evaluate" MCP tool. You specify Smalltalk source
+code to run, and a set of variable bindings that the Smalltalk
 compiler should use when compiling that source. Note that the source
 code you're compiling is not a complete method: it doesn't have a
 method selector, only expressions. It's what a Smalltalk user would

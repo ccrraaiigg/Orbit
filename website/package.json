@@ -2,7 +2,7 @@
     "name": "orbit-agentic-pair-programming-for-smalltalk",
     "displayName": "Orbit: Agentic Pair Programming for Smalltalk",
     "description": "A livecoding pair-programming harness for Smalltalk.",
-    "version": "0.76.0",
+    "version": "0.94.0",
     "publisher": "BlackPageDigital",
     "icon": "public/pictures/icons/participant/orbit.jpg",
     "engines": {
@@ -20,8 +20,10 @@
 	"onCommand:orbit.start",
 	"onCommand:orbit.stop",
 	"onCommand:orbit.openSteering",
+	"onCommand:orbit.addWebdavFolder",
 	"onMcpServerDefinitionProvider:orbitBackend",
-	"onChatParticipant:orbit.orbit"
+	"onChatParticipant:orbit.orbit",
+	"onView:orbit.status"
     ],
     "contributes": {
 	"configuration": {
@@ -35,7 +37,7 @@
 		"orbit.mountWebdav": {
 		    "type": "boolean",
 		    "default": true,
-		    "description": "Mount the Orbit WebDAV filesystem when Orbit starts, and unmount it when Orbit stops. Mounts at /Volumes/webdav on macOS and W: on Windows."
+		    "description": "Add the Orbit WebDAV folder (orbit-webdav://) to the workspace when Orbit starts, and remove it when Orbit stops. Served by the in-process FileSystemProvider; no host-OS WebDAV client is required."
 		}
 	    }
 	},
@@ -55,6 +57,10 @@
 	    {
 		"command": "orbit.runIsolatedSubagent",
 		"title": "Orbit: Run Isolated Subagent (Copilot CLI)"
+	    },
+	    {
+		"command": "orbit.addWebdavFolder",
+		"title": "Orbit: Add WebDAV Folder to Workspace"
 	    }
 	],
 	"languageModelTools": [
@@ -96,6 +102,37 @@
 		"name": "orbit",
 		"description": "Orbit livecoding pair-programming agent for Smalltalk",
 		"isSticky": true
+	    }
+	],
+	"viewsContainers": {
+	    "activitybar": [
+		{
+		    "id": "orbit",
+		    "title": "Orbit",
+		    "icon": "public/pictures/icons/participant/orbit.svg"
+		}
+	    ]
+	},
+	"views": {
+	    "orbit": [
+		{
+		    "id": "orbit.status",
+		    "name": "Orbit",
+		    "icon": "public/pictures/icons/participant/orbit.svg",
+		    "contextualTitle": "Orbit"
+		}
+	    ]
+	},
+	"viewsWelcome": [
+	    {
+		"view": "orbit.status",
+		"contents": "Orbit pair-programs Smalltalk with you.\n\n[Start Orbit](command:orbit.start)",
+		"when": "!orbit.running"
+	    },
+	    {
+		"view": "orbit.status",
+		"contents": "Orbit pair-programs Smalltalk with you.\n\n[Stop Orbit](command:orbit.stop)",
+		"when": "orbit.running"
 	    }
 	],
 	"walkthroughs": [

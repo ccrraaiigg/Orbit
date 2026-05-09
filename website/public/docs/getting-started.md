@@ -1,4 +1,4 @@
-# Getting Started with Orbit
+# <img src="../pictures/icons/participant/orbit.jpg" alt="Orbit logo" height="48" style="vertical-align: middle; margin-right: 12px;" /> Getting Started with Orbit
 
 With Orbit, you can pair-program in Smalltalk with VSCode GitHub
 Copilot agents.
@@ -7,9 +7,9 @@ Copilot agents.
 
 When the Orbit extension starts, it connects to a preset remote
 Smalltalk. It configures access to an MCP server in that Smalltalk,
-and creates a network drive to it as well. If you don't already see
-the windows of your Smalltalk system reproduced here, something went
-wrong.
+and mounts Smalltalk as a network drive in your VSCode workspace. If
+you don't already see the windows of your Smalltalk system reproduced
+here, something went wrong.
 
 ## Your first agent session
 
@@ -45,7 +45,7 @@ that agents can use when creating subagents.
 The network drive presents Smalltalk as a directory tree:
 
 ```
-/Volumes/webdav/
+Smalltalk/
   classes/
     Object/
       comment

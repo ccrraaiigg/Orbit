@@ -23,85 +23,101 @@ module.exports = function (vscode) {
 
     let server = null;
 
-    // ---- WebDAV mount management (macOS + Windows) -----------------------
-    // The Smalltalk backend exposes a WebDAV server. We mount it locally
-    // so the user (and agents) can read/write Smalltalk classes as files.
-    //   macOS:   /Volumes/webdav  via AppleScript `mount volume` (no sudo;
-    //            volume name comes from the trailing URL path component).
-    //   Windows: W:               via `net use W: <url>` (requires the
-    //            WebClient service; usually running on Windows 11).
-    const WEBDAV_MAC_MOUNT = '/Volumes/webdav';
-    const WEBDAV_WIN_DRIVE = 'W:';
+    // ---- Clipboard bridge ------------------------------------------------
+    // The VS Code Integrated Browser swallows Cmd+V and refuses
+    // navigator.clipboard.readText. The Orbit webapp therefore GETs/POSTs
+    // /clipboard against the public Orbit origin; app-impl.js proxies
+    // those calls to a private localhost HTTP server we start here, which
+    // bridges to vscode.env.clipboard. The chosen port is written to
+    // <tmpdir>/orbit-clipboard.port for the proxy to discover.
+    const CLIPBOARD_PORT_FILE = path.join(os.tmpdir(), 'orbit-clipboard.port');
+    let clipboardServer = null;
 
+    function startClipboardBridge() {
+        if (clipboardServer) return;
+        const srv = http.createServer((req, res) => {
+            // Only accept loopback connections.
+            const remote = req.socket && req.socket.remoteAddress;
+            if (remote && remote !== '127.0.0.1' && remote !== '::1' && remote !== '::ffff:127.0.0.1') {
+                res.statusCode = 403;
+                res.end();
+                return;
+            }
+            if (req.url !== '/clipboard') {
+                res.statusCode = 404;
+                res.end();
+                return;
+            }
+            if (req.method === 'GET') {
+                Promise.resolve(vscode.env.clipboard.readText()).then((text) => {
+                    res.statusCode = 200;
+                    res.setHeader('content-type', 'application/json');
+                    res.end(JSON.stringify({ text: typeof text === 'string' ? text : '' }));
+                }, (err) => {
+                    res.statusCode = 500;
+                    res.setHeader('content-type', 'application/json');
+                    res.end(JSON.stringify({ error: String(err && err.message || err) }));
+                });
+                return;
+            }
+            if (req.method === 'POST') {
+                let chunks = '';
+                req.setEncoding('utf8');
+                req.on('data', (c) => { chunks += c; if (chunks.length > 16 * 1024 * 1024) req.destroy(); });
+                req.on('end', () => {
+                    let text = '';
+                    try {
+                        const parsed = chunks ? JSON.parse(chunks) : {};
+                        if (parsed && typeof parsed.text === 'string') text = parsed.text;
+                    } catch (_) {}
+                    Promise.resolve(vscode.env.clipboard.writeText(text)).then(() => {
+                        res.statusCode = 200;
+                        res.setHeader('content-type', 'application/json');
+                        res.end(JSON.stringify({ ok: true }));
+                    }, (err) => {
+                        res.statusCode = 500;
+                        res.setHeader('content-type', 'application/json');
+                        res.end(JSON.stringify({ error: String(err && err.message || err) }));
+                    });
+                });
+                return;
+            }
+            res.statusCode = 405;
+            res.end();
+        });
+        srv.on('error', (err) => {
+            console.error('[orbit] clipboard bridge error:', err && err.message);
+        });
+        srv.listen(0, '127.0.0.1', () => {
+            const port = srv.address().port;
+            try {
+                fs.writeFileSync(CLIPBOARD_PORT_FILE, String(port), { mode: 0o600 });
+            } catch (e) {
+                console.error('[orbit] failed to write clipboard port file:', e && e.message);
+            }
+            console.log('[orbit] clipboard bridge listening on 127.0.0.1:' + port);
+        });
+        clipboardServer = srv;
+    }
+
+    function stopClipboardBridge() {
+        if (clipboardServer) {
+            try { clipboardServer.close(); } catch (_) {}
+            clipboardServer = null;
+        }
+        try {
+            if (fs.existsSync(CLIPBOARD_PORT_FILE)) fs.unlinkSync(CLIPBOARD_PORT_FILE);
+        } catch (_) {}
+    }
+
+    // ---- WebDAV server endpoint ------------------------------------------
+    // The Smalltalk backend exposes a WebDAV server. The Orbit
+    // extension talks to it directly via the in-process
+    // FileSystemProvider (see src/webdav-fs.js); no host-OS WebDAV
+    // client is involved.
     function webdavUrl() {
         const host = isDevHost ? '192.168.1.140' : '127.0.0.1';
         return `http://${host}:19073/webdav`;
-    }
-
-    function isWebdavMounted() {
-        try {
-            if (process.platform === 'darwin') {
-                return fs.existsSync(WEBDAV_MAC_MOUNT);
-            }
-            if (process.platform === 'win32') {
-                return fs.existsSync(WEBDAV_WIN_DRIVE + '\\');
-            }
-        } catch (_) {}
-        return false;
-    }
-
-    function mountWebdav() {
-        return new Promise((resolve) => {
-            if (isWebdavMounted()) { resolve({ alreadyMounted: true }); return; }
-            const { exec } = require('child_process');
-            let cmd;
-            if (process.platform === 'darwin') {
-                const script = `mount volume "${webdavUrl()}"`;
-                cmd = `osascript -e ${JSON.stringify(script)}`;
-            } else if (process.platform === 'win32') {
-                // `net use` accepts http(s) URLs via the WebClient service.
-                cmd = `net use ${WEBDAV_WIN_DRIVE} ${webdavUrl()} /persistent:no`;
-            } else {
-                resolve({ skipped: 'unsupported-platform' });
-                return;
-            }
-            exec(cmd, (err, _stdout, stderr) => {
-                if (err) {
-                    vscode.window.showWarningMessage(
-                        `Orbit: WebDAV mount failed: ${(stderr || err.message).trim()}`
-                    );
-                    resolve({ error: err });
-                } else {
-                    resolve({ mounted: true });
-                }
-            });
-        });
-    }
-
-    function unmountWebdav() {
-        return new Promise((resolve) => {
-            if (!isWebdavMounted()) { resolve({ notMounted: true }); return; }
-            const { exec } = require('child_process');
-            let cmd;
-            if (process.platform === 'darwin') {
-                cmd = `/usr/sbin/diskutil unmount ${WEBDAV_MAC_MOUNT}`;
-            } else if (process.platform === 'win32') {
-                cmd = `net use ${WEBDAV_WIN_DRIVE} /delete /yes`;
-            } else {
-                resolve({ skipped: 'unsupported-platform' });
-                return;
-            }
-            exec(cmd, (err, _stdout, stderr) => {
-                if (err) {
-                    vscode.window.showWarningMessage(
-                        `Orbit: WebDAV unmount failed: ${(stderr || err.message).trim()}`
-                    );
-                    resolve({ error: err });
-                } else {
-                    resolve({ unmounted: true });
-                }
-            });
-        });
     }
 
     function webdavMountEnabled() {
@@ -110,6 +126,83 @@ module.exports = function (vscode) {
                 .getConfiguration('orbit')
                 .get('mountWebdav', true);
         } catch (_) { return true; }
+    }
+
+    // ---- WebDAV workspace folder management ------------------------------
+    // The Orbit extension registers an in-process FileSystemProvider for
+    // the orbit-webdav:// scheme (see src/webdav-fs.js). These helpers
+    // add/remove that scheme's root as a workspace folder so the user
+    // sees the Smalltalk-served tree in the Explorer without any host-OS
+    // WebDAV client. Adding a non-first workspace folder in a
+    // multi-root workspace does not restart the extension host.
+    const WEBDAV_WS_URI = 'orbit-webdav://orbit/';
+
+    function webdavWorkspaceFolderUri() {
+        return vscode.Uri.parse(WEBDAV_WS_URI);
+    }
+
+    function findWebdavWorkspaceFolderIndex() {
+        const folders = vscode.workspace.workspaceFolders || [];
+        for (let i = 0; i < folders.length; i++) {
+            if (folders[i].uri.scheme === 'orbit-webdav') return i;
+        }
+        return -1;
+    }
+
+    function addWebdavWorkspaceFolder() {
+        if (findWebdavWorkspaceFolderIndex() >= 0) return false;
+        const existing = vscode.workspace.workspaceFolders || [];
+        const ok = vscode.workspace.updateWorkspaceFolders(
+            existing.length, 0,
+            { uri: webdavWorkspaceFolderUri(), name: 'Smalltalk' }
+        );
+        if (ok) {
+            // The WebDAV tree is fully dynamic — every byte may change
+            // at any time on the Smalltalk side. Disable VS Code's
+            // background indexing/caching for this folder by setting
+            // folder-scoped excludes for search, file-watching, and
+            // problems, and disabling source-control scanning.
+            //
+            // We watch for the new folder to appear in workspaceFolders
+            // (updateWorkspaceFolders is asynchronous in effect) and
+            // apply settings once it's available.
+            const apply = () => {
+                const folder = (vscode.workspace.workspaceFolders || [])
+                    .find(f => f.uri.scheme === 'orbit-webdav');
+                if (!folder) return false;
+                const target = vscode.ConfigurationTarget.WorkspaceFolder;
+                const everything = { '**': true };
+                try {
+                    vscode.workspace.getConfiguration('search', folder.uri)
+                        .update('exclude', everything, target);
+                    vscode.workspace.getConfiguration('files', folder.uri)
+                        .update('watcherExclude', everything, target);
+                    vscode.workspace.getConfiguration('search', folder.uri)
+                        .update('useIgnoreFiles', false, target);
+                    vscode.workspace.getConfiguration('problems', folder.uri)
+                        .update('decorations.enabled', false, target);
+                    vscode.workspace.getConfiguration('git', folder.uri)
+                        .update('enabled', false, target);
+                    vscode.workspace.getConfiguration('git', folder.uri)
+                        .update('autoRepositoryDetection', false, target);
+                } catch (e) {
+                    console.error('[orbit] webdav folder settings failed:', e && e.message);
+                }
+                return true;
+            };
+            if (!apply()) {
+                const sub = vscode.workspace.onDidChangeWorkspaceFolders(() => {
+                    if (apply()) sub.dispose();
+                });
+            }
+        }
+        return ok;
+    }
+
+    function removeWebdavWorkspaceFolder() {
+        const idx = findWebdavWorkspaceFolderIndex();
+        if (idx < 0) return false;
+        return vscode.workspace.updateWorkspaceFolders(idx, 1);
     }
 
     // Output channel reused by the isolated-subagent feature so that
@@ -244,6 +337,12 @@ module.exports = function (vscode) {
     // Start the Orbit web server. If `openBrowser` is true, also reveal
     // the integrated browser at the orbit.html URL. Returns a promise that
     // resolves once the server is listening (or immediately if already up).
+    function setRunningContext(running) {
+        try {
+            vscode.commands.executeCommand('setContext', 'orbit.running', !!running);
+        } catch (_) {}
+    }
+
     function startServer(context, openBrowser) {
         return new Promise((resolve) => {
             if (server) {
@@ -260,6 +359,7 @@ module.exports = function (vscode) {
 
             server.listen(8089, () => {
                 const addr = server.address();
+                setRunningContext(true);
                 vscode.window.showInformationMessage(`Orbit running on port ${addr.port}`);
                 if (openBrowser) {
                     vscode.commands.executeCommand('simpleBrowser.show', orbitUrl(addr.port));
@@ -270,12 +370,56 @@ module.exports = function (vscode) {
             server.on('error', (err) => {
                 vscode.window.showErrorMessage(`Orbit server error: ${err.message}`);
                 server = null;
+                setRunningContext(false);
                 resolve();
             });
         });
     }
 
+    // Read the MCP/WebDAV bearer token from env or known files.
+    function readBearer(extensionPath) {
+        let bearer = (process.env.ORBIT_MCP_BEARER || '').trim();
+        if (!bearer && extensionPath) {
+            try {
+                const p = path.join(extensionPath, 'secrets', 'mcp-bearer.txt');
+                if (fs.existsSync(p)) bearer = fs.readFileSync(p, 'utf8').trim();
+            } catch (_) {}
+        }
+        if (!bearer) {
+            try {
+                const p = path.join(os.homedir(), '.orbit', 'mcp-bearer');
+                if (fs.existsSync(p)) bearer = fs.readFileSync(p, 'utf8').trim();
+            } catch (_) {}
+        }
+        return bearer;
+    }
+
     function activate(context) {
+        startClipboardBridge();
+        setRunningContext(false);
+
+        // Register the in-process WebDAV FileSystemProvider under the
+        // orbit-webdav:// scheme. This lets us add Smalltalk-served
+        // folders to the workspace without any host-OS WebDAV client.
+        try {
+            const createWebdavFs = require('./webdav-fs');
+            const { provider, scheme } = createWebdavFs(vscode, {
+                baseUrl: webdavUrl(),
+                getAuthHeader: () => {
+                    const b = readBearer(context.extensionPath);
+                    return b ? 'Bearer ' + b : null;
+                }
+            });
+            const reg = vscode.workspace.registerFileSystemProvider(scheme, provider, {
+                isCaseSensitive: true,
+                isReadonly: false
+            });
+            context.subscriptions.push(reg);
+            console.log('[orbit] webdav FileSystemProvider registered for ' + scheme + '://');
+        } catch (e) {
+            console.error('[orbit] webdav FS provider registration failed:', e && e.message);
+        }
+
         const startCmd = vscode.commands.registerCommand('orbit.start', async () => {
             try {
                 await vscode.commands.executeCommand('orbit.stop');
@@ -283,7 +427,7 @@ module.exports = function (vscode) {
                 console.error('[orbit.start] orbit.stop failed:', e && e.message);
             }
             await startServer(context, true);
-            if (webdavMountEnabled()) await mountWebdav();
+            if (webdavMountEnabled()) addWebdavWorkspaceFolder();
             // Best-effort: also start the Orbit MCP backend server so
             // the user doesn't have to start it separately. The server
             // id is `<extKey>/<label>`, where extKey is the lowercased
@@ -304,6 +448,7 @@ module.exports = function (vscode) {
             if (server) {
                 server.close();
                 server = null;
+                setRunningContext(false);
                 // Drop cached app.js and route modules so the next start
                 // picks up edits to those files. The workspace app.js and
                 // routes/*.js are reached via symlinks from the installed
@@ -356,7 +501,7 @@ module.exports = function (vscode) {
             } catch (e) {
                 console.error('[orbit] closing browser tab failed:', e && e.message);
             }
-            if (webdavMountEnabled()) await unmountWebdav();
+            if (webdavMountEnabled()) removeWebdavWorkspaceFolder();
         });
 
         context.subscriptions.push(startCmd, stopCmd);
@@ -367,6 +512,87 @@ module.exports = function (vscode) {
             vscode.commands.executeCommand('vscode.open', steeringPath);
         });
         context.subscriptions.push(openSteeringCmd);
+
+        // Command to add a folder served via the in-process WebDAV
+        // FileSystemProvider to the current workspace. Uses the
+        // orbit-webdav:// scheme registered above; no host-OS WebDAV
+        // client is required.
+        const addWebdavFolderCmd = vscode.commands.registerCommand('orbit.addWebdavFolder', async () => {
+            const subpath = await vscode.window.showInputBox({
+                title: 'Orbit: Add WebDAV Folder to Workspace',
+                prompt: 'Subpath under the WebDAV root. Leave blank to add the root.',
+                placeHolder: 'classes/Object',
+                ignoreFocusOut: true,
+                value: ''
+            });
+            if (subpath === undefined) return; // user cancelled
+            const cleaned = subpath.replace(/^[\\/]+/, '').replace(/[\\/]+$/, '');
+            const uriPath = '/' + cleaned;
+            const uri = vscode.Uri.parse('orbit-webdav://orbit' + uriPath);
+
+            // Probe the path so we fail fast with a useful message
+            // instead of silently adding a broken folder.
+            try {
+                await vscode.workspace.fs.stat(uri);
+            } catch (e) {
+                vscode.window.showErrorMessage(
+                    `Orbit: cannot access ${uri.toString()}: ${e && e.message || e}`
+                );
+                return;
+            }
+
+            const existing = vscode.workspace.workspaceFolders || [];
+            const already = existing.find(f => f.uri.toString() === uri.toString());
+            if (already) {
+                vscode.window.showInformationMessage(
+                    `Orbit: ${uri.toString()} is already in the workspace.`
+                );
+                return;
+            }
+            const name = cleaned ? `Smalltalk:${cleaned}` : 'Smalltalk';
+            const ok = vscode.workspace.updateWorkspaceFolders(
+                existing.length, 0, { uri, name }
+            );
+            if (!ok) {
+                vscode.window.showErrorMessage(
+                    `Orbit: failed to add ${uri.toString()} to the workspace.`
+                );
+            }
+        });
+        context.subscriptions.push(addWebdavFolderCmd);
+
+        // Activity Bar view: register a minimal TreeDataProvider for
+        // `orbit.status`. Welcome content (declared in package.json)
+        // shows a single Start/Stop button driven by the
+        // `orbit.running` context key, which we maintain below.
+        // When the view first becomes visible (the user clicked the
+        // Orbit icon in the activity bar), auto-start Orbit if it
+        // isn't already running. Once the user has explicitly stopped
+        // it via the Stop Orbit button, they'll restart it from the
+        // same view, so we only auto-start if the server isn't up.
+        try {
+            const treeDataProvider = {
+                getTreeItem: (el) => el,
+                getChildren: () => []
+            };
+            const treeView = vscode.window.createTreeView('orbit.status', {
+                treeDataProvider,
+                showCollapseAll: false
+            });
+            const maybeAutoStart = () => {
+                if (server) return;
+                startServer(context, true).catch((e) => {
+                    console.error('[orbit] auto-start from activity bar failed:', e && e.message);
+                });
+            };
+            if (treeView.visible) maybeAutoStart();
+            const visSub = treeView.onDidChangeVisibility((e) => {
+                if (e.visible) maybeAutoStart();
+            });
+            context.subscriptions.push(treeView, visSub);
+        } catch (e) {
+            console.error('[orbit] activity bar view registration failed:', e && e.message);
+        }
 
         // Ad-hoc command: prompt the user for a task and run an isolated
         // Copilot CLI subagent. Output streams to the "Orbit Subagent"
@@ -629,9 +855,8 @@ module.exports = function (vscode) {
                     console.error('[orbit] auto-start failed:', e && e.message);
                 });
                 if (webdavMountEnabled()) {
-                    mountWebdav().catch((e) => {
-                        console.error('[orbit] webdav mount failed:', e && e.message);
-                    });
+                    try { addWebdavWorkspaceFolder(); }
+                    catch (e) { console.error('[orbit] webdav folder add failed:', e && e.message); }
                 }
             }
         } catch (e) {
@@ -640,14 +865,14 @@ module.exports = function (vscode) {
     }
 
     function deactivate() {
+        stopClipboardBridge();
         if (server) {
             server.close();
             server = null;
+            setRunningContext(false);
         }
         if (webdavMountEnabled()) {
-            // Best-effort; deactivate cannot reliably await async work,
-            // but diskutil unmount is fast enough to usually complete.
-            unmountWebdav().catch(() => {});
+            try { removeWebdavWorkspaceFolder(); } catch (_) {}
         }
     }
 
