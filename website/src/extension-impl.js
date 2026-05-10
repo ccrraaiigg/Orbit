@@ -11,6 +11,37 @@ module.exports = function (vscode) {
     const fs = require('fs');
     const os = require('os');
 
+    // Dedicated output channel. All [orbit]-tagged log calls go
+    // through orbitLog/orbitError, which write to both this channel
+    // and console. The channel is created lazily on first log so
+    // helpers used before activate() (e.g. during module init) don't
+    // crash; activate() makes it visible by default.
+    let outputChannel = null;
+    function ensureOutputChannel() {
+        if (!outputChannel) {
+            try { outputChannel = vscode.window.createOutputChannel('Orbit'); }
+            catch (_) { /* test/headless environments */ }
+        }
+        return outputChannel;
+    }
+    function fmtArg(a) {
+        if (a === null || a === undefined) return String(a);
+        if (typeof a === 'string') return a;
+        if (a instanceof Error) return a.stack || a.message || String(a);
+        try { return JSON.stringify(a); }
+        catch (_) { return String(a); }
+    }
+    function orbitLog(...args) {
+        try { console.log(...args); } catch (_) {}
+        const ch = ensureOutputChannel();
+        if (ch) ch.appendLine(args.map(fmtArg).join(' '));
+    }
+    function orbitError(...args) {
+        try { console.error(...args); } catch (_) {}
+        const ch = ensureOutputChannel();
+        if (ch) ch.appendLine('[error] ' + args.map(fmtArg).join(' '));
+    }
+
     const devHosts = new Set(['melody', 'rhythm']);
     const shortHostname = os.hostname().split('.')[0].toLowerCase();
     const isDevHost = devHosts.has(shortHostname);
@@ -23,13 +54,49 @@ module.exports = function (vscode) {
 
     let server = null;
 
-    // Timestamp (ms since epoch) of the most recent orbit.stop. Used to
-    // suppress an immediately-following orbit.start that fires when the
-    // welcome view re-renders the "Start Orbit" link under the same
-    // pointer/keyboard activation that just triggered Stop. Observed on
-    // Windows; harmless on other platforms.
-    let lastStopAt = 0;
-    const POST_STOP_START_SUPPRESSION_MS = 750;
+    // True if there is currently a VS Code editor tab showing the
+    // Orbit page (Simple Browser or Integrated Browser). Uses the
+    // same heuristic as orbit.stop's tab-closing logic.
+    function findOrbitTabs() {
+        const found = [];
+        try {
+            for (const group of vscode.window.tabGroups.all) {
+                for (const tab of group.tabs) {
+                    const label = (tab.label || '').toLowerCase();
+                    const input = tab.input;
+                    const viewType = input && input.viewType;
+                    const editorId = input && (input.id || input.editorId);
+                    const ctorName = input && input.constructor && input.constructor.name;
+                    const matches =
+                        (viewType && /simpleBrowser|browser/i.test(viewType)) ||
+                        (editorId && /browser/i.test(editorId)) ||
+                        (ctorName && /browser/i.test(ctorName)) ||
+                        label.includes('orbit');
+                    if (matches) found.push(tab);
+                }
+            }
+        } catch (_) {}
+        return found;
+    }
+    function hasOrbitTab() {
+        return findOrbitTabs().length > 0;
+    }
+    async function closeOrbitTabs() {
+        const tabs = findOrbitTabs();
+        if (!tabs.length) return 0;
+        try { await vscode.window.tabGroups.close(tabs, true); } catch (_) {}
+        return tabs.length;
+    }
+
+    // workspaceState key: timestamp (ms since epoch) of the user's
+    // most recent explicit orbit.stop. We use it to suppress
+    // auto-start across the *immediately following* window reload
+    // (e.g. one triggered by removing the last workspace folder,
+    // which happens within ~1s of the stop), but not across full
+    // VS Code restarts seconds or hours later. Anything older than
+    // EXPLICIT_STOP_TTL_MS is ignored.
+    const EXPLICIT_STOP_KEY = 'orbit.explicitlyStoppedAt';
+    const EXPLICIT_STOP_TTL_MS = 2 * 1000;
 
     // MCP server visibility/availability. The MCP definition provider
     // returns the orbit backend definition only while `mcpEnabled` is
@@ -103,16 +170,16 @@ module.exports = function (vscode) {
             res.end();
         });
         srv.on('error', (err) => {
-            console.error('[orbit] clipboard bridge error:', err && err.message);
+            orbitError('[orbit] clipboard bridge error:', err && err.message);
         });
         srv.listen(0, '127.0.0.1', () => {
             const port = srv.address().port;
             try {
                 fs.writeFileSync(CLIPBOARD_PORT_FILE, String(port), { mode: 0o600 });
             } catch (e) {
-                console.error('[orbit] failed to write clipboard port file:', e && e.message);
+                orbitError('[orbit] failed to write clipboard port file:', e && e.message);
             }
-            console.log('[orbit] clipboard bridge listening on 127.0.0.1:' + port);
+            orbitLog('[orbit] clipboard bridge listening on 127.0.0.1:' + port);
         });
         clipboardServer = srv;
     }
@@ -124,6 +191,151 @@ module.exports = function (vscode) {
         }
         try {
             if (fs.existsSync(CLIPBOARD_PORT_FILE)) fs.unlinkSync(CLIPBOARD_PORT_FILE);
+        } catch (_) {}
+    }
+
+    // ---- Workspace FS bridge ---------------------------------------------
+    // Expose vscode.workspace.fs (and thus every registered
+    // FileSystemProvider, including untitled:, in-memory, and our own
+    // orbit-webdav:// scheme) to the Orbit page over HTTP. Same pattern
+    // as the clipboard bridge: a private loopback server, port written
+    // to a tmp file, proxied by app-impl.js. For safety, only URIs whose
+    // scheme matches one of the current workspace folders (or known
+    // safe schemes) are accepted.
+    const WORKSPACE_FS_PORT_FILE = path.join(os.tmpdir(), 'orbit-workspace-fs.port');
+    const WORKSPACE_FS_SAFE_SCHEMES = new Set([
+        'file', 'untitled', 'vscode-userdata', 'orbit-webdav'
+    ]);
+    let workspaceFsServer = null;
+
+    function workspaceFsAllowedSchemes() {
+        const set = new Set(WORKSPACE_FS_SAFE_SCHEMES);
+        try {
+            for (const f of vscode.workspace.workspaceFolders || []) {
+                if (f && f.uri && f.uri.scheme) set.add(f.uri.scheme);
+            }
+        } catch (_) {}
+        return set;
+    }
+
+    function parseWorkspaceFsUri(raw) {
+        if (!raw || typeof raw !== 'string') {
+            const e = new Error('missing uri'); e.status = 400; throw e;
+        }
+        let uri;
+        try { uri = vscode.Uri.parse(raw, true); }
+        catch (e2) {
+            const e = new Error('invalid uri: ' + (e2 && e2.message)); e.status = 400; throw e;
+        }
+        const allowed = workspaceFsAllowedSchemes();
+        if (!allowed.has(uri.scheme)) {
+            const e = new Error('scheme not allowed: ' + uri.scheme); e.status = 403; throw e;
+        }
+        return uri;
+    }
+
+    function fsTypeName(t) {
+        // vscode.FileType is a bitmask: Unknown=0, File=1, Directory=2,
+        // SymbolicLink=64. Encode raw value plus convenience flags.
+        const Unknown = 0, File = 1, Directory = 2, SymbolicLink = 64;
+        return {
+            value: t,
+            file: (t & File) === File,
+            directory: (t & Directory) === Directory,
+            symlink: (t & SymbolicLink) === SymbolicLink,
+            unknown: t === Unknown
+        };
+    }
+
+    function sendJson(res, status, obj) {
+        res.statusCode = status;
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify(obj));
+    }
+
+    function startWorkspaceFsBridge() {
+        if (workspaceFsServer) return;
+        const url = require('url');
+        const srv = http.createServer(async (req, res) => {
+            const remote = req.socket && req.socket.remoteAddress;
+            if (remote && remote !== '127.0.0.1' && remote !== '::1' && remote !== '::ffff:127.0.0.1') {
+                res.statusCode = 403; res.end(); return;
+            }
+            if (req.method !== 'GET') {
+                res.statusCode = 405; res.end(); return;
+            }
+            const parsed = url.parse(req.url, true);
+            const pathname = parsed.pathname || '';
+            const q = parsed.query || {};
+            try {
+                if (pathname === '/workspace-fs/folders') {
+                    const folders = (vscode.workspace.workspaceFolders || []).map((f, i) => ({
+                        index: i, name: f.name, uri: f.uri.toString()
+                    }));
+                    return sendJson(res, 200, { folders });
+                }
+                if (pathname === '/workspace-fs/stat') {
+                    const uri = parseWorkspaceFsUri(q.uri);
+                    const st = await vscode.workspace.fs.stat(uri);
+                    return sendJson(res, 200, {
+                        uri: uri.toString(),
+                        type: fsTypeName(st.type),
+                        ctime: st.ctime, mtime: st.mtime, size: st.size,
+                        permissions: st.permissions || 0
+                    });
+                }
+                if (pathname === '/workspace-fs/readDirectory') {
+                    const uri = parseWorkspaceFsUri(q.uri);
+                    const entries = await vscode.workspace.fs.readDirectory(uri);
+                    return sendJson(res, 200, {
+                        uri: uri.toString(),
+                        entries: entries.map(([name, t]) => ({ name, type: fsTypeName(t) }))
+                    });
+                }
+                if (pathname === '/workspace-fs/read') {
+                    const uri = parseWorkspaceFsUri(q.uri);
+                    const bytes = await vscode.workspace.fs.readFile(uri);
+                    res.statusCode = 200;
+                    res.setHeader('content-type', 'application/octet-stream');
+                    res.setHeader('content-length', String(bytes.byteLength));
+                    res.end(Buffer.from(bytes));
+                    return;
+                }
+                res.statusCode = 404; res.end();
+            } catch (err) {
+                const status = (err && err.status) || 500;
+                // FileSystemError carries a `code` property (e.g.
+                // 'FileNotFound'); surface it so the page can
+                // distinguish 404-equivalents.
+                sendJson(res, status, {
+                    error: String(err && err.message || err),
+                    code: err && err.code || undefined,
+                    name: err && err.name || undefined
+                });
+            }
+        });
+        srv.on('error', (err) => {
+            orbitError('[orbit] workspace-fs bridge error:', err && err.message);
+        });
+        srv.listen(0, '127.0.0.1', () => {
+            const port = srv.address().port;
+            try {
+                fs.writeFileSync(WORKSPACE_FS_PORT_FILE, String(port), { mode: 0o600 });
+            } catch (e) {
+                orbitError('[orbit] failed to write workspace-fs port file:', e && e.message);
+            }
+            orbitLog('[orbit] workspace-fs bridge listening on 127.0.0.1:' + port);
+        });
+        workspaceFsServer = srv;
+    }
+
+    function stopWorkspaceFsBridge() {
+        if (workspaceFsServer) {
+            try { workspaceFsServer.close(); } catch (_) {}
+            workspaceFsServer = null;
+        }
+        try {
+            if (fs.existsSync(WORKSPACE_FS_PORT_FILE)) fs.unlinkSync(WORKSPACE_FS_PORT_FILE);
         } catch (_) {}
     }
 
@@ -167,59 +379,53 @@ module.exports = function (vscode) {
     }
 
     function addWebdavWorkspaceFolder() {
-        if (findWebdavWorkspaceFolderIndex() >= 0) return false;
-        const existing = vscode.workspace.workspaceFolders || [];
+        const existingIdx = findWebdavWorkspaceFolderIndex();
+        const existingFolders = vscode.workspace.workspaceFolders || [];
+        orbitLog('[orbit] addWebdavWorkspaceFolder: called; existingIdx=' +
+            existingIdx + ' folders=' +
+            JSON.stringify(existingFolders.map(f => f.uri.toString())));
+        if (existingIdx >= 0) return false;
+        const folderSpec = { uri: webdavWorkspaceFolderUri(), name: 'Smalltalk' };
         const ok = vscode.workspace.updateWorkspaceFolders(
-            existing.length, 0,
-            { uri: webdavWorkspaceFolderUri(), name: 'Smalltalk' }
+            existingFolders.length, 0, folderSpec
         );
-        if (ok) {
-            // The WebDAV tree is fully dynamic — every byte may change
-            // at any time on the Smalltalk side. Disable VS Code's
-            // background indexing/caching for this folder by setting
-            // folder-scoped excludes for search, file-watching, and
-            // problems, and disabling source-control scanning.
-            //
-            // We watch for the new folder to appear in workspaceFolders
-            // (updateWorkspaceFolders is asynchronous in effect) and
-            // apply settings once it's available.
-            const apply = () => {
-                const folder = (vscode.workspace.workspaceFolders || [])
-                    .find(f => f.uri.scheme === 'orbit-webdav');
-                if (!folder) return false;
-                const target = vscode.ConfigurationTarget.WorkspaceFolder;
-                const everything = { '**': true };
-                try {
-                    vscode.workspace.getConfiguration('search', folder.uri)
-                        .update('exclude', everything, target);
-                    vscode.workspace.getConfiguration('files', folder.uri)
-                        .update('watcherExclude', everything, target);
-                    vscode.workspace.getConfiguration('search', folder.uri)
-                        .update('useIgnoreFiles', false, target);
-                    vscode.workspace.getConfiguration('problems', folder.uri)
-                        .update('decorations.enabled', false, target);
-                    vscode.workspace.getConfiguration('git', folder.uri)
-                        .update('enabled', false, target);
-                    vscode.workspace.getConfiguration('git', folder.uri)
-                        .update('autoRepositoryDetection', false, target);
-                } catch (e) {
-                    console.error('[orbit] webdav folder settings failed:', e && e.message);
-                }
-                return true;
-            };
-            if (!apply()) {
-                const sub = vscode.workspace.onDidChangeWorkspaceFolders(() => {
-                    if (apply()) sub.dispose();
-                });
+        orbitLog('[orbit] addWebdavWorkspaceFolder: updateWorkspaceFolders=' + ok);
+        // Verify after a tick. updateWorkspaceFolders is asynchronous
+        // in effect: a true return doesn't guarantee the folder
+        // appears, and a false return is silent. Log either way and
+        // attempt one retry on the next folder-change tick.
+        const sub = vscode.workspace.onDidChangeWorkspaceFolders((e) => {
+            const idx = findWebdavWorkspaceFolderIndex();
+            orbitLog('[orbit] onDidChangeWorkspaceFolders: idx=' + idx +
+                ' added=' + JSON.stringify(e.added.map(f => f.uri.toString())) +
+                ' removed=' + JSON.stringify(e.removed.map(f => f.uri.toString())));
+            if (idx >= 0) sub.dispose();
+        });
+        setTimeout(() => {
+            const idx = findWebdavWorkspaceFolderIndex();
+            orbitLog('[orbit] addWebdavWorkspaceFolder: 500ms post-check idx=' + idx);
+            if (idx < 0) {
+                const now = vscode.workspace.workspaceFolders || [];
+                const ok2 = vscode.workspace.updateWorkspaceFolders(
+                    now.length, 0, folderSpec
+                );
+                orbitLog('[orbit] addWebdavWorkspaceFolder: retry updateWorkspaceFolders=' + ok2);
             }
-        }
+        }, 500);
         return ok;
     }
 
     function removeWebdavWorkspaceFolder() {
         const idx = findWebdavWorkspaceFolderIndex();
+        orbitLog('[orbit] removeWebdavWorkspaceFolder: called; idx=' + idx);
         if (idx < 0) return false;
-        return vscode.workspace.updateWorkspaceFolders(idx, 1);
+        // Note: if this is the only workspace folder, VS Code will
+        // force a window reload. The `orbit.explicitlyStopped`
+        // workspaceState flag set by orbit.stop prevents auto-start
+        // from running after that reload.
+        const ok = vscode.workspace.updateWorkspaceFolders(idx, 1);
+        orbitLog('[orbit] removeWebdavWorkspaceFolder: updateWorkspaceFolders=' + ok);
+        return ok;
     }
 
     // Output channel reused by the isolated-subagent feature so that
@@ -360,12 +566,37 @@ module.exports = function (vscode) {
         } catch (_) {}
     }
 
+    // Open or refocus the Orbit page in the Integrated Browser, falling
+    // back to the legacy Simple Browser. The new
+    // `workbench.action.browser.open` command honors `reuseUrlFilter`,
+    // which navigates an existing matching browser tab to the new URL
+    // instead of spawning a duplicate. This is what lets a "dead" tab
+    // restored from the previous window get re-pointed at the freshly
+    // started server, rather than left to rot beside a new tab.
+    async function showOrbitBrowser(url) {
+        try {
+            await vscode.commands.executeCommand(
+                'workbench.action.browser.open',
+                { url, reuseUrlFilter: url }
+            );
+            return;
+        } catch (e) {
+            orbitError('[orbit] workbench.action.browser.open failed; falling back to simpleBrowser.show:',
+                e && e.message);
+        }
+        try {
+            await vscode.commands.executeCommand('simpleBrowser.show', url);
+        } catch (e) {
+            orbitError('[orbit] simpleBrowser.show failed:', e && e.message);
+        }
+    }
+
     function startServer(context, openBrowser) {
         return new Promise((resolve) => {
             if (server) {
                 if (openBrowser) {
                     const addr = server.address();
-                    vscode.commands.executeCommand('simpleBrowser.show', orbitUrl(addr.port));
+                    showOrbitBrowser(orbitUrl(addr.port));
                 }
                 resolve();
                 return;
@@ -379,7 +610,7 @@ module.exports = function (vscode) {
                 setRunningContext(true);
                 vscode.window.showInformationMessage(`Orbit running on port ${addr.port}`);
                 if (openBrowser) {
-                    vscode.commands.executeCommand('simpleBrowser.show', orbitUrl(addr.port));
+                    showOrbitBrowser(orbitUrl(addr.port));
                 }
                 resolve();
             });
@@ -412,7 +643,16 @@ module.exports = function (vscode) {
     }
 
     function activate(context) {
+        const ch = ensureOutputChannel();
+        if (ch) context.subscriptions.push(ch);
+        orbitLog('[orbit] activate: extension v' +
+            (vscode.extensions.getExtension('BlackPageDigital.orbit-agentic-pair-programming-for-smalltalk')
+                && vscode.extensions.getExtension('BlackPageDigital.orbit-agentic-pair-programming-for-smalltalk').packageJSON.version
+                || '?') +
+            ' workspaceFolders=' +
+            JSON.stringify((vscode.workspace.workspaceFolders || []).map(f => f.uri.toString())));
         startClipboardBridge();
+        startWorkspaceFsBridge();
         setRunningContext(false);
 
         // Register the in-process WebDAV FileSystemProvider under the
@@ -432,26 +672,28 @@ module.exports = function (vscode) {
                 isReadonly: false
             });
             context.subscriptions.push(reg);
-            console.log('[orbit] webdav FileSystemProvider registered for ' + scheme + '://');
+            orbitLog('[orbit] webdav FileSystemProvider registered for ' + scheme + '://');
         } catch (e) {
-            console.error('[orbit] webdav FS provider registration failed:', e && e.message);
+            orbitError('[orbit] webdav FS provider registration failed:', e && e.message);
         }
 
         const startCmd = vscode.commands.registerCommand('orbit.start', async () => {
-            const sinceStop = Date.now() - lastStopAt;
-            if (sinceStop < POST_STOP_START_SUPPRESSION_MS) {
-                console.log(
-                    '[orbit.start] suppressed: fired ' + sinceStop +
-                    'ms after orbit.stop (welcome-view re-render race)'
-                );
-                return;
-            }
+            orbitLog('[orbit] orbit.start: invoked');
+            try { context.workspaceState.update(EXPLICIT_STOP_KEY, 0); } catch (_) {}
+            // If the user already has an Orbit browser tab open
+            // (e.g. localhost:8089 from a prior session), keep it
+            // rather than closing and reopening. The existing tab
+            // will reconnect to the freshly started server on its
+            // own, and we don't want to spawn a duplicate.
+            const keepExistingTab = hasOrbitTab();
+            orbitLog('[orbit] orbit.start: keepExistingTab=' + keepExistingTab);
             try {
-                await vscode.commands.executeCommand('orbit.stop');
+                await vscode.commands.executeCommand('orbit.stop', { keepTabs: keepExistingTab });
             } catch (e) {
-                console.error('[orbit.start] orbit.stop failed:', e && e.message);
+                orbitError('[orbit.start] orbit.stop failed:', e && e.message);
             }
-            await startServer(context, true);
+            await startServer(context, !keepExistingTab);
+            orbitLog('[orbit] orbit.start: startServer done; webdavMountEnabled=' + webdavMountEnabled());
             if (webdavMountEnabled()) addWebdavWorkspaceFolder();
             // Re-publish the Orbit MCP definition (orbit.stop withdrew
             // it) before asking VS Code to start the server.
@@ -471,12 +713,19 @@ module.exports = function (vscode) {
                     { autoTrustChanges: true }
                 );
             } catch (e) {
-                console.error('[orbit] MCP startServer failed:', e && e.message);
+                orbitError('[orbit] MCP startServer failed:', e && e.message);
             }
         });
 
-        const stopCmd = vscode.commands.registerCommand('orbit.stop', async () => {
-            lastStopAt = Date.now();
+        const stopCmd = vscode.commands.registerCommand('orbit.stop', async (opts) => {
+            const keepTabs = !!(opts && opts.keepTabs);
+            orbitLog('[orbit] orbit.stop: invoked; keepTabs=' + keepTabs);
+            // Only treat this as an explicit user stop when invoked
+            // standalone (not as part of orbit.start's restart cycle,
+            // which signals itself via opts.keepTabs).
+            if (!keepTabs) {
+                try { context.workspaceState.update(EXPLICIT_STOP_KEY, Date.now()); } catch (_) {}
+            }
             if (server) {
                 server.close();
                 server = null;
@@ -501,8 +750,9 @@ module.exports = function (vscode) {
             // Close any browser tabs showing the Orbit page (Simple
             // Browser viewType `mainThreadWebview-simpleBrowser.view`,
             // or the new Integrated Browser editor with typeId
-            // `workbench.editor.browser`).
-            try {
+            // `workbench.editor.browser`). Skipped when invoked from
+            // orbit.start with an existing tab to preserve.
+            if (!keepTabs) try {
                 const tabsToClose = [];
                 for (const group of vscode.window.tabGroups.all) {
                     for (const tab of group.tabs) {
@@ -516,7 +766,7 @@ module.exports = function (vscode) {
                             (editorId && /browser/i.test(editorId)) ||
                             (ctorName && /browser/i.test(ctorName)) ||
                             label.includes('orbit');
-                        console.log('[orbit.stop] tab', JSON.stringify({
+                        orbitLog('[orbit.stop] tab', JSON.stringify({
                             label: tab.label,
                             viewType,
                             editorId,
@@ -531,9 +781,18 @@ module.exports = function (vscode) {
                     await vscode.window.tabGroups.close(tabsToClose, true);
                 }
             } catch (e) {
-                console.error('[orbit] closing browser tab failed:', e && e.message);
+                orbitError('[orbit] closing browser tab failed:', e && e.message);
             }
-            if (webdavMountEnabled()) removeWebdavWorkspaceFolder();
+            // Only remove the WebDAV workspace folder when the user
+            // explicitly stopped Orbit. When orbit.stop is invoked as
+            // part of orbit.start's restart cycle (keepTabs=true), the
+            // remove + re-add races against VS Code's async folder
+            // mutation pipeline and the re-add silently fails on the
+            // first attempt — leaving the user with no WebDAV folder
+            // until they retry. The FS provider stays registered for
+            // the lifetime of the extension, so the folder remains
+            // functional across a server restart.
+            if (!keepTabs && webdavMountEnabled()) removeWebdavWorkspaceFolder();
             // Stop the Orbit MCP backend connection and withdraw its
             // definition so it disappears from the MCP servers list.
             try {
@@ -542,7 +801,7 @@ module.exports = function (vscode) {
                     ORBIT_MCP_SERVER_ID
                 );
             } catch (e) {
-                console.error('[orbit.stop] MCP stopServer failed:', e && e.message);
+                orbitError('[orbit.stop] MCP stopServer failed:', e && e.message);
             }
             if (mcpEnabled) {
                 mcpEnabled = false;
@@ -607,6 +866,48 @@ module.exports = function (vscode) {
         });
         context.subscriptions.push(addWebdavFolderCmd);
 
+        // Tab dedup watcher: VS Code restores browser tabs from the
+        // previous session asynchronously, often *after* this
+        // extension's auto-start has already opened its own Orbit
+        // tab. The result is two tabs: a "dead" one from before the
+        // reload (pointing at a server that wasn't running yet) and
+        // the fresh one we just opened. Whenever the tab set changes,
+        // if there is more than one Orbit tab, close all but the
+        // most recently active one. We never run while server is null
+        // (no fresh tab of our own to keep).
+        try {
+            let dedupRunning = false;
+            const dedupOrbitTabs = async () => {
+                if (dedupRunning) return;
+                if (!server) return;
+                const tabs = findOrbitTabs();
+                if (tabs.length < 2) return;
+                // Prefer the active tab; otherwise keep the last in
+                // iteration order (most recently created).
+                let keep = tabs.find(t => t.isActive);
+                if (!keep) keep = tabs[tabs.length - 1];
+                const drop = tabs.filter(t => t !== keep);
+                if (!drop.length) return;
+                dedupRunning = true;
+                try {
+                    orbitLog('[orbit] dedup: closing ' + drop.length +
+                        ' duplicate Orbit tab(s); keeping ' +
+                        JSON.stringify(keep.label));
+                    await vscode.window.tabGroups.close(drop, true);
+                } catch (e) {
+                    orbitError('[orbit] dedup close failed:', e && e.message);
+                } finally {
+                    dedupRunning = false;
+                }
+            };
+            const tabSub = vscode.window.tabGroups.onDidChangeTabs(() => {
+                dedupOrbitTabs();
+            });
+            context.subscriptions.push(tabSub);
+        } catch (e) {
+            orbitError('[orbit] tab dedup watcher registration failed:', e && e.message);
+        }
+
         // Activity Bar view: register a minimal TreeDataProvider for
         // `orbit.status`. Welcome content (declared in package.json)
         // shows a single Start/Stop button driven by the
@@ -625,20 +926,18 @@ module.exports = function (vscode) {
                 treeDataProvider,
                 showCollapseAll: false
             });
-            const maybeAutoStart = () => {
+            const maybeAutoStart = async () => {
                 if (server) return;
-                const sinceStop = Date.now() - lastStopAt;
-                if (sinceStop < POST_STOP_START_SUPPRESSION_MS) {
-                    console.log(
-                        '[orbit] activity-bar auto-start suppressed: fired ' +
-                        sinceStop + 'ms after orbit.stop ' +
-                        '(welcome-view re-render visibility race)'
-                    );
-                    return;
+                orbitLog('[orbit] activity bar maybeAutoStart: starting server');
+                try {
+                    await startServer(context, true);
+                } catch (e) {
+                    orbitError('[orbit] auto-start from activity bar failed:', e && e.message);
                 }
-                startServer(context, true).catch((e) => {
-                    console.error('[orbit] auto-start from activity bar failed:', e && e.message);
-                });
+                if (webdavMountEnabled()) {
+                    try { addWebdavWorkspaceFolder(); }
+                    catch (e) { orbitError('[orbit] activity bar webdav add failed:', e && e.message); }
+                }
             };
             if (treeView.visible) maybeAutoStart();
             const visSub = treeView.onDidChangeVisibility((e) => {
@@ -646,7 +945,7 @@ module.exports = function (vscode) {
             });
             context.subscriptions.push(treeView, visSub);
         } catch (e) {
-            console.error('[orbit] activity bar view registration failed:', e && e.message);
+            orbitError('[orbit] activity bar view registration failed:', e && e.message);
         }
 
         // Ad-hoc command: prompt the user for a task and run an isolated
@@ -759,9 +1058,9 @@ module.exports = function (vscode) {
                 }
             });
             context.subscriptions.push(subagentTool);
-            console.log('[orbit] runIsolatedSubagent tool registered');
+            orbitLog('[orbit] runIsolatedSubagent tool registered');
         } catch (e) {
-            console.error('[orbit] runIsolatedSubagent tool registration failed:', e && e.message);
+            orbitError('[orbit] runIsolatedSubagent tool registration failed:', e && e.message);
         }
 
         // Chat participant: @orbit
@@ -863,7 +1162,7 @@ module.exports = function (vscode) {
                 response.markdown(`\n\n_(Tool-loop iteration cap reached.)_`);
             } catch (e) {
                 response.markdown(`\n\n**Orbit participant error:** ${e && e.message || e}`);
-                console.error('[orbit] participant error:', e);
+                orbitError('[orbit] participant error:', e);
             }
         });
         participant.iconPath = vscode.Uri.joinPath(context.extensionUri, 'public', 'pictures', 'icons', 'participant', 'orbit.jpg');
@@ -874,10 +1173,10 @@ module.exports = function (vscode) {
             const ext = vscode.extensions.getExtension('BlackPageDigital.orbit');
             const contributes = ext && ext.packageJSON && ext.packageJSON.contributes;
             const mcp = contributes && contributes.mcpServerDefinitionProviders;
-            console.log('[orbit] packageJSON.contributes keys:', contributes && Object.keys(contributes));
-            console.log('[orbit] mcpServerDefinitionProviders:', JSON.stringify(mcp));
+            orbitLog('[orbit] packageJSON.contributes keys:', contributes && Object.keys(contributes));
+            orbitLog('[orbit] mcpServerDefinitionProviders:', JSON.stringify(mcp));
         } catch (e) {
-            console.log('[orbit] manifest inspect failed:', e && e.message);
+            orbitLog('[orbit] manifest inspect failed:', e && e.message);
         }
 
         try {
@@ -895,9 +1194,27 @@ module.exports = function (vscode) {
                 }
             });
             context.subscriptions.push(mcpProvider, mcpDefinitionsChanged);
-            console.log('[orbit] MCP provider registered');
+            orbitLog('[orbit] MCP provider registered');
         } catch (e) {
-            console.error('[orbit] MCP provider registration failed:', e && e.message);
+            orbitError('[orbit] MCP provider registration failed:', e && e.message);
+        }
+
+        // Add the WebDAV workspace folder unconditionally on activate.
+        // The FS provider above is registered unconditionally too, so
+        // there is no scenario in which the folder should be present
+        // but the provider absent. Doing this outside the
+        // autoStart/explicitlyStopped gate ensures the user always
+        // sees the Smalltalk tree in the Explorer regardless of
+        // whether the web server is running. Surfaced as a
+        // showInformationMessage on first add so the user gets visible
+        // confirmation even if the DevTools console is filtered.
+        try {
+            if (webdavMountEnabled()) {
+                addWebdavWorkspaceFolder();
+            }
+        } catch (e) {
+            orbitError('[orbit] webdav folder add (unconditional) failed:',
+                e && e.message);
         }
 
         // Auto-start the web server at activation time so that browser
@@ -908,32 +1225,28 @@ module.exports = function (vscode) {
             const autoStart = vscode.workspace
                 .getConfiguration('orbit')
                 .get('autoStart', true);
-            if (autoStart) {
-                // Open the browser tab if one isn't already open for
-                // the Orbit URL. (Reloads where the user had a tab
-                // open will already have it; we don't want to spawn
-                // a duplicate.)
-                let hasOrbitTab = false;
+            const explicitlyStopped = (() => {
                 try {
-                    for (const group of vscode.window.tabGroups.all) {
-                        for (const tab of group.tabs) {
-                            const label = (tab.label || '').toLowerCase();
-                            const input = tab.input;
-                            const viewType = input && input.viewType;
-                            if (label.includes('orbit') ||
-                                (viewType && /simpleBrowser|browser/i.test(viewType))) {
-                                hasOrbitTab = true;
-                            }
-                        }
-                    }
-                } catch (_) {}
-                startServer(context, !hasOrbitTab).catch((e) => {
-                    console.error('[orbit] auto-start failed:', e && e.message);
-                });
-                if (webdavMountEnabled()) {
-                    try { addWebdavWorkspaceFolder(); }
-                    catch (e) { console.error('[orbit] webdav folder add failed:', e && e.message); }
+                    const stoppedAt = +context.workspaceState.get(EXPLICIT_STOP_KEY, 0) || 0;
+                    return stoppedAt > 0 && (Date.now() - stoppedAt) < EXPLICIT_STOP_TTL_MS;
                 }
+                catch (_) { return false; }
+            })();
+            if (explicitlyStopped) {
+                orbitLog('[orbit] auto-start skipped: user explicitly stopped Orbit before this activation');
+            }
+            if (autoStart && !explicitlyStopped) {
+                // On a VS Code window reload, any Orbit browser tab
+                // the user had open is restored *before* this
+                // extension activates and starts the server, so the
+                // restored tab shows a "failed to load" page. We use
+                // the Integrated Browser's reuseUrlFilter option in
+                // showOrbitBrowser, which navigates the existing
+                // dead tab to the freshly-running server URL instead
+                // of leaving it behind beside a new tab.
+                startServer(context, true).catch((e) => {
+                    orbitError('[orbit] auto-start failed:', e && e.message);
+                });
                 // Ensure the Orbit MCP backend is started too, so the
                 // user doesn't see it sitting in the MCP servers list
                 // in a stopped state. On a fresh window reload, VS
@@ -952,9 +1265,9 @@ module.exports = function (vscode) {
                             ORBIT_MCP_SERVER_ID,
                             { autoTrustChanges: true }
                         ).then(() => {
-                            console.log('[orbit] auto-start MCP startServer ok (attempt ' + attempt + ')');
+                            orbitLog('[orbit] auto-start MCP startServer ok (attempt ' + attempt + ')');
                         }, (e) => {
-                            console.error('[orbit] auto-start MCP startServer failed (attempt ' +
+                            orbitError('[orbit] auto-start MCP startServer failed (attempt ' +
                                 attempt + '):', e && e.message);
                             if (attempt < 5) {
                                 setTimeout(() => tryStart(attempt + 1), 500 * attempt);
@@ -963,16 +1276,17 @@ module.exports = function (vscode) {
                     };
                     setTimeout(() => tryStart(1), 500);
                 } catch (e) {
-                    console.error('[orbit] auto-start MCP failed:', e && e.message);
+                    orbitError('[orbit] auto-start MCP failed:', e && e.message);
                 }
             }
         } catch (e) {
-            console.error('[orbit] auto-start check failed:', e && e.message);
+            orbitError('[orbit] auto-start check failed:', e && e.message);
         }
     }
 
     function deactivate() {
         stopClipboardBridge();
+        stopWorkspaceFsBridge();
         if (server) {
             server.close();
             server = null;

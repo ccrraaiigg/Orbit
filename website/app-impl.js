@@ -42,16 +42,21 @@ const fsmod = require('fs');
 const httpmod = require('http');
 
 const CLIPBOARD_PORT_FILE = path.join(os.tmpdir(), 'orbit-clipboard.port');
+const WORKSPACE_FS_PORT_FILE = path.join(os.tmpdir(), 'orbit-workspace-fs.port');
 
-function readClipboardBridgePort() {
+function readPortFile(file) {
   try {
-    if (!fsmod.existsSync(CLIPBOARD_PORT_FILE)) return null;
-    const raw = fsmod.readFileSync(CLIPBOARD_PORT_FILE, 'utf8').trim();
+    if (!fsmod.existsSync(file)) return null;
+    const raw = fsmod.readFileSync(file, 'utf8').trim();
     const port = parseInt(raw, 10);
     return Number.isFinite(port) && port > 0 ? port : null;
   } catch (_) {
     return null;
   }
+}
+
+function readClipboardBridgePort() {
+  return readPortFile(CLIPBOARD_PORT_FILE);
 }
 
 function proxyToBridge(method, body) {
@@ -105,6 +110,35 @@ app.post('/clipboard', async (req, res) => {
     }
     res.status(500).json({ error: err.message });
   }
+});
+
+// Workspace FS bridge: pass GETs through to the private workspace-fs
+// bridge started by the Orbit extension. The bridge gates URIs by
+// scheme and exposes vscode.workspace.fs (every registered
+// FileSystemProvider). Body is streamed verbatim, including binary
+// payloads from /workspace-fs/read.
+app.get('/workspace-fs/*', (req, res) => {
+  const port = readPortFile(WORKSPACE_FS_PORT_FILE);
+  if (!port) {
+    return res.status(503).json({ error: 'workspace-fs bridge unavailable (VS Code not running?)' });
+  }
+  const upstream = httpmod.request({
+    method: 'GET',
+    host: '127.0.0.1',
+    port,
+    path: req.originalUrl
+  }, (upRes) => {
+    res.status(upRes.statusCode);
+    for (const [k, v] of Object.entries(upRes.headers)) {
+      if (k === 'connection' || k === 'transfer-encoding') continue;
+      res.setHeader(k, v);
+    }
+    upRes.pipe(res);
+  });
+  upstream.on('error', (err) => {
+    res.status(502).json({ error: err.message });
+  });
+  upstream.end();
 });
 
 // catch 404 and forward to error handler
