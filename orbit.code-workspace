@@ -4,8 +4,8 @@
 			"path": "."
 		},
 		{
-			"name": "Smalltalk",
-			"uri": "orbit-webdav://orbit/"
+			"name": "Smalltalk-2300-ui",
+			"uri": "orbit-webdav://2300-ui/"
 		}
 	],
 	"settings": {

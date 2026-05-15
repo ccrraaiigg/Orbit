@@ -46,6 +46,71 @@ module.exports = function (vscode) {
     const shortHostname = os.hostname().split('.')[0].toLowerCase();
     const isDevHost = devHosts.has(shortHostname);
     const mcpHost = isDevHost ? '192.168.1.140' : 'localhost';
+    const backendHost = isDevHost ? '192.168.1.140' : '127.0.0.1';
+
+    // The Lam 2300 system is provided by a collaborating set of
+    // Smalltalk object memories ("backends"), each of which exposes
+    // its own MCP and WebDAV servers on distinct ports. We probe each
+    // one at activation time and only register the reachable ones.
+    const BACKENDS = [
+        { name: '2300-backend', mcpPort: 15072, webdavPort: 19072 },
+        { name: '2300-ui',      mcpPort: 15070, webdavPort: 19070 }
+    ];
+
+    function backendByName(name) {
+        return BACKENDS.find(b => b.name === name);
+    }
+
+    function mcpUrlFor(backend) {
+        return `http://${mcpHost}:${backend.mcpPort}/mcpservice/v1/mcp`;
+    }
+
+    function webdavUrlFor(backend) {
+        return `http://${backendHost}:${backend.webdavPort}/webdav`;
+    }
+
+    // Quick TCP-connect probe. Resolves true if the port accepts a
+    // connection within `timeoutMs`, false otherwise. We use this
+    // instead of an HTTP probe because the WebDAV root requires
+    // authentication and the MCP endpoint requires a session
+    // handshake; a bare TCP accept is enough to know whether the
+    // backend is up.
+    function probeTcp(host, port, timeoutMs) {
+        return new Promise((resolve) => {
+            const net = require('net');
+            const sock = new net.Socket();
+            let done = false;
+            const finish = (ok) => {
+                if (done) return;
+                done = true;
+                try { sock.destroy(); } catch (_) {}
+                resolve(ok);
+            };
+            sock.setTimeout(timeoutMs || 800);
+            sock.once('connect', () => finish(true));
+            sock.once('timeout', () => finish(false));
+            sock.once('error', () => finish(false));
+            try { sock.connect(port, host); }
+            catch (_) { finish(false); }
+        });
+    }
+
+    // Probe all backends in parallel for either 'mcp' or 'webdav'
+    // service. Returns an array of {backend, reachable}.
+    async function probeBackends(kind) {
+        const probes = BACKENDS.map(async (b) => {
+            const port = kind === 'mcp' ? b.mcpPort : b.webdavPort;
+            const host = kind === 'mcp' ? mcpHost : backendHost;
+            const reachable = await probeTcp(host, port, 800);
+            return { backend: b, reachable };
+        });
+        return Promise.all(probes);
+    }
+
+    async function reachableBackends(kind) {
+        const results = await probeBackends(kind);
+        return results.filter(r => r.reachable).map(r => r.backend);
+    }
 
     function orbitUrl(port) {
         const base = `http://localhost:${port}/orbit.html`;
@@ -53,6 +118,11 @@ module.exports = function (vscode) {
     }
 
     let server = null;
+    // Reference to the WebDAV FileSystemProvider, set when activate()
+    // registers it. Module-scoped so the orbit web server's
+    // /fs-changed route (registered in startServer) can call back into
+    // it to fire onDidChangeFile events.
+    let webdavProvider = null;
 
     // True if there is currently a VS Code editor tab showing the
     // Orbit page (Simple Browser or Integrated Browser). Uses the
@@ -99,13 +169,90 @@ module.exports = function (vscode) {
     const EXPLICIT_STOP_TTL_MS = 2 * 1000;
 
     // MCP server visibility/availability. The MCP definition provider
-    // returns the orbit backend definition only while `mcpEnabled` is
+    // returns the orbit backend definitions only while `mcpEnabled` is
     // true; orbit.stop flips it to false and fires the change emitter
-    // so VS Code drops the definition from its server list.
+    // so VS Code drops the definitions from its server list.
     let mcpEnabled = true;
     let mcpDefinitionsChanged = null;
-    const ORBIT_MCP_SERVER_ID =
-        'blackpagedigital.orbit-agentic-pair-programming-for-smalltalk/2300-backend';
+    const ORBIT_MCP_EXT_KEY =
+        'blackpagedigital.orbit-agentic-pair-programming-for-smalltalk';
+    function mcpServerIdFor(name) {
+        return `${ORBIT_MCP_EXT_KEY}/${name}`;
+    }
+    // Per-backend reachability cache, populated by the MCP definition
+    // provider's probe. The provider never returns definitions for
+    // unreachable backends, so VS Code never tries to start them.
+    const mcpReachable = new Set();
+
+    // Registry of MCP servers whose state is reflected in the
+    // Orbit activity bar view. One entry per backend in BACKENDS;
+    // setRunning() asks VS Code to start/stop that specific server.
+    // The view checkbox state mirrors getRunning(); toggling a
+    // checkbox invokes setRunning() and then notifies subscribers.
+    // Per-server running state tracked here so the checkbox reflects
+    // the user's intent immediately. The MCP definition stays
+    // registered with VS Code whether or not the server is running;
+    // only orbit.stop fully unregisters the definition.
+    const mcpRunning = {};
+    for (const b of BACKENDS) mcpRunning[b.name] = false;
+
+    const mcpServers = BACKENDS.map((b) => ({
+        name: b.name,
+        getRunning: () => !!mcpRunning[b.name],
+        setRunning: async (running) => {
+            const id = mcpServerIdFor(b.name);
+            if (running) {
+                try {
+                    await vscode.commands.executeCommand(
+                        'workbench.mcp.startServer',
+                        id,
+                        { autoTrustChanges: true }
+                    );
+                } catch (e) {
+                    orbitError(`[orbit] MCP startServer ${b.name} failed:`, e && e.message);
+                    return;
+                }
+                // Confirm via an actual echoMessage tool invocation
+                // that VS Code is connected to the server before
+                // flipping the UI flag. workbench.mcp.startServer
+                // resolves before any tools have been negotiated,
+                // and vscode.lm.tools can hold stale entries from a
+                // previous session, so we round-trip a real call.
+                // If verification fails, leave the flag false so
+                // the periodic retry tick re-issues the start.
+                let verified = false;
+                for (let i = 0; i < 24; i++) {
+                    if (await isMcpServerConnected(b.name)) { verified = true; break; }
+                    await new Promise(r => setTimeout(r, 250));
+                }
+                mcpRunning[b.name] = verified;
+                if (!verified) {
+                    orbitError(`[orbit] MCP startServer ${b.name}: resolved but no tools appeared`);
+                }
+            } else {
+                try {
+                    await vscode.commands.executeCommand(
+                        'workbench.mcp.stopServer',
+                        id
+                    );
+                    mcpRunning[b.name] = false;
+                } catch (e) {
+                    orbitError(`[orbit] MCP stopServer ${b.name} failed:`, e && e.message);
+                }
+            }
+        }
+    }));
+
+    // Subscribers (page SSE clients + view refresher) listening for
+    // MCP server state changes. Each subscriber is a function taking
+    // { name, running }.
+    const mcpStateSubscribers = new Set();
+    function notifyMcpState(name, running) {
+        const payload = { name, running };
+        for (const fn of mcpStateSubscribers) {
+            try { fn(payload); } catch (e) { orbitError('[orbit] mcp subscriber failed:', e && e.message); }
+        }
+    }
 
     // ---- Clipboard bridge ------------------------------------------------
     // The VS Code Integrated Browser swallows Cmd+V and refuses
@@ -340,15 +487,10 @@ module.exports = function (vscode) {
     }
 
     // ---- WebDAV server endpoint ------------------------------------------
-    // The Smalltalk backend exposes a WebDAV server. The Orbit
-    // extension talks to it directly via the in-process
-    // FileSystemProvider (see src/webdav-fs.js); no host-OS WebDAV
-    // client is involved.
-    function webdavUrl() {
-        const host = isDevHost ? '192.168.1.140' : '127.0.0.1';
-        return `http://${host}:19073/webdav`;
-    }
-
+    // Each Smalltalk backend exposes a WebDAV server on its own port
+    // (see BACKENDS). The Orbit extension talks to those servers
+    // directly via the in-process FileSystemProvider (see
+    // src/webdav-fs.js); no host-OS WebDAV client is involved.
     function webdavMountEnabled() {
         try {
             return vscode.workspace
@@ -359,72 +501,94 @@ module.exports = function (vscode) {
 
     // ---- WebDAV workspace folder management ------------------------------
     // The Orbit extension registers an in-process FileSystemProvider for
-    // the orbit-webdav:// scheme (see src/webdav-fs.js). These helpers
-    // add/remove that scheme's root as a workspace folder so the user
-    // sees the Smalltalk-served tree in the Explorer without any host-OS
-    // WebDAV client. Adding a non-first workspace folder in a
-    // multi-root workspace does not restart the extension host.
-    const WEBDAV_WS_URI = 'orbit-webdav://orbit/';
-
-    function webdavWorkspaceFolderUri() {
-        return vscode.Uri.parse(WEBDAV_WS_URI);
+    // the orbit-webdav:// scheme (see src/webdav-fs.js). The provider
+    // is authority-aware: orbit-webdav://<backend-name>/ resolves to
+    // that backend's WebDAV root. These helpers add one workspace
+    // folder per reachable backend (named "Smalltalk-<backend-name>"),
+    // and remove all orbit-webdav folders on shutdown.
+    function webdavWorkspaceFolderUriFor(name) {
+        return vscode.Uri.parse(`orbit-webdav://${name}/`);
     }
 
-    function findWebdavWorkspaceFolderIndex() {
+    function webdavFolderLabelFor(name) {
+        return `Smalltalk-${name}`;
+    }
+
+    function findWebdavFolderIndices() {
         const folders = vscode.workspace.workspaceFolders || [];
+        const out = [];
         for (let i = 0; i < folders.length; i++) {
-            if (folders[i].uri.scheme === 'orbit-webdav') return i;
+            if (folders[i].uri.scheme === 'orbit-webdav') {
+                out.push({ index: i, folder: folders[i] });
+            }
         }
-        return -1;
+        return out;
     }
 
-    function addWebdavWorkspaceFolder() {
-        const existingIdx = findWebdavWorkspaceFolderIndex();
-        const existingFolders = vscode.workspace.workspaceFolders || [];
-        orbitLog('[orbit] addWebdavWorkspaceFolder: called; existingIdx=' +
-            existingIdx + ' folders=' +
-            JSON.stringify(existingFolders.map(f => f.uri.toString())));
-        if (existingIdx >= 0) return false;
-        const folderSpec = { uri: webdavWorkspaceFolderUri(), name: 'Smalltalk' };
-        const ok = vscode.workspace.updateWorkspaceFolders(
-            existingFolders.length, 0, folderSpec
-        );
-        orbitLog('[orbit] addWebdavWorkspaceFolder: updateWorkspaceFolders=' + ok);
-        // Verify after a tick. updateWorkspaceFolders is asynchronous
-        // in effect: a true return doesn't guarantee the folder
-        // appears, and a false return is silent. Log either way and
-        // attempt one retry on the next folder-change tick.
-        const sub = vscode.workspace.onDidChangeWorkspaceFolders((e) => {
-            const idx = findWebdavWorkspaceFolderIndex();
-            orbitLog('[orbit] onDidChangeWorkspaceFolders: idx=' + idx +
-                ' added=' + JSON.stringify(e.added.map(f => f.uri.toString())) +
-                ' removed=' + JSON.stringify(e.removed.map(f => f.uri.toString())));
-            if (idx >= 0) sub.dispose();
-        });
-        setTimeout(() => {
-            const idx = findWebdavWorkspaceFolderIndex();
-            orbitLog('[orbit] addWebdavWorkspaceFolder: 500ms post-check idx=' + idx);
-            if (idx < 0) {
-                const now = vscode.workspace.workspaceFolders || [];
-                const ok2 = vscode.workspace.updateWorkspaceFolders(
-                    now.length, 0, folderSpec
+    async function addWebdavWorkspaceFolders() {
+        // Probe all backends and add a folder per reachable one.
+        // Folders for unreachable backends are skipped, and any stale
+        // orbit-webdav folder (e.g. left behind by an earlier mount
+        // whose backend is no longer reachable, or with an unknown
+        // authority) is removed first.
+        const reachable = await reachableBackends('webdav');
+        const reachableNames = new Set(reachable.map(b => b.name));
+        orbitLog('[orbit] addWebdavWorkspaceFolders: reachable=' +
+            JSON.stringify(Array.from(reachableNames)));
+
+        // Drop stale folders. Iterate from the end so indices stay
+        // valid as we remove.
+        const existing = findWebdavFolderIndices();
+        for (let k = existing.length - 1; k >= 0; k--) {
+            const f = existing[k].folder;
+            const auth = f.uri.authority;
+            if (!reachableNames.has(auth)) {
+                const ok = vscode.workspace.updateWorkspaceFolders(
+                    existing[k].index, 1
                 );
-                orbitLog('[orbit] addWebdavWorkspaceFolder: retry updateWorkspaceFolders=' + ok2);
+                orbitLog('[orbit] addWebdavWorkspaceFolders: removed stale ' +
+                    f.uri.toString() + ' ok=' + ok);
             }
-        }, 500);
+        }
+
+        // Compute which reachable backends still need a folder.
+        const present = new Set(
+            findWebdavFolderIndices().map(e => e.folder.uri.authority)
+        );
+        const toAdd = reachable.filter(b => !present.has(b.name));
+        if (toAdd.length === 0) {
+            orbitLog('[orbit] addWebdavWorkspaceFolders: nothing to add');
+            return true;
+        }
+        const folders = vscode.workspace.workspaceFolders || [];
+        const specs = toAdd.map(b => ({
+            uri: webdavWorkspaceFolderUriFor(b.name),
+            name: webdavFolderLabelFor(b.name)
+        }));
+        const ok = vscode.workspace.updateWorkspaceFolders(
+            folders.length, 0, ...specs
+        );
+        orbitLog('[orbit] addWebdavWorkspaceFolders: added ' +
+            JSON.stringify(specs.map(s => s.uri.toString())) +
+            ' ok=' + ok);
         return ok;
     }
 
-    function removeWebdavWorkspaceFolder() {
-        const idx = findWebdavWorkspaceFolderIndex();
-        orbitLog('[orbit] removeWebdavWorkspaceFolder: called; idx=' + idx);
-        if (idx < 0) return false;
-        // Note: if this is the only workspace folder, VS Code will
+    function removeWebdavWorkspaceFolders() {
+        const existing = findWebdavFolderIndices();
+        if (existing.length === 0) return false;
+        // Note: if these are the only workspace folders, VS Code will
         // force a window reload. The `orbit.explicitlyStopped`
         // workspaceState flag set by orbit.stop prevents auto-start
         // from running after that reload.
-        const ok = vscode.workspace.updateWorkspaceFolders(idx, 1);
-        orbitLog('[orbit] removeWebdavWorkspaceFolder: updateWorkspaceFolders=' + ok);
+        let ok = true;
+        // Remove from the end so earlier indices don't shift.
+        for (let k = existing.length - 1; k >= 0; k--) {
+            const r = vscode.workspace.updateWorkspaceFolders(existing[k].index, 1);
+            ok = ok && r;
+        }
+        orbitLog('[orbit] removeWebdavWorkspaceFolders: removed ' +
+            existing.length + ' folders ok=' + ok);
         return ok;
     }
 
@@ -470,7 +634,7 @@ module.exports = function (vscode) {
 
         const orbitServer = {
             type: 'http',
-            url: `http://${mcpHost}:15072/mcpservice/v1/mcp`
+            url: mcpUrlFor(backendByName('2300-backend'))
         };
         if (bearer) {
             orbitServer.headers = { Authorization: `Bearer ${bearer}` };
@@ -560,10 +724,17 @@ module.exports = function (vscode) {
     // Start the Orbit web server. If `openBrowser` is true, also reveal
     // the integrated browser at the orbit.html URL. Returns a promise that
     // resolves once the server is listening (or immediately if already up).
+    // Fired when the orbit tree view should refresh (e.g. the Orbit
+    // web server's running state has changed). Set by the activity-bar
+    // view registration; safe to call before then.
+    let orbitTreeChangeFire = null;
     function setRunningContext(running) {
         try {
             vscode.commands.executeCommand('setContext', 'orbit.running', !!running);
         } catch (_) {}
+        if (orbitTreeChangeFire) {
+            try { orbitTreeChangeFire(); } catch (_) {}
+        }
     }
 
     // Open or refocus the Orbit page in the Integrated Browser, falling
@@ -603,6 +774,159 @@ module.exports = function (vscode) {
             }
 
             const app = require(path.join(context.extensionPath, 'app'));
+            // Server-Sent Events endpoint that streams MCP server
+            // state changes to the Orbit webapp. The page subscribes
+            // via EventSource and dispatches each event to
+            // window.mcpServerNotification(payload).
+            // Register on app.extensionRoutes so the route is matched
+            // before app-impl.js's 404 catchall.
+            (app.extensionRoutes || app).get('/mcp-events', (req, res) => {
+                res.writeHead(200, {
+                    'Content-Type': 'text/event-stream',
+                    'Cache-Control': 'no-cache, no-transform',
+                    'Connection': 'keep-alive',
+                    'X-Accel-Buffering': 'no'
+                });
+                // Initial snapshot so newly-connected clients can
+                // sync without waiting for the next change.
+                for (const s of mcpServers) {
+                    res.write(`data: ${JSON.stringify({ name: s.name, running: !!s.getRunning() })}\n\n`);
+                }
+                const subscriber = (payload) => {
+                    try { res.write(`data: ${JSON.stringify(payload)}\n\n`); }
+                    catch (_) { /* will be cleaned up on close */ }
+                };
+                mcpStateSubscribers.add(subscriber);
+                const keepAlive = setInterval(() => {
+                    try { res.write(': ping\n\n'); } catch (_) {}
+                }, 25000);
+                req.on('close', () => {
+                    clearInterval(keepAlive);
+                    mcpStateSubscribers.delete(subscriber);
+                });
+            });
+
+            // POST /fs-changed
+            //
+            // Server-side change notification from the Smalltalk image,
+            // forwarded through SqueakJS in the Orbit page. Body:
+            //   { port: 19070,
+            //     paths?: ['/search/results', ...],
+            //     readOnlyPaths?: ['/classes/Object/methods/yourself', ...],
+            //     writablePaths?: ['/search/query', ...] }
+            // `port` is the backend's WebDAV port (the Smalltalk image
+            // knows its own listen port; the Orbit-side backend name
+            // is an internal label it shouldn't need to know). When
+            // `paths` is omitted (or empty), every directory the
+            // FileSystemProvider has ever served under that backend
+            // is invalidated. Each entry in `paths` is invalidated
+            // individually. `readOnlyPaths` asserts those URIs as
+            // read-only (surfaced as FilePermissions.Readonly in
+            // stat); `writablePaths` clears the assertion. Both lists
+            // are also invalidated so VS Code re-stats and picks up
+            // the new permissions. VS Code re-calls readDirectory/
+            // stat on any cached URI we fire a Changed event for.
+            (app.extensionRoutes || app).post('/fs-changed', (req, res) => {
+                // `app.use(express.json())` runs upstream of this
+                // handler, so by the time we get the request the JSON
+                // body has already been parsed onto req.body. We do
+                // NOT re-read req via 'data' events here — those
+                // would never fire and the response would hang.
+                const body = (req && req.body) || {};
+                if (!webdavProvider) {
+                    res.statusCode = 503;
+                    res.setHeader('content-type', 'application/json');
+                    res.end(JSON.stringify({ error: 'webdav provider not registered' }));
+                    return;
+                }
+                const port = Number(body.port);
+                const backend = Number.isFinite(port)
+                    ? BACKENDS.find(b => b.webdavPort === port)
+                    : null;
+                if (!backend) {
+                    res.statusCode = 400;
+                    res.setHeader('content-type', 'application/json');
+                    res.end(JSON.stringify({
+                        error: 'unknown webdav port: ' + body.port
+                    }));
+                    return;
+                }
+                let extras = [];
+                if (Array.isArray(body.paths) && body.paths.length) {
+                    extras = body.paths.map((p) => {
+                        const pp = ('/' + String(p)).replace(/\/+/g, '/');
+                        return vscode.Uri.parse(`orbit-webdav://${backend.name}${pp}`);
+                    });
+                }
+                // Apply read-only assertions. The named URIs are also
+                // invalidated so VS Code re-stats them and observes
+                // the updated FilePermissions.
+                const toUri = (p) => {
+                    const pp = ('/' + String(p)).replace(/\/+/g, '/');
+                    return vscode.Uri.parse(`orbit-webdav://${backend.name}${pp}`);
+                };
+                let roChanged = 0, rwChanged = 0;
+                if (Array.isArray(body.readOnlyPaths)) {
+                    for (const p of body.readOnlyPaths) {
+                        const uri = toUri(p);
+                        if (webdavProvider.setReadOnly(uri, true)) roChanged++;
+                        extras.push(uri);
+                    }
+                }
+                if (Array.isArray(body.writablePaths)) {
+                    for (const p of body.writablePaths) {
+                        const uri = toUri(p);
+                        if (webdavProvider.setReadOnly(uri, false)) rwChanged++;
+                        extras.push(uri);
+                    }
+                }
+                // If no specific paths given, refresh every URI we've
+                // ever served for this backend.
+                if (!extras.length) {
+                    try {
+                        for (const uri of webdavProvider._readDirs.values()) {
+                            if (uri.authority === backend.name) extras.push(uri);
+                        }
+                    } catch (_) {}
+                }
+                let fired = 0;
+                try { fired = webdavProvider.refresh(extras); }
+                catch (e) {
+                    orbitError('[orbit] /fs-changed refresh failed:', e && e.message);
+                    res.statusCode = 500;
+                    res.setHeader('content-type', 'application/json');
+                    res.end(JSON.stringify({ error: e && e.message || String(e) }));
+                    return;
+                }
+                // onDidChangeFile events alone aren't reliably picked
+                // up by the Files Explorer tree model for our
+                // in-process FileSystemProvider — possibly because
+                // our watch() is a no-op so the file service doesn't
+                // consider any URI "watched". Force a tree refresh
+                // so stale children disappear immediately.
+                vscode.commands.executeCommand(
+                    'workbench.files.action.refreshFilesExplorer'
+                ).then(undefined, (e) => {
+                    orbitError('[orbit] /fs-changed: explorer refresh failed:',
+                        e && e.message);
+                });
+                const pathSummary = Array.isArray(body.paths) && body.paths.length
+                    ? (body.paths.length <= 5
+                        ? body.paths.join(', ')
+                        : body.paths.slice(0, 5).join(', ') +
+                          ` (+${body.paths.length - 5} more)`)
+                    : '<all>';
+                orbitLog(
+                    `[orbit] /fs-changed: backend=${backend.name}` +
+                    ` port=${port} paths=${pathSummary}` +
+                    ` ro+=${roChanged} rw+=${rwChanged}` +
+                    ` fired=${fired}`
+                );
+                res.statusCode = 200;
+                res.setHeader('content-type', 'application/json');
+                res.end(JSON.stringify({ ok: true, fired }));
+            });
+
             server = http.createServer(app);
 
             server.listen(8089, () => {
@@ -642,6 +966,185 @@ module.exports = function (vscode) {
         return bearer;
     }
 
+    // True iff VS Code is currently connected to the MCP server for
+    // the named backend. We detect this by looking for any
+    // LanguageModelTool whose name starts with `mcp_<backend>_`,
+    // which is the naming convention VS Code uses for MCP-provided
+    // tools. This is more reliable than trusting the
+    // `workbench.mcp.startServer` command's resolved promise: that
+    // command resolves before VS Code has actually negotiated tools
+    // with the server, and it resolves successfully even when the
+    // connection later drops.
+    //
+    // CAVEAT: vscode.lm.tools is not always invalidated when the
+    // MCP client disconnects (the MCP servers panel can show
+    // "stopped" while tool entries linger), so this is an
+    // optimistic check. Use isMcpServerConnected() for an
+    // authoritative answer.
+    function isMcpServerActuallyRunning(name) {
+        try {
+            const tools = (vscode.lm && vscode.lm.tools) || [];
+            const prefix = `mcp_${name}_`;
+            for (const t of tools) {
+                const n = (t && t.name) || '';
+                if (n.startsWith(prefix)) return true;
+            }
+            return false;
+        } catch (_) { return false; }
+    }
+
+    // Authoritative connectivity check: actually invoke the
+    // backend's echoMessage tool (which every Orbit backend exposes).
+    // If the invocation resolves, VS Code's MCP client is connected
+    // to the server. If it rejects or times out, it isn't. We do
+    // this rather than trust vscode.lm.tools alone because lm.tools
+    // can retain stale entries after a disconnect.
+    async function isMcpServerConnected(name) {
+        try {
+            const toolName = `mcp_${name}_echoMessage`;
+            const tools = (vscode.lm && vscode.lm.tools) || [];
+            const tool = tools.find(t => t && t.name === toolName);
+            if (!tool) return false;
+            const cts = new vscode.CancellationTokenSource();
+            const timer = setTimeout(() => cts.cancel(), 1500);
+            try {
+                await vscode.lm.invokeTool(toolName, {
+                    input: { message: 'orbit-heartbeat' },
+                    toolInvocationToken: undefined
+                }, cts.token);
+                return true;
+            } finally {
+                clearTimeout(timer);
+                cts.dispose();
+            }
+        } catch (_) {
+            return false;
+        }
+    }
+
+    // Probe every backend and, for those that respond, ensure that
+    //   (a) its MCP definition is visible to VS Code, and
+    //   (b) its MCP server has been asked to start.
+    // WebDAV mounts are added separately (once per activation, plus
+    // when orbit.start runs); Smalltalk-side updates are then pushed
+    // to the extension via POST /fs-changed and do not require
+    // polling. Safe to call repeatedly: we only issue startServer for
+    // backends whose MCP tools aren't yet visible to vscode.lm.tools.
+    // Returns true iff every backend in BACKENDS has its MCP server
+    // confirmed running (tools visible).
+    async function activateReachableBackends() {
+        // Reconcile cached running flags with reality, but only
+        // for backends we don't already believe to be running.
+        // Once we've successfully connected an MCP server, we treat
+        // it as sticky: heartbeating a connected server can trigger
+        // VS Code's OAuth flow to re-prompt the user if the token
+        // has expired or the MCP client has dropped, which violates
+        // the contract that an MCP server stays connected until the
+        // user clicks Stop Orbit or quits VS Code. So we only probe
+        // backends whose state is currently "not running"; ones
+        // already marked running stay that way until an explicit
+        // stop (setRunning(false) or orbit.stop) clears the flag.
+        for (const b of BACKENDS) {
+            if (mcpRunning[b.name]) continue;
+            const actual = await isMcpServerConnected(b.name);
+            if (actual) {
+                mcpRunning[b.name] = true;
+                notifyMcpState(b.name, true);
+                orbitLog(`[orbit] activateReachableBackends: ${b.name} running=true (reconciled)`);
+            }
+        }
+        const probes = await Promise.all(BACKENDS.map(async (b) => {
+            const mcp = mcpRunning[b.name]
+                ? true
+                : await probeTcp(mcpHost, b.mcpPort, 800);
+            return { b, mcp };
+        }));
+        let definitionsChanged = false;
+        for (const { b, mcp } of probes) {
+            if (mcp && !mcpReachable.has(b.name)) {
+                mcpReachable.add(b.name);
+                definitionsChanged = true;
+            }
+        }
+        if (definitionsChanged && mcpDefinitionsChanged) {
+            mcpDefinitionsChanged.fire();
+        }
+        for (const { b, mcp } of probes) {
+            if (!mcp || mcpRunning[b.name]) continue;
+            try {
+                await vscode.commands.executeCommand(
+                    'workbench.mcp.startServer',
+                    mcpServerIdFor(b.name),
+                    { autoTrustChanges: true }
+                );
+                orbitLog(`[orbit] activateReachableBackends: MCP startServer ${b.name} resolved`);
+            } catch (e) {
+                orbitError(`[orbit] activateReachableBackends: MCP start ${b.name} failed:`,
+                    e && e.message);
+                continue;
+            }
+            // The startServer command resolves before tools are
+            // negotiated. Round-trip a real echoMessage invocation
+            // to confirm VS Code is connected to the server before
+            // flipping the UI flag. If verification times out,
+            // leave the flag false so the next retry tick re-issues
+            // the start.
+            let verified = false;
+            for (let i = 0; i < 24; i++) {
+                if (await isMcpServerConnected(b.name)) { verified = true; break; }
+                await new Promise(r => setTimeout(r, 250));
+            }
+            if (verified) {
+                mcpRunning[b.name] = true;
+                notifyMcpState(b.name, true);
+                orbitLog(`[orbit] activateReachableBackends: MCP ${b.name} confirmed running`);
+            } else {
+                orbitError(`[orbit] activateReachableBackends: MCP ${b.name} startServer resolved but no tools appeared; will retry`);
+            }
+        }
+        if (orbitTreeChangeFire) {
+            try { orbitTreeChangeFire(); } catch (_) {}
+        }
+        return BACKENDS.every(b => mcpRunning[b.name]);
+    }
+
+    // Periodically retry activateReachableBackends so a backend that
+    // wasn't ready at activate() (slow Smalltalk image, restarting
+    // backend, etc.) still gets its MCP server started and WebDAV
+    // folder mounted once it comes up. Backs off to a slow poll once
+    // every backend is activated.
+    let activateBackendsTimer = null;
+    function scheduleBackendActivationRetries() {
+        if (activateBackendsTimer) return;
+        let attempt = 0;
+        const tick = async () => {
+            attempt++;
+            let allUp = false;
+            try { allUp = await activateReachableBackends(); }
+            catch (e) { orbitError('[orbit] activation retry failed:', e && e.message); }
+            if (allUp) {
+                // All MCP backends are connected. Stop polling: any
+                // further activateReachableBackends call risks
+                // re-issuing workbench.mcp.startServer (which can
+                // trigger VS Code's OAuth re-prompt) if a heartbeat
+                // ever flaked. The user explicitly stops via the
+                // Stop Orbit button or by quitting VS Code.
+                activateBackendsTimer = null;
+                orbitLog('[orbit] activation retry: all backends up; stopping retry loop');
+                return;
+            }
+            const delay = Math.min(1000 * Math.pow(1.5, attempt), 10000);
+            activateBackendsTimer = setTimeout(tick, delay);
+        };
+        activateBackendsTimer = setTimeout(tick, 1000);
+    }
+    function stopBackendActivationRetries() {
+        if (activateBackendsTimer) {
+            clearTimeout(activateBackendsTimer);
+            activateBackendsTimer = null;
+        }
+    }
+
     function activate(context) {
         const ch = ensureOutputChannel();
         if (ch) context.subscriptions.push(ch);
@@ -661,12 +1164,16 @@ module.exports = function (vscode) {
         try {
             const createWebdavFs = require('./webdav-fs');
             const { provider, scheme } = createWebdavFs(vscode, {
-                baseUrl: webdavUrl(),
+                getBaseUrl: (authority) => {
+                    const b = backendByName(authority);
+                    return b ? webdavUrlFor(b) : null;
+                },
                 getAuthHeader: () => {
                     const b = readBearer(context.extensionPath);
                     return b ? 'Bearer ' + b : null;
                 }
             });
+            webdavProvider = provider;
             const reg = vscode.workspace.registerFileSystemProvider(scheme, provider, {
                 isCaseSensitive: true,
                 isReadonly: false
@@ -676,6 +1183,40 @@ module.exports = function (vscode) {
         } catch (e) {
             orbitError('[orbit] webdav FS provider registration failed:', e && e.message);
         }
+
+        // Command: force-refresh every mounted orbit-webdav folder.
+        // VS Code caches readDirectory/stat results until the FS
+        // provider fires an onDidChangeFile event; this command fires
+        // Changed events for the roots of every orbit-webdav workspace
+        // folder (and every URI VS Code is currently watching), and
+        // then invokes the built-in Explorer refresh. Bound to F5 in
+        // the keybindings contribution so users can press F5 to
+        // re-fetch after Smalltalk-side changes.
+        const refreshWebdavCmd = vscode.commands.registerCommand(
+            'orbit.refreshWebdav', async () => {
+                let fired = 0;
+                if (webdavProvider) {
+                    const roots = (vscode.workspace.workspaceFolders || [])
+                        .filter(f => f.uri.scheme === 'orbit-webdav')
+                        .map(f => f.uri);
+                    try { fired = webdavProvider.refresh(roots); }
+                    catch (e) {
+                        orbitError('[orbit] refreshWebdav: provider.refresh failed:',
+                            e && e.message);
+                    }
+                }
+                try {
+                    await vscode.commands.executeCommand(
+                        'workbench.files.action.refreshFilesExplorer'
+                    );
+                } catch (e) {
+                    orbitError('[orbit] refreshWebdav: explorer refresh failed:',
+                        e && e.message);
+                }
+                orbitLog('[orbit] refreshWebdav: invalidated ' + fired + ' URI(s)');
+            }
+        );
+        context.subscriptions.push(refreshWebdavCmd);
 
         const startCmd = vscode.commands.registerCommand('orbit.start', async () => {
             orbitLog('[orbit] orbit.start: invoked');
@@ -694,36 +1235,42 @@ module.exports = function (vscode) {
             }
             await startServer(context, !keepExistingTab);
             orbitLog('[orbit] orbit.start: startServer done; webdavMountEnabled=' + webdavMountEnabled());
-            if (webdavMountEnabled()) addWebdavWorkspaceFolder();
-            // Re-publish the Orbit MCP definition (orbit.stop withdrew
-            // it) before asking VS Code to start the server.
+            // Re-publish the Orbit MCP definitions (orbit.stop withdrew
+            // them) before asking VS Code to start the servers.
             if (!mcpEnabled) {
                 mcpEnabled = true;
                 if (mcpDefinitionsChanged) mcpDefinitionsChanged.fire();
             }
-            // Best-effort: also start the Orbit MCP backend server so
-            // the user doesn't have to start it separately. The server
-            // id is `<extKey>/<label>`, where extKey is the lowercased
-            // extension identifier and label is the McpHttpServerDefinition
-            // label ('2300-backend').
-            try {
-                await vscode.commands.executeCommand(
-                    'workbench.mcp.startServer',
-                    ORBIT_MCP_SERVER_ID,
-                    { autoTrustChanges: true }
-                );
-            } catch (e) {
-                orbitError('[orbit] MCP startServer failed:', e && e.message);
+            // Best-effort: start every reachable Orbit MCP backend so
+            // the user doesn't have to do it by hand. The retry
+            // scheduler picks up any backend that wasn't yet reachable
+            // at this moment.
+            try { await activateReachableBackends(); }
+            catch (e) {
+                orbitError('[orbit] orbit.start: activateReachableBackends failed:',
+                    e && e.message);
             }
+            // Mount the WebDAV folders once. Smalltalk-side changes
+            // are pushed via POST /fs-changed, so no polling.
+            if (webdavMountEnabled()) {
+                try { await addWebdavWorkspaceFolders(); }
+                catch (e) {
+                    orbitError('[orbit] orbit.start: addWebdavWorkspaceFolders failed:',
+                        e && e.message);
+                }
+            }
+            scheduleBackendActivationRetries();
         });
 
         const stopCmd = vscode.commands.registerCommand('orbit.stop', async (opts) => {
             const keepTabs = !!(opts && opts.keepTabs);
-            orbitLog('[orbit] orbit.stop: invoked; keepTabs=' + keepTabs);
+            const silent = !!(opts && opts.silent);
+            orbitLog('[orbit] orbit.stop: invoked; keepTabs=' + keepTabs + ' silent=' + silent);
             // Only treat this as an explicit user stop when invoked
             // standalone (not as part of orbit.start's restart cycle,
-            // which signals itself via opts.keepTabs).
-            if (!keepTabs) {
+            // which signals itself via opts.keepTabs; nor from the
+            // activate-time auto-close, which uses opts.silent).
+            if (!keepTabs && !silent) {
                 try { context.workspaceState.update(EXPLICIT_STOP_KEY, Date.now()); } catch (_) {}
             }
             if (server) {
@@ -743,9 +1290,9 @@ module.exports = function (vscode) {
                         }
                     });
                 } catch (_) {}
-                vscode.window.showInformationMessage('Orbit stopped.');
+                if (!silent) vscode.window.showInformationMessage('Orbit stopped.');
             } else {
-                vscode.window.showInformationMessage('Orbit is not running.');
+                if (!silent) vscode.window.showInformationMessage('Orbit is not running.');
             }
             // Close any browser tabs showing the Orbit page (Simple
             // Browser viewType `mainThreadWebview-simpleBrowser.view`,
@@ -783,25 +1330,30 @@ module.exports = function (vscode) {
             } catch (e) {
                 orbitError('[orbit] closing browser tab failed:', e && e.message);
             }
-            // Only remove the WebDAV workspace folder when the user
-            // explicitly stopped Orbit. When orbit.stop is invoked as
-            // part of orbit.start's restart cycle (keepTabs=true), the
-            // remove + re-add races against VS Code's async folder
-            // mutation pipeline and the re-add silently fails on the
-            // first attempt — leaving the user with no WebDAV folder
-            // until they retry. The FS provider stays registered for
-            // the lifetime of the extension, so the folder remains
-            // functional across a server restart.
-            if (!keepTabs && webdavMountEnabled()) removeWebdavWorkspaceFolder();
-            // Stop the Orbit MCP backend connection and withdraw its
-            // definition so it disappears from the MCP servers list.
-            try {
-                await vscode.commands.executeCommand(
-                    'workbench.mcp.stopServer',
-                    ORBIT_MCP_SERVER_ID
-                );
-            } catch (e) {
-                orbitError('[orbit.stop] MCP stopServer failed:', e && e.message);
+            // Always remove WebDAV workspace folders when Orbit is
+            // stopped (except during orbit.start's internal restart
+            // cycle, signalled by keepTabs=true: the remove + re-add
+            // races against VS Code's async folder mutation pipeline
+            // and the re-add silently fails on the first attempt).
+            // This runs regardless of the mountWebdav setting or the
+            // current workspace, so a stopped Orbit never leaves
+            // Smalltalk filesystems mounted. The FS provider stays
+            // registered for the lifetime of the extension, so the
+            // folder can be re-added later without re-registering.
+            if (!keepTabs) removeWebdavWorkspaceFolders();
+            // Stop the Orbit MCP backend connections and withdraw the
+            // definitions so they disappear from the MCP servers list.
+            for (const b of BACKENDS) {
+                try {
+                    await vscode.commands.executeCommand(
+                        'workbench.mcp.stopServer',
+                        mcpServerIdFor(b.name)
+                    );
+                } catch (e) {
+                    orbitError(`[orbit.stop] MCP stopServer ${b.name} failed:`, e && e.message);
+                }
+                mcpRunning[b.name] = false;
+                notifyMcpState(b.name, false);
             }
             if (mcpEnabled) {
                 mcpEnabled = false;
@@ -823,8 +1375,29 @@ module.exports = function (vscode) {
         // orbit-webdav:// scheme registered above; no host-OS WebDAV
         // client is required.
         const addWebdavFolderCmd = vscode.commands.registerCommand('orbit.addWebdavFolder', async () => {
+            // Ask which backend's WebDAV root to mount under, then
+            // which subpath. Only show backends that pass a quick TCP
+            // probe so the user can't pick an unreachable one.
+            const reachable = await reachableBackends('webdav');
+            if (reachable.length === 0) {
+                vscode.window.showErrorMessage(
+                    'Orbit: no Smalltalk WebDAV servers are reachable.'
+                );
+                return;
+            }
+            let backend;
+            if (reachable.length === 1) {
+                backend = reachable[0];
+            } else {
+                const pick = await vscode.window.showQuickPick(
+                    reachable.map(b => ({ label: b.name, backend: b })),
+                    { title: 'Orbit: choose a Smalltalk backend', ignoreFocusOut: true }
+                );
+                if (!pick) return;
+                backend = pick.backend;
+            }
             const subpath = await vscode.window.showInputBox({
-                title: 'Orbit: Add WebDAV Folder to Workspace',
+                title: `Orbit: Add WebDAV Folder to Workspace (${backend.name})`,
                 prompt: 'Subpath under the WebDAV root. Leave blank to add the root.',
                 placeHolder: 'classes/Object',
                 ignoreFocusOut: true,
@@ -833,7 +1406,7 @@ module.exports = function (vscode) {
             if (subpath === undefined) return; // user cancelled
             const cleaned = subpath.replace(/^[\\/]+/, '').replace(/[\\/]+$/, '');
             const uriPath = '/' + cleaned;
-            const uri = vscode.Uri.parse('orbit-webdav://orbit' + uriPath);
+            const uri = vscode.Uri.parse(`orbit-webdav://${backend.name}${uriPath}`);
 
             // Probe the path so we fail fast with a useful message
             // instead of silently adding a broken folder.
@@ -854,7 +1427,8 @@ module.exports = function (vscode) {
                 );
                 return;
             }
-            const name = cleaned ? `Smalltalk:${cleaned}` : 'Smalltalk';
+            const baseName = webdavFolderLabelFor(backend.name);
+            const name = cleaned ? `${baseName}:${cleaned}` : baseName;
             const ok = vscode.workspace.updateWorkspaceFolders(
                 existing.length, 0, { uri, name }
             );
@@ -912,38 +1486,307 @@ module.exports = function (vscode) {
         // `orbit.status`. Welcome content (declared in package.json)
         // shows a single Start/Stop button driven by the
         // `orbit.running` context key, which we maintain below.
-        // When the view first becomes visible (the user clicked the
-        // Orbit icon in the activity bar), auto-start Orbit if it
-        // isn't already running. Once the user has explicitly stopped
-        // it via the Stop Orbit button, they'll restart it from the
-        // same view, so we only auto-start if the server isn't up.
+        // The view is passive: opening it (clicking the Orbit icon
+        // in the activity bar) does not auto-start Orbit. The user
+        // explicitly starts Orbit by clicking the "Start Orbit"
+        // button in the view.
+        // Activity Bar view: tree provider showing
+        //   [summary header]
+        //   [WebDAV section]          (checkbox; toggles mountWebdav)
+        //   [MCP server checkboxes]   (visible when Orbit is running)
+        //   [Start/Stop Orbit button]
+        // The summary row is informational. The WebDAV checkbox
+        // mirrors the `orbit.mountWebdav` setting; toggling it
+        // updates the setting and adds/removes the orbit-webdav
+        // workspace folders accordingly. Each MCP server row has
+        // a checkbox whose state mirrors the server's running state;
+        // toggling it starts/stops that server and notifies the
+        // webapp via SSE -> window.mcpServerNotification(payload).
+        // The footer row is a button that runs orbit.start or
+        // orbit.stop depending on whether the Orbit web server is up.
         try {
-            const treeDataProvider = {
-                getTreeItem: (el) => el,
-                getChildren: () => []
-            };
-            const treeView = vscode.window.createTreeView('orbit.status', {
-                treeDataProvider,
-                showCollapseAll: false
-            });
-            const maybeAutoStart = async () => {
-                if (server) return;
-                orbitLog('[orbit] activity bar maybeAutoStart: starting server');
-                try {
-                    await startServer(context, true);
-                } catch (e) {
-                    orbitError('[orbit] auto-start from activity bar failed:', e && e.message);
+            let currentWebviewView = null;
+            // Serial counter so a slow heartbeat from an earlier
+            // postState call doesn't overwrite a fresher result.
+            let postStateSeq = 0;
+
+            async function postState() {
+                if (!currentWebviewView) return;
+                const mySeq = ++postStateSeq;
+                const orbitRunning = !!server;
+                // Report the cached running state. We deliberately
+                // do NOT heartbeat already-connected servers here:
+                // an echoMessage tool invocation against a server
+                // whose OAuth token has expired or whose MCP client
+                // has dropped can trigger VS Code to re-prompt the
+                // user for authentication. The contract is that an
+                // MCP server stays connected until the user clicks
+                // Stop Orbit or quits VS Code, so once mcpRunning
+                // is true we leave it true; it only flips false on
+                // explicit stop (setRunning(false) or orbit.stop).
+                // For backends not yet marked running, a heartbeat
+                // is safe (and useful: it picks up a server that
+                // VS Code connected to without going through our
+                // setRunning path, e.g. after window reload).
+                const servers = orbitRunning
+                    ? await Promise.all(mcpServers.map(async (s) => {
+                        if (mcpRunning[s.name]) {
+                            return { name: s.name, running: true };
+                        }
+                        const connected = await isMcpServerConnected(s.name);
+                        if (connected) {
+                            mcpRunning[s.name] = true;
+                        }
+                        return { name: s.name, running: connected };
+                    }))
+                    : [];
+                if (mySeq !== postStateSeq) return;
+                if (!currentWebviewView) return;
+                const payload = {
+                    type: 'state',
+                    orbitRunning,
+                    webdavEnabled: webdavMountEnabled(),
+                    servers
+                };
+                try { currentWebviewView.webview.postMessage(payload); } catch (_) {}
+            }
+            orbitTreeChangeFire = () => postState();
+
+            function getHtml(webview, nonce) {
+                const csp = [
+                    "default-src 'none'",
+                    `style-src ${webview.cspSource} 'unsafe-inline'`,
+                    `script-src 'nonce-${nonce}'`
+                ].join('; ');
+                return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="${csp}">
+<style>
+  body {
+    font-family: var(--vscode-font-family);
+    font-size: var(--vscode-font-size);
+    color: var(--vscode-foreground);
+    padding: 8px 12px;
+    margin: 0;
+    box-sizing: border-box;
+  }
+  .summary {
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    white-space: normal;
+    line-height: 1.4;
+  }
+  hr {
+    border: none;
+    border-top: 1px solid var(--vscode-panel-border, var(--vscode-editorWidget-border, rgba(128,128,128,0.35)));
+    margin: 10px 0;
+  }
+  .section-label {
+    font-weight: bold;
+    margin-bottom: 6px;
+  }
+  .server {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 0;
+  }
+  .server input[type="checkbox"] {
+    margin: 0;
+    cursor: pointer;
+  }
+  .server .name { flex: 0 0 auto; }
+  .server .status {
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.9em;
+  }
+  .footer-button {
+    width: 100%;
+    text-align: center;
+    cursor: pointer;
+    padding: 4px 10px;
+    border: 1px solid var(--vscode-button-border, transparent);
+    color: var(--vscode-button-foreground);
+    background: var(--vscode-button-background);
+    border-radius: 2px;
+    font-family: inherit;
+    font-size: inherit;
+  }
+  .footer-button:hover { background: var(--vscode-button-hoverBackground); }
+</style>
+</head>
+<body>
+  <div class="summary">Orbit pair-programs Smalltalk with you.</div>
+  <hr>
+  <div class="section-label">virtual filesystems</div>
+  <div class="server">
+    <input type="checkbox" id="webdav-toggle">
+    <label for="webdav-toggle" class="name">mount Smalltalk folders</label>
+  </div>
+  <hr id="hr-top">
+  <div id="mcp-section-label" class="section-label">remote systems</div>
+  <div id="servers"></div>
+  <hr>
+  <button id="orbit-toggle" class="footer-button">Start Orbit</button>
+
+<script nonce="${nonce}">
+  const vscode = acquireVsCodeApi();
+  const serversEl = document.getElementById('servers');
+  const toggleBtn = document.getElementById('orbit-toggle');
+  const webdavCb = document.getElementById('webdav-toggle');
+
+  toggleBtn.addEventListener('click', () => {
+    vscode.postMessage({ type: 'toggleOrbit' });
+  });
+
+  webdavCb.addEventListener('change', () => {
+    vscode.postMessage({ type: 'toggleWebdav', desired: webdavCb.checked });
+  });
+
+  function render(state) {
+    toggleBtn.textContent = state.orbitRunning ? 'Stop Orbit' : 'Start Orbit';
+    webdavCb.checked = !!state.webdavEnabled;
+    const hasServers = state.servers && state.servers.length > 0;
+    document.getElementById('hr-top').style.display = hasServers ? '' : 'none';
+    document.getElementById('mcp-section-label').style.display = hasServers ? '' : 'none';
+    serversEl.innerHTML = '';
+    for (const s of state.servers) {
+      const row = document.createElement('div');
+      row.className = 'server';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = !!s.running;
+      cb.id = 'cb-' + s.name;
+      cb.addEventListener('change', () => {
+        vscode.postMessage({
+          type: 'toggleServer',
+          name: s.name,
+          desired: cb.checked
+        });
+      });
+      const label = document.createElement('label');
+      label.className = 'name';
+      label.htmlFor = cb.id;
+      label.textContent = s.name;
+      const status = document.createElement('span');
+      status.className = 'status';
+      status.textContent = s.running ? 'running' : 'stopped';
+      row.appendChild(cb);
+      row.appendChild(label);
+      row.appendChild(status);
+      serversEl.appendChild(row);
+    }
+  }
+
+  window.addEventListener('message', (e) => {
+    const msg = e.data;
+    if (msg && msg.type === 'state') render(msg);
+  });
+  vscode.postMessage({ type: 'ready' });
+</script>
+</body>
+</html>`;
+            }
+
+            const provider = {
+                resolveWebviewView(webviewView) {
+                    currentWebviewView = webviewView;
+                    webviewView.webview.options = { enableScripts: true };
+                    const nonce = Math.random().toString(36).slice(2) +
+                        Math.random().toString(36).slice(2);
+                    webviewView.webview.html = getHtml(webviewView.webview, nonce);
+
+                    webviewView.webview.onDidReceiveMessage(async (msg) => {
+                        if (!msg) return;
+                        if (msg.type === 'ready') {
+                            postState();
+                            return;
+                        }
+                        if (msg.type === 'toggleOrbit') {
+                            try {
+                                if (server) {
+                                    await vscode.commands.executeCommand('orbit.stop');
+                                } else {
+                                    await vscode.commands.executeCommand('orbit.start');
+                                }
+                            } catch (e) {
+                                orbitError('[orbit] toggleOrbit failed:', e && e.message);
+                            }
+                            postState();
+                            return;
+                        }
+                        if (msg.type === 'toggleServer') {
+                            const srv = mcpServers.find(s => s.name === msg.name);
+                            if (!srv) { postState(); return; }
+                            const desired = !!msg.desired;
+                            if (!!srv.getRunning() === desired) { postState(); return; }
+                            try {
+                                await srv.setRunning(desired);
+                            } catch (e) {
+                                orbitError('[orbit] MCP setRunning failed:', e && e.message);
+                            }
+                            notifyMcpState(srv.name, !!srv.getRunning());
+                            postState();
+                            return;
+                        }
+                        if (msg.type === 'toggleWebdav') {
+                            const desired = !!msg.desired;
+                            try {
+                                await vscode.workspace
+                                    .getConfiguration('orbit')
+                                    .update(
+                                        'mountWebdav',
+                                        desired,
+                                        vscode.ConfigurationTarget.Global
+                                    );
+                            } catch (e) {
+                                orbitError('[orbit] mountWebdav update failed:', e && e.message);
+                                postState();
+                                return;
+                            }
+                            try {
+                                if (desired) {
+                                    await addWebdavWorkspaceFolders();
+                                } else {
+                                    removeWebdavWorkspaceFolders();
+                                }
+                            } catch (e) {
+                                orbitError('[orbit] toggleWebdav apply failed:', e && e.message);
+                            }
+                            postState();
+                            return;
+                        }
+                    });
+
+                    webviewView.onDidDispose(() => {
+                        if (currentWebviewView === webviewView) currentWebviewView = null;
+                    });
+
+                    // Re-post when the view becomes visible so a stale
+                    // UI (e.g. a backend dropped while the view was
+                    // hidden) gets corrected immediately.
+                    webviewView.onDidChangeVisibility(() => {
+                        if (webviewView.visible) postState();
+                    });
                 }
-                if (webdavMountEnabled()) {
-                    try { addWebdavWorkspaceFolder(); }
-                    catch (e) { orbitError('[orbit] activity bar webdav add failed:', e && e.message); }
-                }
             };
-            if (treeView.visible) maybeAutoStart();
-            const visSub = treeView.onDidChangeVisibility((e) => {
-                if (e.visible) maybeAutoStart();
+
+            const mcpRefresher = () => postState();
+            mcpStateSubscribers.add(mcpRefresher);
+
+            const cfgSub = vscode.workspace.onDidChangeConfiguration((e) => {
+                if (e.affectsConfiguration('orbit.mountWebdav')) postState();
             });
-            context.subscriptions.push(treeView, visSub);
+
+            const viewReg = vscode.window.registerWebviewViewProvider(
+                'orbit.status', provider,
+                { webviewOptions: { retainContextWhenHidden: true } }
+            );
+            context.subscriptions.push(viewReg, cfgSub, {
+                dispose: () => mcpStateSubscribers.delete(mcpRefresher)
+            });
         } catch (e) {
             orbitError('[orbit] activity bar view registration failed:', e && e.message);
         }
@@ -1063,110 +1906,227 @@ module.exports = function (vscode) {
             orbitError('[orbit] runIsolatedSubagent tool registration failed:', e && e.message);
         }
 
-        // Chat participant: @orbit
+        // Chat participants:
+        //   @orbit                 — unrestricted: all available tools
+        //   @orbit-<server>        — restricted to mcp_<server>_* tools
+        //                            (one per active Smalltalk MCP server)
         const agentMdPath = path.join(context.extensionPath, 'agents', 'orbit.agent.md');
         const agentInstructions = fs.readFileSync(agentMdPath, 'utf8');
 
-        const participant = vscode.chat.createChatParticipant('orbit.orbit', async (request, chatContext, response, token) => {
-            try {
-                const messages = [vscode.LanguageModelChatMessage.User(agentInstructions)];
+        function makeOrbitParticipantHandler(participantId, toolFilter, extraSystemNote) {
+            return async (request, chatContext, response, token) => {
+                try {
+                    const sysText = extraSystemNote
+                        ? agentInstructions + '\n\n' + extraSystemNote
+                        : agentInstructions;
+                    const messages = [vscode.LanguageModelChatMessage.User(sysText)];
 
-                // Replay chat history so multi-turn works.
-                for (const turn of (chatContext.history || [])) {
-                    if (turn instanceof vscode.ChatRequestTurn) {
-                        if (turn.participant === 'orbit.orbit') {
-                            messages.push(vscode.LanguageModelChatMessage.User(turn.prompt));
-                        }
-                    } else if (turn instanceof vscode.ChatResponseTurn) {
-                        if (turn.participant === 'orbit.orbit') {
-                            const text = (turn.response || [])
-                                .map(p => (p && p.value && typeof p.value.value === 'string') ? p.value.value : '')
-                                .join('');
-                            if (text) messages.push(vscode.LanguageModelChatMessage.Assistant(text));
+                    for (const turn of (chatContext.history || [])) {
+                        if (turn instanceof vscode.ChatRequestTurn) {
+                            if (turn.participant === participantId) {
+                                messages.push(vscode.LanguageModelChatMessage.User(turn.prompt));
+                            }
+                        } else if (turn instanceof vscode.ChatResponseTurn) {
+                            if (turn.participant === participantId) {
+                                const text = (turn.response || [])
+                                    .map(p => (p && p.value && typeof p.value.value === 'string') ? p.value.value : '')
+                                    .join('');
+                                if (text) messages.push(vscode.LanguageModelChatMessage.Assistant(text));
+                            }
                         }
                     }
-                }
 
-                messages.push(vscode.LanguageModelChatMessage.User(request.prompt));
+                    messages.push(vscode.LanguageModelChatMessage.User(request.prompt));
 
-                // Build the tool list available to the model. Filter out our own
-                // chat participant or anything without a description.
-                const allTools = (vscode.lm.tools || []).filter(t => t && t.name && t.description);
-                const toolMap = new Map(allTools.map(t => [t.name, t]));
-                const toolsForModel = allTools.map(t => ({
-                    name: t.name,
-                    description: t.description,
-                    inputSchema: t.inputSchema
-                }));
+                    const allTools = (vscode.lm.tools || []).filter(t => t && t.name && t.description);
+                    const filtered = toolFilter ? allTools.filter(toolFilter) : allTools;
+                    const toolMap = new Map(filtered.map(t => [t.name, t]));
+                    const toolsForModel = filtered.map(t => ({
+                        name: t.name,
+                        description: t.description,
+                        inputSchema: t.inputSchema
+                    }));
 
-                const MAX_ITERATIONS = 16;
-                for (let iter = 0; iter < MAX_ITERATIONS; iter++) {
-                    if (token.isCancellationRequested) return;
-
-                    const lmResponse = await request.model.sendRequest(
-                        messages,
-                        { tools: toolsForModel },
-                        token
-                    );
-
-                    const toolCalls = [];
-                    const assistantParts = [];
-                    for await (const part of lmResponse.stream) {
+                    const MAX_ITERATIONS = 16;
+                    for (let iter = 0; iter < MAX_ITERATIONS; iter++) {
                         if (token.isCancellationRequested) return;
-                        if (part instanceof vscode.LanguageModelTextPart) {
-                            response.markdown(part.value);
-                            assistantParts.push(part);
-                        } else if (part instanceof vscode.LanguageModelToolCallPart) {
-                            toolCalls.push(part);
-                            assistantParts.push(part);
+
+                        const lmResponse = await request.model.sendRequest(
+                            messages,
+                            { tools: toolsForModel },
+                            token
+                        );
+
+                        const toolCalls = [];
+                        const assistantParts = [];
+                        for await (const part of lmResponse.stream) {
+                            if (token.isCancellationRequested) return;
+                            if (part instanceof vscode.LanguageModelTextPart) {
+                                response.markdown(part.value);
+                                assistantParts.push(part);
+                            } else if (part instanceof vscode.LanguageModelToolCallPart) {
+                                toolCalls.push(part);
+                                assistantParts.push(part);
+                            }
+                        }
+
+                        if (toolCalls.length === 0) return;
+
+                        messages.push(vscode.LanguageModelChatMessage.Assistant(assistantParts));
+
+                        for (const call of toolCalls) {
+                            if (token.isCancellationRequested) return;
+                            const tool = toolMap.get(call.name);
+                            if (!tool) {
+                                messages.push(vscode.LanguageModelChatMessage.User([
+                                    new vscode.LanguageModelToolResultPart(call.callId, [
+                                        new vscode.LanguageModelTextPart(`Tool '${call.name}' is not available to this participant.`)
+                                    ])
+                                ]));
+                                continue;
+                            }
+                            try {
+                                response.progress(`Invoking ${call.name}…`);
+                                const result = await vscode.lm.invokeTool(call.name, {
+                                    input: call.input,
+                                    toolInvocationToken: request.toolInvocationToken
+                                }, token);
+                                messages.push(vscode.LanguageModelChatMessage.User([
+                                    new vscode.LanguageModelToolResultPart(call.callId, result.content)
+                                ]));
+                            } catch (toolErr) {
+                                messages.push(vscode.LanguageModelChatMessage.User([
+                                    new vscode.LanguageModelToolResultPart(call.callId, [
+                                        new vscode.LanguageModelTextPart(
+                                            `Tool '${call.name}' failed: ${toolErr && toolErr.message || toolErr}`
+                                        )
+                                    ])
+                                ]));
+                            }
                         }
                     }
 
-                    if (toolCalls.length === 0) return;
-
-                    // Record the assistant turn (text + tool calls) before tool results.
-                    messages.push(vscode.LanguageModelChatMessage.Assistant(assistantParts));
-
-                    for (const call of toolCalls) {
-                        if (token.isCancellationRequested) return;
-                        const tool = toolMap.get(call.name);
-                        if (!tool) {
-                            messages.push(vscode.LanguageModelChatMessage.User([
-                                new vscode.LanguageModelToolResultPart(call.callId, [
-                                    new vscode.LanguageModelTextPart(`Tool '${call.name}' is not available.`)
-                                ])
-                            ]));
-                            continue;
-                        }
-                        try {
-                            response.progress(`Invoking ${call.name}…`);
-                            const result = await vscode.lm.invokeTool(call.name, {
-                                input: call.input,
-                                toolInvocationToken: request.toolInvocationToken
-                            }, token);
-                            messages.push(vscode.LanguageModelChatMessage.User([
-                                new vscode.LanguageModelToolResultPart(call.callId, result.content)
-                            ]));
-                        } catch (toolErr) {
-                            messages.push(vscode.LanguageModelChatMessage.User([
-                                new vscode.LanguageModelToolResultPart(call.callId, [
-                                    new vscode.LanguageModelTextPart(
-                                        `Tool '${call.name}' failed: ${toolErr && toolErr.message || toolErr}`
-                                    )
-                                ])
-                            ]));
-                        }
-                    }
+                    response.markdown(`\n\n_(Tool-loop iteration cap reached.)_`);
+                } catch (e) {
+                    response.markdown(`\n\n**Orbit participant error:** ${e && e.message || e}`);
+                    orbitError('[orbit] participant error:', e);
                 }
+            };
+        }
 
-                response.markdown(`\n\n_(Tool-loop iteration cap reached.)_`);
-            } catch (e) {
-                response.markdown(`\n\n**Orbit participant error:** ${e && e.message || e}`);
-                orbitError('[orbit] participant error:', e);
-            }
-        });
+        // Tools whose name doesn't start with "mcp_" are non-MCP
+        // (e.g. orbit.runIsolatedSubagent). They're available to every
+        // Orbit participant. Per-server participants additionally only
+        // see MCP tools whose prefix matches their server.
+        function isNonMcpTool(t) { return !/^mcp_/.test(t.name); }
+        function makeServerToolFilter(serverName) {
+            const prefix = `mcp_${serverName}_`;
+            return (t) => isNonMcpTool(t) || t.name.startsWith(prefix);
+        }
+
+        const participant = vscode.chat.createChatParticipant(
+            'orbit.orbit',
+            makeOrbitParticipantHandler('orbit.orbit', null, null)
+        );
         participant.iconPath = vscode.Uri.joinPath(context.extensionUri, 'public', 'pictures', 'icons', 'participant', 'orbit.jpg');
         context.subscriptions.push(participant);
+
+        // Per-server participants. Each is created when its server is
+        // running and disposed when it stops, so the @-picker only
+        // lists currently-available servers.
+        //
+        // Steering: every Orbit participant gets the shared base
+        // (agents/orbit.agent.md). A per-server participant additionally
+        // appends, in order:
+        //   1. Contents of the file in `instructionsFile`, if present
+        //      and readable. Path is resolved relative to extension root,
+        //      so it survives livecoding symlinks. Default convention:
+        //      agents/orbit-<serverName>.agent.md.
+        //   2. The auto-generated restriction note telling the model
+        //      which MCP-tool prefix it's allowed to use.
+        // Edit the per-server .md file (or change `instructionsFile`)
+        // to control steering for that participant. Reload to pick up
+        // changes; the file is read each time the participant is
+        // created (i.e. whenever the server transitions to running),
+        // so a stop/start of the MCP server is enough to re-read.
+        const PER_SERVER_PARTICIPANTS = [
+            {
+                serverName: '2300-backend',
+                participantId: 'orbit.orbit-2300-backend',
+                instructionsFile: 'agents/orbit-2300-backend.agent.md'
+            },
+            {
+                serverName: '2300-ui',
+                participantId: 'orbit.orbit-2300-ui',
+                instructionsFile: 'agents/orbit-2300-ui.agent.md'
+            }
+        ];
+        const liveServerParticipants = new Map(); // serverName -> Disposable
+
+        function loadServerInstructions(spec) {
+            if (!spec.instructionsFile) return '';
+            const p = path.join(context.extensionPath, spec.instructionsFile);
+            try {
+                if (fs.existsSync(p)) return fs.readFileSync(p, 'utf8');
+            } catch (e) {
+                orbitError(`[orbit] read ${spec.instructionsFile} failed:`, e && e.message);
+            }
+            return '';
+        }
+
+        function createServerParticipant(spec) {
+            try {
+                const restriction = `You are restricted to the "${spec.serverName}" Smalltalk MCP server. Only the tools you've been given (mcp_${spec.serverName}_*) target it; do not assume access to any other Smalltalk system.`;
+                const fileNote = loadServerInstructions(spec);
+                const note = fileNote
+                    ? (fileNote.trimEnd() + '\n\n' + restriction)
+                    : restriction;
+                const p = vscode.chat.createChatParticipant(
+                    spec.participantId,
+                    makeOrbitParticipantHandler(
+                        spec.participantId,
+                        makeServerToolFilter(spec.serverName),
+                        note
+                    )
+                );
+                p.iconPath = vscode.Uri.joinPath(context.extensionUri, 'public', 'pictures', 'icons', 'participant', 'orbit.jpg');
+                liveServerParticipants.set(spec.serverName, p);
+            } catch (e) {
+                orbitError(`[orbit] per-server participant ${spec.participantId} register failed:`, e && e.message);
+            }
+        }
+
+        function disposeServerParticipant(serverName) {
+            const p = liveServerParticipants.get(serverName);
+            if (!p) return;
+            try { p.dispose(); }
+            catch (e) { orbitError(`[orbit] per-server participant ${serverName} dispose failed:`, e && e.message); }
+            liveServerParticipants.delete(serverName);
+        }
+
+        function syncServerParticipants() {
+            for (const spec of PER_SERVER_PARTICIPANTS) {
+                const srv = mcpServers.find(s => s.name === spec.serverName);
+                const shouldBeLive = !!server && !!srv && !!srv.getRunning();
+                const isLive = liveServerParticipants.has(spec.serverName);
+                if (shouldBeLive && !isLive) createServerParticipant(spec);
+                else if (!shouldBeLive && isLive) disposeServerParticipant(spec.serverName);
+            }
+        }
+
+        // React to MCP server start/stop and Orbit start/stop.
+        const participantSyncSubscriber = () => syncServerParticipants();
+        mcpStateSubscribers.add(participantSyncSubscriber);
+        context.subscriptions.push({
+            dispose: () => {
+                mcpStateSubscribers.delete(participantSyncSubscriber);
+                for (const name of Array.from(liveServerParticipants.keys())) {
+                    disposeServerParticipant(name);
+                }
+            }
+        });
+        // Initial sync (mcpServers + Orbit server may already be up).
+        syncServerParticipants();
 
         // Diagnostic: log what VS Code thinks our manifest contributes look like.
         try {
@@ -1183,37 +2143,75 @@ module.exports = function (vscode) {
             mcpDefinitionsChanged = new vscode.EventEmitter();
             const mcpProvider = vscode.lm.registerMcpServerDefinitionProvider('orbitBackend', {
                 onDidChangeMcpServerDefinitions: mcpDefinitionsChanged.event,
-                provideMcpServerDefinitions() {
+                async provideMcpServerDefinitions() {
                     if (!mcpEnabled) return [];
-                    return [
-                        new vscode.McpHttpServerDefinition(
-                            '2300-backend',
-                            vscode.Uri.parse(`http://${mcpHost}:15072/mcpservice/v1/mcp`)
-                        )
-                    ];
+                    // Probe each backend's MCP port; only return
+                    // definitions for those that accept a TCP
+                    // connection. This keeps unreachable backends
+                    // out of the MCP servers list entirely instead
+                    // of leaving them visible-but-erroring.
+                    const reachable = await reachableBackends('mcp');
+                    mcpReachable.clear();
+                    reachable.forEach(b => mcpReachable.add(b.name));
+                    orbitLog('[orbit] MCP provider: reachable=' +
+                        JSON.stringify(reachable.map(b => b.name)));
+                    return reachable.map(b => new vscode.McpHttpServerDefinition(
+                        b.name,
+                        vscode.Uri.parse(mcpUrlFor(b))
+                    ));
                 }
             });
             context.subscriptions.push(mcpProvider, mcpDefinitionsChanged);
             orbitLog('[orbit] MCP provider registered');
+
+            // VS Code does not auto-start MCP servers on window
+            // reload, so the reachable backend servers would be
+            // visible but stopped. Kick off an initial activation
+            // pass and a periodic retry loop, but only if the user
+            // wants Orbit to auto-start (and hasn't explicitly
+            // stopped it). Otherwise we'd start MCP servers behind
+            // the user's back even when the Orbit web server is
+            // intentionally stopped. orbit.start runs these same
+            // passes explicitly, so a manual start still wires
+            // everything up.
+            for (const b of BACKENDS) mcpRunning[b.name] = false;
+            const wantAutoStart = (() => {
+                try {
+                    if (!vscode.workspace.getConfiguration('orbit')
+                        .get('autoStart', false)) return false;
+                    const stoppedAt = +context.workspaceState
+                        .get(EXPLICIT_STOP_KEY, 0) || 0;
+                    if (stoppedAt > 0
+                        && (Date.now() - stoppedAt) < EXPLICIT_STOP_TTL_MS) {
+                        return false;
+                    }
+                    return true;
+                } catch (_) { return false; }
+            })();
+            if (wantAutoStart) {
+                activateReachableBackends().catch((e) => {
+                    orbitError('[orbit] initial activateReachableBackends failed:',
+                        e && e.message);
+                });
+                scheduleBackendActivationRetries();
+            } else {
+                orbitLog('[orbit] activate: skipping MCP activation (autoStart off or user explicitly stopped Orbit)');
+            }
         } catch (e) {
             orbitError('[orbit] MCP provider registration failed:', e && e.message);
         }
 
-        // Add the WebDAV workspace folder unconditionally on activate.
-        // The FS provider above is registered unconditionally too, so
-        // there is no scenario in which the folder should be present
-        // but the provider absent. Doing this outside the
-        // autoStart/explicitlyStopped gate ensures the user always
-        // sees the Smalltalk tree in the Explorer regardless of
-        // whether the web server is running. Surfaced as a
-        // showInformationMessage on first add so the user gets visible
-        // confirmation even if the DevTools console is filtered.
+        // On activate (including window reload) we deliberately do
+        // NOT mount any WebDAV workspace folders. They are added only
+        // when the user explicitly starts Orbit (orbit.start) or
+        // toggles the WebDAV mount on via the webview. Any stale
+        // orbit-webdav folders persisted in the workspace file from a
+        // previous session are removed here so a fresh reload starts
+        // with no Smalltalk filesystems mounted.
         try {
-            if (webdavMountEnabled()) {
-                addWebdavWorkspaceFolder();
-            }
+            removeWebdavWorkspaceFolders();
         } catch (e) {
-            orbitError('[orbit] webdav folder add (unconditional) failed:',
+            orbitError('[orbit] webdav folder cleanup on activate failed:',
                 e && e.message);
         }
 
@@ -1224,7 +2222,7 @@ module.exports = function (vscode) {
         try {
             const autoStart = vscode.workspace
                 .getConfiguration('orbit')
-                .get('autoStart', true);
+                .get('autoStart', false);
             const explicitlyStopped = (() => {
                 try {
                     const stoppedAt = +context.workspaceState.get(EXPLICIT_STOP_KEY, 0) || 0;
@@ -1247,37 +2245,22 @@ module.exports = function (vscode) {
                 startServer(context, true).catch((e) => {
                     orbitError('[orbit] auto-start failed:', e && e.message);
                 });
-                // Ensure the Orbit MCP backend is started too, so the
-                // user doesn't see it sitting in the MCP servers list
-                // in a stopped state. On a fresh window reload, VS
-                // Code hasn't yet enumerated this provider's
-                // definitions when activate() runs, so an immediate
-                // startServer call is a no-op. Retry a few times with
-                // a short delay until it takes effect.
-                try {
-                    if (!mcpEnabled) {
-                        mcpEnabled = true;
-                        if (mcpDefinitionsChanged) mcpDefinitionsChanged.fire();
-                    }
-                    const tryStart = (attempt) => {
-                        vscode.commands.executeCommand(
-                            'workbench.mcp.startServer',
-                            ORBIT_MCP_SERVER_ID,
-                            { autoTrustChanges: true }
-                        ).then(() => {
-                            orbitLog('[orbit] auto-start MCP startServer ok (attempt ' + attempt + ')');
-                        }, (e) => {
-                            orbitError('[orbit] auto-start MCP startServer failed (attempt ' +
-                                attempt + '):', e && e.message);
-                            if (attempt < 5) {
-                                setTimeout(() => tryStart(attempt + 1), 500 * attempt);
-                            }
-                        });
-                    };
-                    setTimeout(() => tryStart(1), 500);
-                } catch (e) {
-                    orbitError('[orbit] auto-start MCP failed:', e && e.message);
-                }
+                // MCP server start and WebDAV mount are handled by
+                // activateReachableBackends + scheduleBackendActivationRetries
+                // above, which run unconditionally on activate().
+            } else {
+                // autoStart is off (or user explicitly stopped Orbit
+                // before this activation). On a window reload, any
+                // Orbit browser tab the user had open is restored
+                // by VS Code before we activate. Run orbit.stop
+                // silently to close those stale tabs so the user
+                // doesn't see a dead webapp until they click
+                // "Start Orbit".
+                vscode.commands.executeCommand('orbit.stop', { silent: true })
+                    .then(undefined, (e) => {
+                        orbitError('[orbit] activate-time orbit.stop failed:',
+                            e && e.message);
+                    });
             }
         } catch (e) {
             orbitError('[orbit] auto-start check failed:', e && e.message);
@@ -1287,13 +2270,14 @@ module.exports = function (vscode) {
     function deactivate() {
         stopClipboardBridge();
         stopWorkspaceFsBridge();
+        stopBackendActivationRetries();
         if (server) {
             server.close();
             server = null;
             setRunningContext(false);
         }
         if (webdavMountEnabled()) {
-            try { removeWebdavWorkspaceFolder(); } catch (_) {}
+            try { removeWebdavWorkspaceFolders(); } catch (_) {}
         }
     }
 

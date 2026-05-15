@@ -141,6 +141,13 @@ app.get('/workspace-fs/*', (req, res) => {
   upstream.end();
 });
 
+// Mount point for routes registered later by the Orbit extension
+// (e.g. /mcp-events SSE). Mounted before the 404 catchall so
+// late-added routes still match.
+const extensionRoutes = express.Router();
+app.use(extensionRoutes);
+app.extensionRoutes = extensionRoutes;
+
 // catch 404 and forward to error handler
 app.use(function(req, res, next) {
   next(createError(404));

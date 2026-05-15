@@ -43,7 +43,7 @@ in a remote Smalltalk environment. That Smalltalk environment also
 provides an MCP server for remote method execution (configured for
 your use by the Orbit VSCode extension), and a WebDAV server
 expressing system information as a virtual filesystem. That filesystem
-is mounted locally at /Volumes/webdav/ if the host operating system,
+is mounted locally at / if the host operating system,
 or W: if the host operating system is Windows.
 
 The extension sources are in ./website/. You can rebuild the
@@ -58,9 +58,9 @@ debuggers, etc. You can manipulate those tools just as the user can.
 ### You can interact with the remote Smalltalk and other agents via the WebDAV filesystem
 
 The normal way of interacting with the Smalltalk system is by sending
-messages. In Orbit, we have another way: reading and writing the
-WebDAV filesystem. We can also interact with other agents who have
-access to that filesysten.
+messages. In Orbit, we have another way: reading and writing a WebDAV
+filesystem. We can also use that filesystem to interact with other
+agents who have access to it.
 
 #### You can get and change information about remote Smalltalk classes and methods
 
@@ -70,14 +70,14 @@ and writing the WebDAV filesystem. The filesystem maps remote
 Smalltalk class information to a hierarchy of directories and
 files. Here's a sampling of the top of the filesystem:
 
-/Volumes/webdav/ (or W: on Microsoft Windows)
-	/Volumes/webdav/classes/
-		/Volumes/webdav/classes/Object/
-			/Volumes/webdav/classes/Object/comment
-			/Volumes/webdav/classes/Object/subclasses/
-			/Volumes/webdav/classes/Object/methods/
-				/Volumes/webdav/classes/Object/methods/
-					/Volumes/webdav/classes/Object/methods/yourself/
+/
+	/classes/
+		/classes/Object/
+			/classes/Object/comment
+			/classes/Object/subclasses/
+			/classes/Object/methods/
+				/classes/Object/methods/
+					/classes/Object/methods/yourself/
 
 The "comment" file above provides access to the class comment of class
 Object. The content of the "yourself" file above is the source code of
@@ -97,7 +97,7 @@ WebDAV when asked by the user.
 
 #### You can use the WebDAV filesystem as shared agentic memory
 
-In /Volumes/webdav/sessions/ (the session memory) you can externalize
+In /sessions/ (the session memory) you can externalize
 your context window for the benefit of:
 
 - other agents

@@ -22,9 +22,10 @@ if [ -z "$SKIP_VERSION_BUMP" ]; then
     const src = fs.readFileSync(path, 'utf8');
     const m = src.match(/(\"version\"\s*:\s*\")(\d+)\.(\d+)\.(\d+)(\")/);
     if (!m) { throw new Error('version field not found'); }
-    const next = m[1] + m[2] + '.' + (Number(m[3]) + 1) + '.0' + m[5];
-    fs.writeFileSync(path, src.replace(m[0], next));
-    console.log('Bumped version to ' + (Number(m[3]) + 1) + '.0 (was ' + m[3] + '.' + m[4] + ')');
+    const oldVersion = m[2] + '.' + m[3] + '.' + m[4];
+    const newVersion = m[2] + '.' + (Number(m[3]) + 1) + '.0';
+    fs.writeFileSync(path, src.replace(m[0], m[1] + newVersion + m[5]));
+    console.log('Bumped version to ' + newVersion + ' (was ' + oldVersion + ')');
   "
 fi
 

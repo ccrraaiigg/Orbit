@@ -22,7 +22,7 @@ symlink_extension() {
     echo "symlinked components/$f"
   done
 
-  for f in orbit-paste.js orbit-clipboard.js caffeine.js orbit-version-check.js; do
+  for f in orbit-paste.js orbit-clipboard.js orbit-mcp-events.js caffeine.js orbit-version-check.js; do
     rm -f "$DST_JS/$f"
     ln -s "$SRC_JS/$f" "$DST_JS/$f"
     echo "symlinked js/$f"

@@ -103,16 +103,29 @@ function request(method, urlString, { headers, body, expectBody } = {}) {
 }
 
 module.exports = function createWebdavFs(vscode, options) {
-    const baseUrl = (options && options.baseUrl) || 'http://127.0.0.1:19073/webdav';
     const getAuthHeader = (options && options.getAuthHeader) || (() => null);
+    // getBaseUrl(authority) -> 'http://host:port/webdav' for that backend.
+    // The extension passes a function that maps each known backend's
+    // authority (e.g. '2300-backend', '2300-ui') to its WebDAV root.
+    // For backwards compatibility with a single-backend setup, callers
+    // may pass {baseUrl} instead and any authority resolves to it.
+    const getBaseUrl = (options && options.getBaseUrl)
+        || (() => (options && options.baseUrl) || 'http://127.0.0.1:19073/webdav');
 
-    // Map a vscode Uri (scheme=orbit-webdav, authority='', path=/x/y)
-    // to a remote WebDAV URL. Authority is unused so multiple roots
-    // share one connection.
+    // Map a vscode Uri (scheme=orbit-webdav, authority='<system>',
+    // path=/x/y) to a remote WebDAV URL. Different authorities resolve
+    // to different backend servers.
+    function baseUrlFor(uri) {
+        const url = getBaseUrl(uri.authority || '');
+        if (!url) {
+            throw vscode.FileSystemError.Unavailable(uri);
+        }
+        return url;
+    }
     function uriToUrl(uri) {
         const path = uri.path || '/';
         // baseUrl already ends with /webdav (no trailing slash); join cleanly.
-        const trimmed = baseUrl.replace(/\/+$/, '');
+        const trimmed = baseUrlFor(uri).replace(/\/+$/, '');
         const segs = path.split('/').filter(Boolean).map(encodeURIComponent);
         return trimmed + '/' + segs.join('/');
     }
@@ -139,7 +152,7 @@ module.exports = function createWebdavFs(vscode, options) {
         return e;
     }
 
-    function hrefToPath(href) {
+    function hrefToPath(href, baseUrl) {
         // Server returns hrefs like "/webdav/classes/Object" or full URL.
         let p = href;
         try {
@@ -157,11 +170,69 @@ module.exports = function createWebdavFs(vscode, options) {
         constructor() {
             this._emitter = new vscode.EventEmitter();
             this.onDidChangeFile = this._emitter.event;
+            // URIs currently being watched by VS Code (typically the
+            // workspace folder roots and any subtree the Explorer is
+            // tracking). We use these as the targets of refresh().
+            this._watched = new Map(); // key=uri.toString() -> {uri, count}
+            // Every directory URI we've ever served via readDirectory.
+            // VS Code caches those results; to force a re-fetch we
+            // must fire Changed events for each of them. Tracked
+            // because Changed events on the workspace root do not
+            // recursively invalidate deeper cached directories.
+            this._readDirs = new Map(); // key=uri.toString() -> uri
+            // URIs asserted read-only by the backend via POST
+            // /fs-changed { readOnlyPaths: [...] }. Surfaced in
+            // stat() as FilePermissions.Readonly so VS Code refuses
+            // edits and shows the lock indicator. The backend owns
+            // this set; we never infer it ourselves.
+            this._readOnly = new Set(); // uri.toString()
         }
 
-        watch(_uri, _options) {
-            // Server-push not implemented; refresh-on-demand only.
-            return new vscode.Disposable(() => {});
+        // Assert (flag=true) or clear (flag=false) the read-only
+        // marker on a URI. Returns true iff the state changed.
+        setReadOnly(uri, flag) {
+            const key = uri.toString();
+            const had = this._readOnly.has(key);
+            if (flag && !had) { this._readOnly.add(key); return true; }
+            if (!flag && had) { this._readOnly.delete(key); return true; }
+            return false;
+        }
+
+        watch(uri, _options) {
+            // We don't have server-push, but we do track which URIs
+            // VS Code is watching so refresh() can invalidate the
+            // right set of cache entries.
+            const key = uri.toString();
+            const cur = this._watched.get(key);
+            if (cur) cur.count++;
+            else this._watched.set(key, { uri, count: 1 });
+            return new vscode.Disposable(() => {
+                const e = this._watched.get(key);
+                if (!e) return;
+                e.count--;
+                if (e.count <= 0) this._watched.delete(key);
+            });
+        }
+
+        // Fire Changed events to invalidate VS Code's cached
+        // readDirectory/stat results. Targets every directory we've
+        // ever served (so the Explorer re-reads every expanded
+        // subtree, not just the workspace root), every currently-
+        // watched URI, plus any extra URIs the caller passes in.
+        refresh(extraUris) {
+            const events = [];
+            const seen = new Set();
+            const add = (uri) => {
+                const k = uri.toString();
+                if (seen.has(k)) return;
+                seen.add(k);
+                events.push({ type: vscode.FileChangeType.Changed, uri });
+            };
+            for (const uri of this._readDirs.values()) add(uri);
+            for (const { uri } of this._watched.values()) add(uri);
+            if (Array.isArray(extraUris)) for (const u of extraUris) add(u);
+            if (events.length) this._emitter.fire(events);
+            return events.length;
         }
 
         async stat(uri) {
@@ -178,12 +249,16 @@ module.exports = function createWebdavFs(vscode, options) {
             const records = parseMultistatus(res.body.toString('utf8'));
             if (!records.length) throw vscode.FileSystemError.FileNotFound(uri);
             const rec = records[0];
-            return {
+            const stat = {
                 type: rec.isCollection ? FileType.Directory : FileType.File,
                 ctime: rec.ctime,
                 mtime: rec.mtime,
                 size: rec.size
             };
+            if (this._readOnly.has(uri.toString())) {
+                stat.permissions = vscode.FilePermissions.Readonly;
+            }
+            return stat;
         }
 
         async readDirectory(uri) {
@@ -201,7 +276,7 @@ module.exports = function createWebdavFs(vscode, options) {
             const selfPath = (uri.path || '/').replace(/\/+$/, '') || '/';
             const out = [];
             for (const rec of records) {
-                const p = hrefToPath(rec.href);
+                const p = hrefToPath(rec.href, baseUrlFor(uri));
                 if (p === selfPath || p === selfPath + '/') continue;
                 // Compute the basename relative to selfPath.
                 let rel = p;
@@ -213,6 +288,9 @@ module.exports = function createWebdavFs(vscode, options) {
                 if (!rel || rel.includes('/')) continue;
                 out.push([rel, rec.isCollection ? FileType.Directory : FileType.File]);
             }
+            // Remember this directory so future mutations can fire
+            // Changed events to invalidate the cached listing.
+            this._readDirs.set(uri.toString(), uri);
             return out;
         }
 
@@ -224,6 +302,30 @@ module.exports = function createWebdavFs(vscode, options) {
             if (res.status >= 400 && res.status !== 405) {
                 throw fileError({ status: res.status }, uri, 'createDirectory');
             }
+        }
+
+        // Fire Changed events for every URI VS Code has cached a
+        // listing for (every directory we've ever served) plus every
+        // URI VS Code is currently watching. Used after any
+        // mutation: the Smalltalk WebDAV server may rewrite arbitrary
+        // parts of the tree in response to a single write (e.g.
+        // saving /search/query repopulates /search/results/), and the
+        // server's contract is that nothing on our side should be
+        // cached. Conservatively invalidating every cached listing
+        // causes VS Code to re-call readDirectory/stat the next time
+        // the user accesses each one.
+        _fireWatchedChanged(extraEvents) {
+            const events = Array.isArray(extraEvents) ? extraEvents.slice() : [];
+            const seen = new Set(events.map(e => e.uri.toString()));
+            const add = (uri) => {
+                const k = uri.toString();
+                if (seen.has(k)) return;
+                seen.add(k);
+                events.push({ type: vscode.FileChangeType.Changed, uri });
+            };
+            for (const uri of this._readDirs.values()) add(uri);
+            for (const { uri } of this._watched.values()) add(uri);
+            if (events.length) this._emitter.fire(events);
         }
 
         async readFile(uri) {
@@ -253,7 +355,7 @@ module.exports = function createWebdavFs(vscode, options) {
             });
             if (res.status === 412) throw vscode.FileSystemError.FileExists(uri);
             if (res.status >= 400) throw fileError({ status: res.status }, uri, 'writeFile');
-            this._emitter.fire([{ type: vscode.FileChangeType.Changed, uri }]);
+            this._fireWatchedChanged([{ type: vscode.FileChangeType.Changed, uri }]);
         }
 
         async delete(uri, _options) {
@@ -261,7 +363,7 @@ module.exports = function createWebdavFs(vscode, options) {
             const res = await request('DELETE', url, { headers: authHeaders() });
             if (res.status === 404) throw vscode.FileSystemError.FileNotFound(uri);
             if (res.status >= 400) throw fileError({ status: res.status }, uri, 'delete');
-            this._emitter.fire([{ type: vscode.FileChangeType.Deleted, uri }]);
+            this._fireWatchedChanged([{ type: vscode.FileChangeType.Deleted, uri }]);
         }
 
         async rename(oldUri, newUri, options) {
@@ -275,7 +377,7 @@ module.exports = function createWebdavFs(vscode, options) {
             if (res.status === 404) throw vscode.FileSystemError.FileNotFound(oldUri);
             if (res.status === 412) throw vscode.FileSystemError.FileExists(newUri);
             if (res.status >= 400) throw fileError({ status: res.status }, oldUri, 'rename');
-            this._emitter.fire([
+            this._fireWatchedChanged([
                 { type: vscode.FileChangeType.Deleted, uri: oldUri },
                 { type: vscode.FileChangeType.Created, uri: newUri }
             ]);
@@ -292,7 +394,7 @@ module.exports = function createWebdavFs(vscode, options) {
             if (res.status === 404) throw vscode.FileSystemError.FileNotFound(srcUri);
             if (res.status === 412) throw vscode.FileSystemError.FileExists(dstUri);
             if (res.status >= 400) throw fileError({ status: res.status }, srcUri, 'copy');
-            this._emitter.fire([{ type: vscode.FileChangeType.Created, uri: dstUri }]);
+            this._fireWatchedChanged([{ type: vscode.FileChangeType.Created, uri: dstUri }]);
         }
     }
 

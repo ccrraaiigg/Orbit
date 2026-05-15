@@ -2,7 +2,7 @@
     "name": "orbit-agentic-pair-programming-for-smalltalk",
     "displayName": "Orbit: Agentic Pair Programming for Smalltalk",
     "description": "A livecoding pair-programming harness for Smalltalk.",
-    "version": "1.18.0",
+    "version": "1.50.0",
     "publisher": "BlackPageDigital",
     "icon": "public/pictures/icons/participant/orbit.jpg",
     "engines": {
@@ -22,8 +22,11 @@
 	"onCommand:orbit.stop",
 	"onCommand:orbit.openSteering",
 	"onCommand:orbit.addWebdavFolder",
+	"onCommand:orbit.refreshWebdav",
 	"onMcpServerDefinitionProvider:orbitBackend",
 	"onChatParticipant:orbit.orbit",
+	"onChatParticipant:orbit.orbit-2300-backend",
+	"onChatParticipant:orbit.orbit-2300-ui",
 	"onView:orbit.status"
     ],
     "contributes": {
@@ -32,13 +35,13 @@
 	    "properties": {
 		"orbit.autoStart": {
 		    "type": "boolean",
-		    "default": true,
-		    "description": "Automatically start the Orbit web server when VS Code starts. This lets browser tabs left open at the Orbit URL reconnect after a restart."
+		    "default": false,
+		    "description": "Automatically start the Orbit web server when VS Code starts. When false (the default), Orbit only starts when the user clicks \"Start Orbit\" in the Orbit view. When true, Orbit starts on extension activation so browser tabs left open at the Orbit URL can reconnect after a restart."
 		},
 		"orbit.mountWebdav": {
 		    "type": "boolean",
 		    "default": true,
-		    "description": "Add the Orbit WebDAV folder (orbit-webdav://) to the workspace when Orbit starts, and remove it when Orbit stops. Served by the in-process FileSystemProvider; no host-OS WebDAV client is required."
+		    "description": "Add a workspace folder for each reachable Smalltalk WebDAV backend (orbit-webdav://<backend>/) when Orbit starts, and remove them when Orbit stops. Served by the in-process FileSystemProvider; no host-OS WebDAV client is required."
 		}
 	    }
 	},
@@ -62,6 +65,17 @@
 	    {
 		"command": "orbit.addWebdavFolder",
 		"title": "Orbit: Add WebDAV Folder to Workspace"
+	    },
+	    {
+		"command": "orbit.refreshWebdav",
+		"title": "Orbit: Refresh WebDAV Folders"
+	    }
+	],
+	"keybindings": [
+	    {
+		"command": "orbit.refreshWebdav",
+		"key": "f5",
+		"when": "filesExplorerFocus && resourceScheme == orbit-webdav"
 	    }
 	],
 	"languageModelTools": [
@@ -93,7 +107,7 @@
 	"mcpServerDefinitionProviders": [
 	    {
 		"id": "orbitBackend",
-		"label": "2300 Backend"
+		"label": "Orbit Smalltalk Backends"
 	    }
 	],
 	"chatParticipants": [
@@ -102,6 +116,20 @@
 		"fullName": "Orbit",
 		"name": "orbit",
 		"description": "Orbit livecoding pair-programming agent for Smalltalk",
+		"isSticky": true
+	    },
+	    {
+		"id": "orbit.orbit-2300-backend",
+		"fullName": "Orbit (2300-backend)",
+		"name": "orbit-2300-backend",
+		"description": "Orbit pair-programming agent restricted to the 2300-backend Smalltalk MCP server",
+		"isSticky": true
+	    },
+	    {
+		"id": "orbit.orbit-2300-ui",
+		"fullName": "Orbit (2300-ui)",
+		"name": "orbit-2300-ui",
+		"description": "Orbit pair-programming agent restricted to the 2300-ui Smalltalk MCP server",
 		"isSticky": true
 	    }
 	],
@@ -117,6 +145,7 @@
 	"views": {
 	    "orbit": [
 		{
+		    "type": "webview",
 		    "id": "orbit.status",
 		    "name": "Orbit",
 		    "icon": "public/pictures/icons/participant/orbit.svg",
@@ -124,18 +153,6 @@
 		}
 	    ]
 	},
-	"viewsWelcome": [
-	    {
-		"view": "orbit.status",
-		"contents": "Orbit pair-programs Smalltalk with you.\n\n[Start Orbit](command:orbit.start)",
-		"when": "!orbit.running"
-	    },
-	    {
-		"view": "orbit.status",
-		"contents": "Orbit pair-programs Smalltalk with you.\n\n[Stop Orbit](command:orbit.stop)",
-		"when": "orbit.running"
-	    }
-	],
 	"walkthroughs": [
 	    {
 		"id": "orbit.getStarted",
