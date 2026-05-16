@@ -22,6 +22,7 @@ class IconManager extends HTMLElement {
     this._onMutation = this._onMutation.bind(this);
     this._onCursorMove = this._onCursorMove.bind(this);
     this._onCursorLeave = this._onCursorLeave.bind(this);
+    this._onDocPointerMove = this._onDocPointerMove.bind(this);
     this._onKeyDown = this._onKeyDown.bind(this);
     this._onKeyUp = this._onKeyUp.bind(this);
   }
@@ -31,6 +32,7 @@ class IconManager extends HTMLElement {
     this._startObserving();
     this.addEventListener('pointermove', this._onCursorMove, true);
     this.addEventListener('pointerleave', this._onCursorLeave, true);
+    document.addEventListener('pointermove', this._onDocPointerMove, true);
     document.addEventListener('keydown', this._onKeyDown, true);
     document.addEventListener('keyup', this._onKeyUp, true);
     var self = this;
@@ -87,11 +89,14 @@ class IconManager extends HTMLElement {
         self.refresh();
       }
     }, true);
+
+    this._installIframePointerForwarders();
   }
 
   disconnectedCallback() {
     this.removeEventListener('pointermove', this._onCursorMove, true);
     this.removeEventListener('pointerleave', this._onCursorLeave, true);
+    document.removeEventListener('pointermove', this._onDocPointerMove, true);
     document.removeEventListener('keydown', this._onKeyDown, true);
     document.removeEventListener('keyup', this._onKeyUp, true);
     if (this._observer) {
@@ -301,6 +306,55 @@ class IconManager extends HTMLElement {
 
   _onMutation() {
     this._scheduleRefresh(0);
+    this._installIframePointerForwarders();
+  }
+
+  _installIframePointerForwarders() {
+    var self = this;
+    var iframes = document.querySelectorAll('iframe');
+    iframes.forEach(function(iframe) {
+      var attach = function() {
+        var doc;
+        try { doc = iframe.contentDocument; } catch (_) { return; }
+        if (!doc) return;
+        if (doc._iconManagerPointerForwardInstalled) return;
+        var onMove = function(ev) {
+          var r;
+          try { r = iframe.getBoundingClientRect(); } catch (_) { return; }
+          var x = (ev.clientX || 0) + r.left;
+          var y = (ev.clientY || 0) + r.top;
+          self._lastPointerX = x;
+          self._lastPointerY = y;
+          if (self._iconified) return;
+          if (!(self._altDown || ev.altKey)) return;
+          if (self._hovering || self._pointerOverMorphicWindow(x, y)) {
+            self._showIconifyCursor();
+          } else {
+            self._hideIconifyCursor();
+          }
+        };
+        doc.addEventListener('pointermove', onMove, true);
+        doc.addEventListener('mousemove', onMove, true);
+        var onKey = function(ev) {
+          if (ev.key !== 'Alt') return;
+          if (ev.type === 'keydown') {
+            self._altDown = true;
+            if (self._iconified) return;
+            if (self._hovering || self._pointerOverMorphicWindow(self._lastPointerX, self._lastPointerY)) {
+              self._showIconifyCursor();
+            }
+          } else {
+            self._altDown = false;
+            self._hideIconifyCursor();
+          }
+        };
+        doc.addEventListener('keydown', onKey, true);
+        doc.addEventListener('keyup', onKey, true);
+        doc._iconManagerPointerForwardInstalled = true;
+      };
+      attach();
+      iframe.addEventListener('load', attach);
+    });
   }
 
   _edgeCursorForPoint(clientX, clientY) {
@@ -343,6 +397,8 @@ class IconManager extends HTMLElement {
     this.style.setProperty('cursor', 'none', 'important');
     style.textContent = '* { cursor: none !important; }';
     document.documentElement.style.setProperty('cursor', 'none', 'important');
+    this._setHostCursorHidden(true);
+    this._setIframeCursorHidden(true);
   }
 
   _hideIconifyCursor() {
@@ -353,6 +409,73 @@ class IconManager extends HTMLElement {
     style.textContent = '';
     this._setCellCursors('');
     document.documentElement.style.removeProperty('cursor');
+    this._setHostCursorHidden(false);
+    this._setIframeCursorHidden(false);
+  }
+
+  _setHostCursorHidden(hidden) {
+    var styleId = '__iconManagerHostCursorHide';
+    var styleEl = document.getElementById(styleId);
+    if (hidden) {
+      if (!styleEl) {
+        styleEl = document.createElement('style');
+        styleEl.id = styleId;
+        (document.head || document.documentElement).appendChild(styleEl);
+      }
+      styleEl.textContent = '*, *::before, *::after { cursor: none !important; }';
+    } else if (styleEl) {
+      styleEl.textContent = '';
+    }
+    this._setShadowCursorHidden(hidden);
+  }
+
+  _setShadowCursorHidden(hidden) {
+    var wins = document.querySelectorAll('morphic-window, transient-window, workbook-window');
+    var styleId = '__iconManagerShadowCursorHide';
+    wins.forEach(function(win) {
+      var root = win.shadowRoot;
+      if (!root) return;
+      var styleEl = root.getElementById(styleId);
+      if (hidden) {
+        if (!styleEl) {
+          styleEl = document.createElement('style');
+          styleEl.id = styleId;
+          root.appendChild(styleEl);
+        }
+        styleEl.textContent = '*, *::before, *::after { cursor: none !important; }';
+      } else if (styleEl) {
+        styleEl.textContent = '';
+      }
+    });
+  }
+
+  _setIframeCursorHidden(hidden) {
+    var iframes = document.querySelectorAll('iframe');
+    iframes.forEach(function(iframe) {
+      var doc;
+      try { doc = iframe.contentDocument; } catch (_) { return; }
+      if (!doc) return;
+      var styleId = '__iconManagerCursorHide';
+      var styleEl = doc.getElementById(styleId);
+      if (hidden) {
+        if (!styleEl) {
+          styleEl = doc.createElement('style');
+          styleEl.id = styleId;
+          (doc.head || doc.documentElement).appendChild(styleEl);
+        }
+        styleEl.textContent = '*, *::before, *::after { cursor: none !important; }';
+        if (doc.documentElement) doc.documentElement.style.setProperty('cursor', 'none', 'important');
+        if (doc.body) doc.body.style.setProperty('cursor', 'none', 'important');
+        var cc = doc.getElementById('cursorCanvas');
+        if (cc) cc.style.setProperty('display', 'none', 'important');
+      } else {
+        if (styleEl) styleEl.textContent = '';
+        if (doc.documentElement) doc.documentElement.style.removeProperty('cursor');
+        if (doc.body) doc.body.style.removeProperty('cursor');
+        var cc2 = doc.getElementById('cursorCanvas');
+        if (cc2) cc2.style.removeProperty('display');
+      }
+    });
   }
 
   _onCursorMove(e) {
@@ -371,16 +494,48 @@ class IconManager extends HTMLElement {
 
   _onCursorLeave() {
     this._hovering = false;
-    this._altDown = false;
-    this._hideIconifyCursor();
     this.style.cursor = '';
     this._setCellCursors('');
+    if (!this._pointerOverMorphicWindow(this._lastPointerX, this._lastPointerY)) {
+      this._hideIconifyCursor();
+    }
+  }
+
+  _onDocPointerMove(e) {
+    this._lastPointerX = e.clientX;
+    this._lastPointerY = e.clientY;
+    if (this._iconified) return;
+    if (!(this._altDown || e.altKey)) return;
+    var overSelf = e.composedPath && e.composedPath().indexOf(this) !== -1;
+    if (overSelf || this._hovering || this._pointerOverMorphicWindow(e.clientX, e.clientY)) {
+      this._showIconifyCursor();
+    } else {
+      this._hideIconifyCursor();
+    }
+  }
+
+  _pointerOverMorphicWindow(x, y) {
+    if (x == null || y == null) return false;
+    var els = document.elementsFromPoint(x, y);
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i];
+      if (el === this || (this.shadowRoot && this.shadowRoot.contains(el))) continue;
+      var node = el;
+      while (node) {
+        if (node.tagName && /^(morphic-window|transient-window|workbook-window)$/i.test(node.tagName)) {
+          return true;
+        }
+        node = node.parentElement || (node.getRootNode && node.getRootNode().host) || null;
+      }
+    }
+    return false;
   }
 
   _onKeyDown(e) {
     if (e.key === 'Alt') {
       this._altDown = true;
-      if (this._hovering && !this._iconified) {
+      if (this._iconified) return;
+      if (this._hovering || this._pointerOverMorphicWindow(this._lastPointerX, this._lastPointerY)) {
         this._showIconifyCursor();
       }
     }

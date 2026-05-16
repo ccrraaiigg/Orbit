@@ -43,8 +43,8 @@ in a remote Smalltalk environment. That Smalltalk environment also
 provides an MCP server for remote method execution (configured for
 your use by the Orbit VSCode extension), and a WebDAV server
 expressing system information as a virtual filesystem. That filesystem
-is mounted locally at / if the host operating system,
-or W: if the host operating system is Windows.
+is mounted locally at / by the Orbit extension in the VSCode
+workspace.
 
 The extension sources are in ./website/. You can rebuild the
 extension.
@@ -64,36 +64,65 @@ agents who have access to it.
 
 #### You can get and change information about remote Smalltalk classes and methods
 
-To minimize MCP tool roundtrips for source code evaluation, you can
-invoke some remote Smalltalk actions and information access by reading
-and writing the WebDAV filesystem. The filesystem maps remote
+You can invoke some remote Smalltalk actions and information access by
+reading and writing the WebDAV filesystem. The filesystem maps remote
 Smalltalk class information to a hierarchy of directories and
 files. Here's a sampling of the top of the filesystem:
 
+```
 /
-	/classes/
-		/classes/Object/
-			/classes/Object/comment
-			/classes/Object/subclasses/
-			/classes/Object/methods/
-				/classes/Object/methods/
-					/classes/Object/methods/yourself/
+  classes/
+    Object/
+      comment
+      subclasses/
+		  Model/
+			  comment
+			  subclasses/
+			  variables/
+				  instance/
+					  dependents/
+						  references/
+							  SomeClass/
+								  comment
+								  subclasses/
+								  methods/
+						  readers/
+						  writers/
+				  class/
+				  pool/
+				  classInstance/
+			  methods/
+      methods/
+		  instance/
+			  yourself/
+				  source
+				  senders/
+				  implementors/
+		  class/
+  sessions/
+  search/
+	  query
+	  results/
+		  classes/
+		  methods/
+```
 
-The "comment" file above provides access to the class comment of class
-Object. The content of the "yourself" file above is the source code of
-Object>>yourself.
+The /classes/Object/comment file above provides access to the class
+comment of class Object. The
+/classes/Object/methods/instance/yourself/source file above contains
+the source code of the Object>>yourself method.
 
 Given the name of a class, it's helpful to know the superclasses of
 that class in order to traverse the classes hierarchy. You can use the
-"getClassHierarchy" tool for that.
+"getClassHierarchy" MCP tool for that.
+
+When there are appropriate MCP tools for a task, you should use
+them. Only use the WebDAV filesystem when you think it is better
+suited to a task than the MCP tools.
 
 Note that the SqueakJS system running in the page is distinct from the
 remote Smalltalk system. The WebDAV filesystem is not relevant for
 understanding the SqueakJS object memory.
-
-We're getting some users reporting trouble mounting the WebDAV
-filesystem on Windows 11. For now, use the MCP tools first. Only use
-WebDAV when asked by the user.
 
 #### You can use the WebDAV filesystem as shared agentic memory
 

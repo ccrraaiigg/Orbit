@@ -1145,6 +1145,51 @@ module.exports = function (vscode) {
         }
     }
 
+    // Passive watcher: detect MCP servers whose VS Code-side client
+    // has dropped (OAuth token expired, backend image restarted,
+    // user clicked Stop in the MCP Servers panel, network blip,
+    // etc.) and uncheck the corresponding checkbox so the UI stops
+    // claiming the server is running.
+    //
+    // We deliberately do NOT call vscode.lm.invokeTool to verify
+    // connectivity: invoking a tool against a server with an expired
+    // OAuth token would trigger VS Code's auth re-prompt, breaking
+    // the "sticky until user stops" contract documented in
+    // activateReachableBackends/postState. Instead we inspect
+    // vscode.lm.tools, which is a passive read. As noted in
+    // isMcpServerActuallyRunning's caveat, lm.tools can retain
+    // stale entries after a disconnect; in that case the checkbox
+    // remains checked (a false positive), but we will never flip
+    // it to false while the server is still serving tools.
+    let mcpDisconnectWatcher = null;
+    function startMcpDisconnectWatcher() {
+        if (mcpDisconnectWatcher) return;
+        mcpDisconnectWatcher = setInterval(() => {
+            try {
+                let changed = false;
+                for (const b of BACKENDS) {
+                    if (!mcpRunning[b.name]) continue;
+                    if (isMcpServerActuallyRunning(b.name)) continue;
+                    mcpRunning[b.name] = false;
+                    notifyMcpState(b.name, false);
+                    changed = true;
+                    orbitLog(`[orbit] mcpDisconnectWatcher: ${b.name} tools vanished from vscode.lm.tools; marking not running`);
+                }
+                if (changed && orbitTreeChangeFire) {
+                    try { orbitTreeChangeFire(); } catch (_) {}
+                }
+            } catch (e) {
+                orbitError('[orbit] mcpDisconnectWatcher tick failed:', e && e.message);
+            }
+        }, 5000);
+    }
+    function stopMcpDisconnectWatcher() {
+        if (mcpDisconnectWatcher) {
+            clearInterval(mcpDisconnectWatcher);
+            mcpDisconnectWatcher = null;
+        }
+    }
+
     function activate(context) {
         const ch = ensureOutputChannel();
         if (ch) context.subscriptions.push(ch);
@@ -1260,6 +1305,7 @@ module.exports = function (vscode) {
                 }
             }
             scheduleBackendActivationRetries();
+            startMcpDisconnectWatcher();
         });
 
         const stopCmd = vscode.commands.registerCommand('orbit.stop', async (opts) => {
@@ -1277,6 +1323,7 @@ module.exports = function (vscode) {
                 server.close();
                 server = null;
                 setRunningContext(false);
+                stopMcpDisconnectWatcher();
                 // Drop cached app.js and route modules so the next start
                 // picks up edits to those files. The workspace app.js and
                 // routes/*.js are reached via symlinks from the installed
@@ -2194,6 +2241,7 @@ module.exports = function (vscode) {
                         e && e.message);
                 });
                 scheduleBackendActivationRetries();
+                startMcpDisconnectWatcher();
             } else {
                 orbitLog('[orbit] activate: skipping MCP activation (autoStart off or user explicitly stopped Orbit)');
             }
@@ -2271,6 +2319,7 @@ module.exports = function (vscode) {
         stopClipboardBridge();
         stopWorkspaceFsBridge();
         stopBackendActivationRetries();
+        stopMcpDisconnectWatcher();
         if (server) {
             server.close();
             server = null;

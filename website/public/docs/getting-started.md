@@ -44,7 +44,7 @@ documents](https://code.visualstudio.com/docs/copilot/agents/overview)
 The network drive presents Smalltalk as a directory tree:
 
 ```
-Smalltalk/
+/
   classes/
     Object/
       comment
