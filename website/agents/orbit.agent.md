@@ -71,58 +71,71 @@ files. Here's a sampling of the top of the filesystem:
 
 ```
 /
-  classes/
-    Object/
-      comment
-      subclasses/
-		  Model/
-			  comment
-			  subclasses/
-			  variables/
-				  instance/
-					  dependents/
-						  references/
-							  SomeClass/
-								  comment
-								  subclasses/
-								  methods/
-						  readers/
-						  writers/
-				  class/
-				  pool/
-				  classInstance/
-			  methods/
-      methods/
-		  instance/
-			  yourself/
-				  source
-				  senders/
-				  implementors/
-		  class/
-  sessions/
-  search/
-	  query
-	  results/
-		  classes/
-		  methods/
-```
-
-The /classes/Object/comment file above provides access to the class
-comment of class Object. The
-/classes/Object/methods/instance/yourself/source file above contains
-the source code of the Object>>yourself method.
-
-Given the name of a class, it's helpful to know the superclasses of
-that class in order to traverse the classes hierarchy. You can use the
-"getClassHierarchy" MCP tool for that.
-
-When there are appropriate MCP tools for a task, you should use
-them. Only use the WebDAV filesystem when you think it is better
-suited to a task than the MCP tools.
-
+	classes/
+		Object/
+			comment
+				subclasses/
+					Model/
+						comment
+							subclasses/
+								variables/
+									instance/
+										dependents/
+											references/
+												SomeClass/
+													comment
+													subclasses/
+													methods/
+											readers/
+   											writers/
+	                                class/
+									pool/
+									classInstance/
+								methods/
+	             methods/
+					 instance/
+						 yourself/
+							 source
+								 references/
+								 senders/
+								 implementors/
+					 class/
+	sessions/
+	search/
+		query
+			results/
+				classes/
+				methods/
+	processes/
+		<identityHash>-<sanitized-name>/
+			name
+			state
+			priority
+			isSystem
+			suspendingList
+			stack
+			description
+			actions/
+				suspend
+				resume
+				terminate
+				debug
 Note that the SqueakJS system running in the page is distinct from the
 remote Smalltalk system. The WebDAV filesystem is not relevant for
 understanding the SqueakJS object memory.
+
+#### You can inspect and manipulate remote Smalltalk processes
+
+The /processes directory has one subdirectory per live (non-terminated)
+remote Smalltalk Process. Each process directory exposes read-only
+files for live state (name, state, priority, isSystem, suspendingList,
+stack, description) and an `actions/` subdirectory of writable action
+files. Writing any non-empty content to one of the action files
+triggers it: `suspend`, `resume`, `terminate`, or `debug` (which opens
+a debugger window on the process). Reading an action file returns a
+description of what it does. The set of process subdirectories is
+recomputed on every listing, and subdirectory names use the form
+`<identityHash>-<sanitized name>`.
 
 #### You can use the WebDAV filesystem as shared agentic memory
 
@@ -183,6 +196,10 @@ AgentSession. Check out the code for
 \>>debuggerClientForException: and \>>debuggerServiceForException: in
 AgentSession, as well as the code for the DebuggerClient and
 DebuggerService classes.
+
+### You can use Smalltalk MCP tools
+
+Ensure that every class you create is commented.
 
 ## development of Orbit itself
 

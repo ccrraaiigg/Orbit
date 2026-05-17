@@ -79,6 +79,20 @@ The network drive presents Smalltalk as a directory tree:
 	  results/
 		  classes/
 		  methods/
+  processes/
+	  <identityHash>-<sanitized-name>/
+		  name
+		  state
+		  priority
+		  isSystem
+		  suspendingList
+		  stack
+		  description
+		  actions/
+			  suspend
+			  resume
+			  terminate
+			  debug
 ```
 
 - Read `classes/<Class>/methods/<selector>` to get source code without
@@ -86,6 +100,11 @@ The network drive presents Smalltalk as a directory tree:
 - Write to those same paths to compile methods.
 - Drop notes into `sessions/` so the next session (yours or another
   agent's) picks up where this one left off.
+- Browse `processes/` to see what is running in the remote Smalltalk.
+  Each process subdirectory has live files (state, priority, stack,
+  ...) and a writable `actions/` directory; writing any non-empty
+  content to `actions/suspend`, `actions/resume`, `actions/terminate`,
+  or `actions/debug` performs that operation on the process.
 
 ### Searching the virtual filesystem
 

@@ -849,6 +849,28 @@ class MorphicWindow extends HTMLElement {
     titlebar.addEventListener('pointermove', this._onPointerMove);
     titlebar.addEventListener('pointerup', this._onPointerUp);
 
+    // Suppress page-wide text-selection drags initiated inside slotted
+    // content. `::slotted(*) { user-select: none }` prevents text inside
+    // the window from being selected, but it does NOT stop the browser
+    // from starting a selection-drag on mousedown that then extends out
+    // into selectable text elsewhere on the page (the rest of the body,
+    // other windows, etc.). preventDefault() on the underlying mousedown
+    // blocks that. Skip iframes (they own their own selection) and any
+    // editable / form / anchor target where the default action matters.
+    var slot = this.shadowRoot.querySelector('slot:not([name])');
+    if (slot) {
+      slot.addEventListener('mousedown', function(e) {
+        var t = e.target;
+        if (!t) return;
+        if (t.tagName === 'IFRAME') return;
+        if (t.closest && t.closest(
+          'iframe, input, textarea, select, button, a, ' +
+          '[contenteditable=""], [contenteditable="true"]'
+        )) return;
+        e.preventDefault();
+      });
+    }
+
     this._bringToFront();
   }
 
