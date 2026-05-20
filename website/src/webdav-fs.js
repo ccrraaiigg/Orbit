@@ -27,7 +27,12 @@ function stripNs(tag) {
 
 function parseMultistatus(xml) {
     const out = [];
-    const reResp = /<([A-Za-z0-9]+:)?response\b[^>]*>([\s\S]*?)<\/\1?response>/g;
+    // Match `<response>` … `</response>` and `<D:response>` … `</D:response>`
+    // (or any namespace prefix), but require the closing tag's prefix
+    // to match the opener's. Using `\1?` on the backref would let it
+    // collapse to empty, terminating early on a stray bare `</response>`
+    // inside any record body.
+    const reResp = /<([A-Za-z0-9]+:)?response\b[^>]*>([\s\S]*?)<\/(?:\1)response>/g;
     let m;
     while ((m = reResp.exec(xml)) !== null) {
         const body = m[2];
@@ -57,6 +62,8 @@ function matchInner(xml, localName) {
 }
 
 // --- HTTP helper -------------------------------------------------------
+const REQUEST_TIMEOUT_MS = 30000;
+
 function request(method, urlString, { headers, body, expectBody } = {}) {
     return new Promise((resolve, reject) => {
         let u;
@@ -74,16 +81,24 @@ function request(method, urlString, { headers, body, expectBody } = {}) {
                 headers || {}
             )
         };
+        const armTimeout = (req) => {
+            req.setTimeout(REQUEST_TIMEOUT_MS, () => {
+                req.destroy(new Error('webdav request timed out after '
+                    + REQUEST_TIMEOUT_MS + 'ms: ' + method + ' ' + urlString));
+            });
+        };
         if (body !== undefined && body !== null) {
             const buf = Buffer.isBuffer(body) ? body : Buffer.from(body);
             opts.headers['Content-Length'] = String(buf.length);
             const req = http.request(opts, onResp);
             req.on('error', reject);
+            armTimeout(req);
             req.write(buf);
             req.end();
         } else {
             const req = http.request(opts, onResp);
             req.on('error', reject);
+            armTimeout(req);
             req.end();
         }
         function onResp(res) {

@@ -22,6 +22,16 @@ app.set('port', port);
 var server = http.createServer(app);
 
 /**
+ * Wire the MCP bridge's WebSocket upgrade handler onto the server.
+ * The bridge installs an `upgrade` listener that only handles its
+ * own path (/orbit-tether by default), leaving other upgrade traffic
+ * untouched.
+ */
+if (typeof app.attachMcpBridge === 'function') {
+  app.attachMcpBridge(server);
+}
+
+/**
  * Listen on provided port, on all network interfaces.
  */
 

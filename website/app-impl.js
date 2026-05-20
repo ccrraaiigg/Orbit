@@ -40,6 +40,55 @@ app.use('/orbit', orbitRouter);
 const os = require('os');
 const fsmod = require('fs');
 const httpmod = require('http');
+const cryptomod = require('crypto');
+
+const { readBearer, isLoopback, bearerHeaderMatches } = require('./src/bearer');
+
+// Two bearer tokens gate the clipboard and workspace-fs proxies for
+// non-loopback callers (the extension binds 0.0.0.0:8089 in dev-host
+// mode so LAN browsers can load the page):
+//
+//   - `mcpBearer`: the shared Orbit MCP grant token (same one the
+//     MCP bridge accepts). High-privilege; identifies CLI subagents
+//     and external MCP clients.
+//   - `pageBearer`: a per-process random token, minted at module
+//     load and served to the Orbit webapp via /orbit-bridge-config.js.
+//     Scoped to /clipboard and /workspace-fs/* only. Compromise of
+//     this token does not grant MCP access.
+//
+// The page uses `pageBearer`; either token is accepted.
+const mcpBearer  = readBearer(__dirname);
+const pageBearer = cryptomod.randomBytes(32).toString('hex');
+
+// Gate that allows loopback callers unconditionally and requires a
+// matching Bearer token (either the MCP grant or the per-process
+// page token) from any other origin. Returns true if the request
+// should be allowed; otherwise writes a 401 response and returns
+// false.
+function allowBridgeAccess(req, res) {
+    if (isLoopback(req)) return true;
+    const auth = req.headers && req.headers['authorization'] || '';
+    if (bearerHeaderMatches(auth, pageBearer)) return true;
+    if (bearerHeaderMatches(auth, mcpBearer)) return true;
+    res.status(401).json({ error: 'bridge access requires a Bearer token' });
+    return false;
+}
+
+// Served to the Orbit webapp on startup. The page reads
+// window.__ORBIT_BRIDGE_BEARER__ from this script and attaches it
+// as `Authorization: Bearer …` to /clipboard and /workspace-fs/*
+// requests. Mounted before the 404 catchall.
+app.get('/orbit-bridge-config.js', (req, res) => {
+    res.type('application/javascript')
+       .set('Cache-Control', 'no-store')
+       .send('window.__ORBIT_BRIDGE_BEARER__ = '
+           + JSON.stringify(pageBearer) + ';\n');
+});
+
+// Exported so the extension (and tests) can read these without
+// re-deriving them. The page never sees `mcpBearer`.
+app.pageBearer = pageBearer;
+app.mcpBearer  = mcpBearer;
 
 const CLIPBOARD_PORT_FILE = path.join(os.tmpdir(), 'orbit-clipboard.port');
 const WORKSPACE_FS_PORT_FILE = path.join(os.tmpdir(), 'orbit-workspace-fs.port');
@@ -89,6 +138,7 @@ function proxyToBridge(method, body) {
 }
 
 app.get('/clipboard', async (req, res) => {
+  if (!allowBridgeAccess(req, res)) return;
   try {
     const r = await proxyToBridge('GET');
     res.status(r.status).type('application/json').send(r.body);
@@ -100,6 +150,7 @@ app.get('/clipboard', async (req, res) => {
   }
 });
 app.post('/clipboard', async (req, res) => {
+  if (!allowBridgeAccess(req, res)) return;
   try {
     const text = (req.body && typeof req.body.text === 'string') ? req.body.text : '';
     const r = await proxyToBridge('POST', JSON.stringify({ text }));
@@ -118,6 +169,7 @@ app.post('/clipboard', async (req, res) => {
 // FileSystemProvider). Body is streamed verbatim, including binary
 // payloads from /workspace-fs/read.
 app.get('/workspace-fs/*', (req, res) => {
+  if (!allowBridgeAccess(req, res)) return;
   const port = readPortFile(WORKSPACE_FS_PORT_FILE);
   if (!port) {
     return res.status(503).json({ error: 'workspace-fs bridge unavailable (VS Code not running?)' });
@@ -140,6 +192,20 @@ app.get('/workspace-fs/*', (req, res) => {
   });
   upstream.end();
 });
+
+// MCP bridge: proxies HTTP MCP JSON-RPC traffic to an MCP server
+// hosted in the Orbit webapp page. The page registers itself by
+// connecting a WebSocket to /orbit-tether and announcing its
+// endpoint over the Tether protocol; see src/mcp-bridge.js.
+// bin/www calls app.attachMcpBridge(server) after the http.Server is
+// created so the bridge can install its `upgrade` listener.
+const { McpBridge } = require('./src/mcp-bridge');
+const mcpBridge = new McpBridge({ extensionPath: __dirname });
+app.use(mcpBridge.middleware());
+app.attachMcpBridge = function (server) {
+  mcpBridge.attachToHttpServer(server);
+};
+app.mcpBridge = mcpBridge;
 
 // Mount point for routes registered later by the Orbit extension
 // (e.g. /mcp-events SSE). Mounted before the 404 catchall so

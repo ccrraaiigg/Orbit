@@ -3,6 +3,12 @@
 
     <title>Orbit: agentic pair programming in Smalltalk</title>
 
+    <!-- Server-rendered: defines window.__ORBIT_BRIDGE_BEARER__, the
+         per-process token the page sends as Authorization: Bearer …
+         to /clipboard and /workspace-fs/*. Must load before any
+         script that calls those endpoints. -->
+    <script src="/orbit-bridge-config.js"></script>
+
     <link rel="stylesheet"
 	  href="css/caffeine.css">
 
@@ -18,7 +24,7 @@
 
     <script>
       document.addEventListener('keydown', function(e) {
-        if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Tab', 'Space'].indexOf(e.key) !== -1) {
+        if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Tab', ' '].indexOf(e.key) !== -1) {
           e.preventDefault();
         }
       }, { passive: false });

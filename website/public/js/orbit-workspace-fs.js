@@ -5,6 +5,18 @@
 (function () {
   const BASE = '/workspace-fs';
 
+  // The express bridge requires an Authorization: Bearer header from
+  // non-loopback callers (LAN/dev-host mode). The page learns the
+  // token from /orbit-bridge-config.js, which the Orbit extension
+  // serves with a per-process random secret. Loopback callers don't
+  // need the header but sending it costs nothing.
+  function bridgeHeaders(extra) {
+    const h = Object.assign({}, extra || {});
+    const t = (typeof window !== 'undefined') && window.__ORBIT_BRIDGE_BEARER__;
+    if (t) h['Authorization'] = 'Bearer ' + t;
+    return h;
+  }
+
   async function call(path, params, { binary = false } = {}) {
     const url = new URL(BASE + path, window.location.origin);
     if (params) {
@@ -12,7 +24,7 @@
         if (v != null) url.searchParams.set(k, String(v));
       }
     }
-    const res = await fetch(url.toString());
+    const res = await fetch(url.toString(), { headers: bridgeHeaders() });
     if (binary) {
       if (!res.ok) {
         // Bridge sends JSON for errors even on the binary endpoint.

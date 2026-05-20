@@ -52,21 +52,78 @@ module.exports = function (vscode) {
     // Smalltalk object memories ("backends"), each of which exposes
     // its own MCP and WebDAV servers on distinct ports. We probe each
     // one at activation time and only register the reachable ones.
+    //
+    // The "Caffeine" backend is different: it's hosted by the Orbit
+    // webapp page (the SqueakJS image in the browser) and proxied by
+    // the Orbit webserver's McpBridge (see website/src/mcp-bridge.js).
+    // Reachability is "is there a tether currently registered with
+    // the bridge?", and the MCP URL is the bridge's HTTP endpoint on
+    // the local Orbit webserver port (8089).
+    const ORBIT_WEB_PORT = 8089;
     const BACKENDS = [
-        { name: '2300-backend', mcpPort: 15072, webdavPort: 19072 },
-        { name: '2300-ui',      mcpPort: 15070, webdavPort: 19070 }
+        { name: '2300-backend', kind: 'tcp',    mcpPort: 15072, webdavPort: 19072 },
+        { name: '2300-ui',      kind: 'tcp',    mcpPort: 15070, webdavPort: 19070 },
+        { name: 'Caffeine',     kind: 'bridge' }
     ];
+
+    // Set by startServer to the live express app, so the MCP provider
+    // and reachability probes can consult app.mcpBridge.
+    let currentApp = null;
 
     function backendByName(name) {
         return BACKENDS.find(b => b.name === name);
     }
 
+    // Pick the bridge endpoint that backs the Caffeine MCP server.
+    // Currently we assume the page registers exactly one endpoint;
+    // if multiple endpoints are ever announced, the first one wins.
+    function bridgeEndpointFor(backend) {
+        if (!currentApp || !currentApp.mcpBridge) return null;
+        const endpoints = Array.from(currentApp.mcpBridge.mcpServers.keys());
+        return endpoints[0] || null;
+    }
+
+    // Whether VS Code's MCP client has actually contacted the bridge
+    // endpoint (i.e. POSTed an initialize) since the page registered.
+    // This is the authoritative "VS Code is talking to us" signal for
+    // bridge-kind backends, since vscode.lm.tools can retain stale
+    // tool entries from previous sessions even when the MCP client
+    // is no longer connected.
+    function bridgeVscodeConnected(backend) {
+        if (!currentApp || !currentApp.mcpBridge) return false;
+        const ep = bridgeEndpointFor(backend);
+        if (!ep) return false;
+        return currentApp.mcpBridge.lastInitializeAt.has(ep);
+    }
+
     function mcpUrlFor(backend) {
+        if (backend.kind === 'bridge') {
+            const ep = bridgeEndpointFor(backend);
+            if (!ep) return null;
+            // The Orbit webserver always runs on the same machine
+            // as VS Code, so target localhost regardless of the
+            // dev-host LAN-address override used for the 2300
+            // backends. Use the string "localhost" (not 127.0.0.1)
+            // because VS Code's MCP HTTP client appears to silently
+            // refuse to POST initialize to a bare-IP loopback URL.
+            return `http://localhost:${ORBIT_WEB_PORT}${ep}`;
+        }
         return `http://${mcpHost}:${backend.mcpPort}/mcpservice/v1/mcp`;
     }
 
     function webdavUrlFor(backend) {
+        if (backend.kind === 'bridge') return null;
         return `http://${backendHost}:${backend.webdavPort}/webdav`;
+    }
+
+    // Headers to send to the Orbit McpBridge so it accepts the
+    // proxied JSON-RPC POST. The bridge gates POSTs on the same
+    // Orbit MCP bearer that the 2300 backends accept via OAuth; we
+    // bypass OAuth here because the bridge endpoint is local-only.
+    function bridgeAuthHeaders() {
+        const bridge = currentApp && currentApp.mcpBridge;
+        const bearer = bridge && bridge.bearer;
+        return bearer ? { Authorization: `Bearer ${bearer}` } : undefined;
     }
 
     // Quick TCP-connect probe. Resolves true if the port accepts a
@@ -96,12 +153,21 @@ module.exports = function (vscode) {
     }
 
     // Probe all backends in parallel for either 'mcp' or 'webdav'
-    // service. Returns an array of {backend, reachable}.
+    // service. Returns an array of {backend, reachable}. Bridge-kind
+    // backends only support 'mcp' (their reachability is "is there a
+    // tether registered with the Orbit McpBridge?"); they are always
+    // unreachable for 'webdav'.
     async function probeBackends(kind) {
         const probes = BACKENDS.map(async (b) => {
-            const port = kind === 'mcp' ? b.mcpPort : b.webdavPort;
-            const host = kind === 'mcp' ? mcpHost : backendHost;
-            const reachable = await probeTcp(host, port, 800);
+            let reachable;
+            if (b.kind === 'bridge') {
+                reachable = (kind === 'mcp')
+                    && !!bridgeEndpointFor(b);
+            } else {
+                const port = kind === 'mcp' ? b.mcpPort : b.webdavPort;
+                const host = kind === 'mcp' ? mcpHost : backendHost;
+                reachable = await probeTcp(host, port, 800);
+            }
             return { backend: b, reachable };
         });
         return Promise.all(probes);
@@ -125,24 +191,44 @@ module.exports = function (vscode) {
     let webdavProvider = null;
 
     // True if there is currently a VS Code editor tab showing the
-    // Orbit page (Simple Browser or Integrated Browser). Uses the
-    // same heuristic as orbit.stop's tab-closing logic.
+    // Orbit page (Simple Browser or Integrated Browser). Matches by
+    // tab label, which VS Code populates from the served page's
+    // <title> once the page loads. Two needles:
+    //   1. The distinctive title phrase
+    //      ("agentic pair programming in Smalltalk", see
+    //      website/public/orbit.html).
+    //   2. The Orbit web server URL
+    //      ("http://localhost:<ORBIT_WEB_PORT>"), which is what the
+    //      Integrated Browser uses as the tab label before the page
+    //      finishes loading — e.g. right after a window reload, when
+    //      VS Code restores the tab before the extension brings the
+    //      server back up. Without this fallback, activate-time
+    //      orbit.stop runs while the tab label is still the URL and
+    //      findOrbitTabs returns nothing.
+    // True if there is currently a VS Code editor tab showing the
+    // Orbit page (Simple Browser or Integrated Browser). Matches by
+    // tab label. VS Code truncates the Integrated Browser's label
+    // to ~30 characters (e.g. "Orbit: agentic pair programmin…"),
+    // and `tab.input` is null on those tabs, so we match against a
+    // short, distinctive prefix that fits inside the truncated form.
+    // The two needles cover:
+    //   1. "Orbit: agentic" — the page's <title> prefix; remains
+    //      visible after VS Code's truncation.
+    //   2. `http://localhost:<port>` — the URL the Integrated Browser
+    //      shows as a fallback label before the page finishes
+    //      loading (e.g. immediately after a window reload).
     function findOrbitTabs() {
+        const titleNeedle = 'Orbit: agentic';
+        const urlNeedle   = `http://localhost:${ORBIT_WEB_PORT}`;
         const found = [];
         try {
             for (const group of vscode.window.tabGroups.all) {
                 for (const tab of group.tabs) {
-                    const label = (tab.label || '').toLowerCase();
-                    const input = tab.input;
-                    const viewType = input && input.viewType;
-                    const editorId = input && (input.id || input.editorId);
-                    const ctorName = input && input.constructor && input.constructor.name;
-                    const matches =
-                        (viewType && /simpleBrowser|browser/i.test(viewType)) ||
-                        (editorId && /browser/i.test(editorId)) ||
-                        (ctorName && /browser/i.test(ctorName)) ||
-                        label.includes('orbit');
-                    if (matches) found.push(tab);
+                    const label = tab.label || '';
+                    if (label.includes(titleNeedle)
+                        || label.includes(urlNeedle)) {
+                        found.push(tab);
+                    }
                 }
             }
         } catch (_) {}
@@ -154,7 +240,11 @@ module.exports = function (vscode) {
     async function closeOrbitTabs() {
         const tabs = findOrbitTabs();
         if (!tabs.length) return 0;
-        try { await vscode.window.tabGroups.close(tabs, true); } catch (_) {}
+        try {
+            await vscode.window.tabGroups.close(tabs, true);
+        } catch (e) {
+            orbitError('[orbit] closing browser tab failed:', e && e.message);
+        }
         return tabs.length;
     }
 
@@ -618,19 +708,7 @@ module.exports = function (vscode) {
         //   1. ORBIT_MCP_BEARER environment variable
         //   2. <extensionPath>/secrets/mcp-bearer.txt
         //   3. ~/.orbit/mcp-bearer
-        let bearer = (process.env.ORBIT_MCP_BEARER || '').trim();
-        if (!bearer && extensionPath) {
-            try {
-                const p = path.join(extensionPath, 'secrets', 'mcp-bearer.txt');
-                if (fs.existsSync(p)) bearer = fs.readFileSync(p, 'utf8').trim();
-            } catch (_) {}
-        }
-        if (!bearer) {
-            try {
-                const p = path.join(os.homedir(), '.orbit', 'mcp-bearer');
-                if (fs.existsSync(p)) bearer = fs.readFileSync(p, 'utf8').trim();
-            } catch (_) {}
-        }
+        const bearer = require('./bearer').readBearer(extensionPath);
 
         const orbitServer = {
             type: 'http',
@@ -773,7 +851,69 @@ module.exports = function (vscode) {
                 return;
             }
 
+            // Invalidate require-cache entries under the website tree
+            // so livecoding edits to app-impl.js, routes, src/tether.js,
+            // src/mcp-bridge.js, etc. take effect on the next
+            // orbit.start without a full window reload (which would
+            // restart SqueakJS in the page). We deliberately skip
+            // extension-impl.js (we're running inside it) and anything
+            // under node_modules.
+            try {
+                const shimPath = path.join(context.extensionPath, 'app.js');
+                const selfPath = path.join('src', 'extension-impl.js');
+                let websiteRoot = null;
+                const shimEntry = require.cache[shimPath];
+                if (shimEntry) {
+                    for (const child of shimEntry.children || []) {
+                        if (child.id.endsWith(path.sep + 'app-impl.js')) {
+                            websiteRoot = path.dirname(child.id);
+                            break;
+                        }
+                    }
+                }
+                const toDrop = [];
+                for (const key of Object.keys(require.cache)) {
+                    if (key === shimPath) { toDrop.push(key); continue; }
+                    if (!websiteRoot) continue;
+                    if (!key.startsWith(websiteRoot + path.sep)) continue;
+                    if (key.includes(path.sep + 'node_modules' + path.sep)) continue;
+                    if (key.endsWith(selfPath)) continue;
+                    toDrop.push(key);
+                }
+                for (const key of toDrop) delete require.cache[key];
+                if (toDrop.length) {
+                    orbitLog(`[orbit] startServer: invalidated ${toDrop.length} require-cache entries`);
+                }
+            } catch (e) {
+                orbitError('[orbit] startServer: require-cache invalidation failed:',
+                    e && e.message);
+            }
+
             const app = require(path.join(context.extensionPath, 'app'));
+            currentApp = app;
+            // Hook the McpBridge so a fresh page-MCP announce can
+            // refire VS Code's MCP definitions (used to expose the
+            // Caffeine backend). We install the hook here because
+            // the MCP definition provider is registered earlier in
+            // activate(), before this require() runs.
+            if (app.mcpBridge && mcpDefinitionsChanged) {
+                // Route the bridge's logs through the Orbit output
+                // channel so we can see incoming HTTP requests.
+                app.mcpBridge.log = (...a) => orbitLog('[mcp-bridge]', ...a);
+                app.mcpBridge.error = (...a) => orbitError('[mcp-bridge]', ...a);
+                app.mcpBridge.onProvidersChanged = () => {
+                    orbitLog('[orbit] McpBridge providers changed; refiring MCP definitions');
+                    try { mcpDefinitionsChanged.fire(); } catch (_) {}
+                    activateReachableBackends().catch((e) => {
+                        orbitError('[orbit] activateReachableBackends after bridge change failed:',
+                            e && e.message);
+                    });
+                    // Re-arm the retry loop in case it had stopped
+                    // (e.g. the 2300 backends had already settled
+                    // as "all up" before Caffeine showed up).
+                    scheduleBackendActivationRetries();
+                };
+            }
             // Server-Sent Events endpoint that streams MCP server
             // state changes to the Orbit webapp. The page subscribes
             // via EventSource and dispatches each event to
@@ -929,6 +1069,14 @@ module.exports = function (vscode) {
 
             server = http.createServer(app);
 
+            // The MCP bridge (see website/src/mcp-bridge.js) needs to
+            // own the WebSocket upgrade for its path; install its
+            // upgrade listener now, before any clients connect.
+            if (typeof app.attachMcpBridge === 'function') {
+                try { app.attachMcpBridge(server); }
+                catch (e) { orbitError('[orbit] attachMcpBridge failed:', e && e.message); }
+            }
+
             server.listen(8089, () => {
                 const addr = server.address();
                 setRunningContext(true);
@@ -949,22 +1097,7 @@ module.exports = function (vscode) {
     }
 
     // Read the MCP/WebDAV bearer token from env or known files.
-    function readBearer(extensionPath) {
-        let bearer = (process.env.ORBIT_MCP_BEARER || '').trim();
-        if (!bearer && extensionPath) {
-            try {
-                const p = path.join(extensionPath, 'secrets', 'mcp-bearer.txt');
-                if (fs.existsSync(p)) bearer = fs.readFileSync(p, 'utf8').trim();
-            } catch (_) {}
-        }
-        if (!bearer) {
-            try {
-                const p = path.join(os.homedir(), '.orbit', 'mcp-bearer');
-                if (fs.existsSync(p)) bearer = fs.readFileSync(p, 'utf8').trim();
-            } catch (_) {}
-        }
-        return bearer;
-    }
+    const { readBearer } = require('./bearer');
 
     // True iff VS Code is currently connected to the MCP server for
     // the named backend. We detect this by looking for any
@@ -983,13 +1116,26 @@ module.exports = function (vscode) {
     // authoritative answer.
     function isMcpServerActuallyRunning(name) {
         try {
+            // "Running" means VS Code has surfaced at least one
+            // tool for this MCP server. Bridge-kind backends
+            // (Caffeine) additionally require that VS Code's MCP
+            // client has actually contacted the bridge endpoint
+            // (i.e. POSTed initialize) — otherwise we'd be fooled
+            // by stale vscode.lm.tools entries cached from a
+            // previous session.
             const tools = (vscode.lm && vscode.lm.tools) || [];
-            const prefix = `mcp_${name}_`;
+            const prefix = `mcp_${name}_`.toLowerCase();
+            let hasTool = false;
             for (const t of tools) {
-                const n = (t && t.name) || '';
-                if (n.startsWith(prefix)) return true;
+                const n = ((t && t.name) || '').toLowerCase();
+                if (n.startsWith(prefix)) { hasTool = true; break; }
             }
-            return false;
+            if (!hasTool) return false;
+            const backend = backendByName(name);
+            if (backend && backend.kind === 'bridge') {
+                return bridgeVscodeConnected(backend);
+            }
+            return true;
         } catch (_) { return false; }
     }
 
@@ -1001,6 +1147,16 @@ module.exports = function (vscode) {
     // can retain stale entries after a disconnect.
     async function isMcpServerConnected(name) {
         try {
+            // Bridge-kind backends (e.g. Caffeine) don't expose a
+            // fixed echoMessage tool; their toolset is whatever the
+            // page-hosted MCP server provides. For them, "connected"
+            // means VS Code has at least one tool registered under
+            // mcp_<name>_ — i.e. the bridge has successfully proxied
+            // tools/list to the page and back.
+            const backend = backendByName(name);
+            if (backend && backend.kind === 'bridge') {
+                return isMcpServerActuallyRunning(name);
+            }
             const toolName = `mcp_${name}_echoMessage`;
             const tools = (vscode.lm && vscode.lm.tools) || [];
             const tool = tools.find(t => t && t.name === toolName);
@@ -1046,6 +1202,12 @@ module.exports = function (vscode) {
         // stop (setRunning(false) or orbit.stop) clears the flag.
         for (const b of BACKENDS) {
             if (mcpRunning[b.name]) continue;
+            // Don't reconcile bridge backends from a bare tether
+            // presence — the tether attaches before VS Code starts
+            // the server, so flipping mcpRunning here would cause
+            // the startServer step below to skip them and VS Code
+            // would never actually start the bridge backend.
+            if (b.kind === 'bridge') continue;
             const actual = await isMcpServerConnected(b.name);
             if (actual) {
                 mcpRunning[b.name] = true;
@@ -1054,9 +1216,10 @@ module.exports = function (vscode) {
             }
         }
         const probes = await Promise.all(BACKENDS.map(async (b) => {
-            const mcp = mcpRunning[b.name]
-                ? true
-                : await probeTcp(mcpHost, b.mcpPort, 800);
+            let mcp;
+            if (mcpRunning[b.name]) mcp = true;
+            else if (b.kind === 'bridge') mcp = !!bridgeEndpointFor(b);
+            else mcp = await probeTcp(mcpHost, b.mcpPort, 800);
             return { b, mcp };
         }));
         let definitionsChanged = false;
@@ -1068,6 +1231,13 @@ module.exports = function (vscode) {
         }
         if (definitionsChanged && mcpDefinitionsChanged) {
             mcpDefinitionsChanged.fire();
+            // VS Code re-queries the MCP definition provider
+            // asynchronously after the change event. Give it a beat
+            // so workbench.mcp.startServer below can find the
+            // newly-registered server id (otherwise the start is a
+            // no-op and the server stays "stopped" until the next
+            // retry tick).
+            await new Promise(r => setTimeout(r, 250));
         }
         for (const { b, mcp } of probes) {
             if (!mcp || mcpRunning[b.name]) continue;
@@ -1229,6 +1399,54 @@ module.exports = function (vscode) {
             orbitError('[orbit] webdav FS provider registration failed:', e && e.message);
         }
 
+        // Register empty FileSearchProvider and TextSearchProvider for
+        // the orbit-webdav:// scheme. We do not support searching
+        // WebDAV filesystems; without these stubs VS Code would
+        // either fall back to walking the FS provider (extremely slow
+        // over WebDAV) or surface confusing errors. The providers
+        // return no results.
+        try {
+            const emptyFileSearch = {
+                provideFileSearchResults() { return []; }
+            };
+            const emptyTextSearch = {
+                provideTextSearchResults() { return { limitHit: false }; }
+            };
+            const ws = vscode.workspace;
+            const regFns = [
+                'registerFileSearchProvider',
+                'registerFileSearchProvider2'
+            ];
+            for (const fn of regFns) {
+                if (typeof ws[fn] === 'function') {
+                    try {
+                        context.subscriptions.push(
+                            ws[fn]('orbit-webdav', emptyFileSearch));
+                        orbitLog('[orbit] empty ' + fn + ' registered for orbit-webdav://');
+                    } catch (e) {
+                        orbitError('[orbit] ' + fn + ' failed:', e && e.message);
+                    }
+                }
+            }
+            const txtFns = [
+                'registerTextSearchProvider',
+                'registerTextSearchProvider2'
+            ];
+            for (const fn of txtFns) {
+                if (typeof ws[fn] === 'function') {
+                    try {
+                        context.subscriptions.push(
+                            ws[fn]('orbit-webdav', emptyTextSearch));
+                        orbitLog('[orbit] empty ' + fn + ' registered for orbit-webdav://');
+                    } catch (e) {
+                        orbitError('[orbit] ' + fn + ' failed:', e && e.message);
+                    }
+                }
+            }
+        } catch (e) {
+            orbitError('[orbit] search provider registration failed:', e && e.message);
+        }
+
         // Command: force-refresh every mounted orbit-webdav folder.
         // VS Code caches readDirectory/stat results until the FS
         // provider fires an onDidChangeFile event; this command fires
@@ -1322,6 +1540,7 @@ module.exports = function (vscode) {
             if (server) {
                 server.close();
                 server = null;
+                currentApp = null;
                 setRunningContext(false);
                 stopMcpDisconnectWatcher();
                 // Drop cached app.js and route modules so the next start
@@ -1341,41 +1560,21 @@ module.exports = function (vscode) {
             } else {
                 if (!silent) vscode.window.showInformationMessage('Orbit is not running.');
             }
-            // Close any browser tabs showing the Orbit page (Simple
-            // Browser viewType `mainThreadWebview-simpleBrowser.view`,
-            // or the new Integrated Browser editor with typeId
-            // `workbench.editor.browser`). Skipped when invoked from
-            // orbit.start with an existing tab to preserve.
-            if (!keepTabs) try {
-                const tabsToClose = [];
-                for (const group of vscode.window.tabGroups.all) {
-                    for (const tab of group.tabs) {
-                        const input = tab.input;
-                        const viewType = input && input.viewType;
-                        const editorId = input && (input.id || input.editorId);
-                        const ctorName = input && input.constructor && input.constructor.name;
-                        const label = (tab.label || '').toLowerCase();
-                        const matches =
-                            (viewType && /simpleBrowser|browser/i.test(viewType)) ||
-                            (editorId && /browser/i.test(editorId)) ||
-                            (ctorName && /browser/i.test(ctorName)) ||
-                            label.includes('orbit');
-                        orbitLog('[orbit.stop] tab', JSON.stringify({
-                            label: tab.label,
-                            viewType,
-                            editorId,
-                            ctorName,
-                            inputKeys: input ? Object.keys(input) : null,
-                            matches
-                        }));
-                        if (matches) tabsToClose.push(tab);
-                    }
+            // Close any browser tabs showing the Orbit page.
+            // Skipped when invoked from orbit.start with an existing
+            // tab to preserve.
+            if (!keepTabs) {
+                for (const tab of findOrbitTabs()) {
+                    const input = tab.input;
+                    orbitLog('[orbit.stop] closing tab', JSON.stringify({
+                        label: tab.label,
+                        viewType: input && input.viewType,
+                        editorId: input && (input.id || input.editorId),
+                        ctorName: input && input.constructor && input.constructor.name,
+                        inputKeys: input ? Object.keys(input) : null,
+                    }));
                 }
-                if (tabsToClose.length) {
-                    await vscode.window.tabGroups.close(tabsToClose, true);
-                }
-            } catch (e) {
-                orbitError('[orbit] closing browser tab failed:', e && e.message);
+                await closeOrbitTabs();
             }
             // Always remove WebDAV workspace folders when Orbit is
             // stopped (except during orbit.start's internal restart
@@ -1409,6 +1608,27 @@ module.exports = function (vscode) {
         });
 
         context.subscriptions.push(startCmd, stopCmd);
+
+        // Recycle just the HTTP server (and its WebSocket upgrade
+        // handler) so livecoding edits to app-impl.js / routes /
+        // src/mcp-bridge.js / src/tether.js take effect without
+        // touching the Orbit browser tab. Unlike orbit.start, this
+        // does not close tabs, withdraw MCP definitions, remount
+        // WebDAV folders, or restart the SqueakJS image in the page.
+        // The page's WebSocket to /orbit-tether will drop and need
+        // to be reopened by the page on its own.
+        const restartWebserverCmd = vscode.commands.registerCommand(
+            'orbit.restartWebserver',
+            async () => {
+                orbitLog('[orbit] orbit.restartWebserver: invoked');
+                if (server) {
+                    try { server.close(); } catch (_) {}
+                    server = null;
+                }
+                await startServer(context, /*openBrowser*/ false);
+                vscode.window.showInformationMessage('Orbit webserver restarted.');
+            });
+        context.subscriptions.push(restartWebserverCmd);
 
         // Command to open steering file from extension details page
         const openSteeringCmd = vscode.commands.registerCommand('orbit.openSteering', () => {
@@ -1667,15 +1887,15 @@ module.exports = function (vscode) {
 <body>
   <div class="summary">Orbit pair-programs Smalltalk with you.</div>
   <hr>
-  <div class="section-label">virtual filesystems</div>
-  <div class="server">
+  <div id="webdav-section-label" class="section-label">virtual filesystems</div>
+  <div id="webdav-row" class="server">
     <input type="checkbox" id="webdav-toggle">
     <label for="webdav-toggle" class="name">mount Smalltalk folders</label>
   </div>
   <hr id="hr-top">
   <div id="mcp-section-label" class="section-label">remote systems</div>
   <div id="servers"></div>
-  <hr>
+  <hr id="hr-bottom">
   <button id="orbit-toggle" class="footer-button">Start Orbit</button>
 
 <script nonce="${nonce}">
@@ -1695,9 +1915,13 @@ module.exports = function (vscode) {
   function render(state) {
     toggleBtn.textContent = state.orbitRunning ? 'Stop Orbit' : 'Start Orbit';
     webdavCb.checked = !!state.webdavEnabled;
-    const hasServers = state.servers && state.servers.length > 0;
+    const showWebdav = !!state.orbitRunning;
+    document.getElementById('webdav-section-label').style.display = showWebdav ? '' : 'none';
+    document.getElementById('webdav-row').style.display = showWebdav ? '' : 'none';
+    const hasServers = state.orbitRunning && state.servers && state.servers.length > 0;
     document.getElementById('hr-top').style.display = hasServers ? '' : 'none';
     document.getElementById('mcp-section-label').style.display = hasServers ? '' : 'none';
+    document.getElementById('hr-bottom').style.display = state.orbitRunning ? '' : 'none';
     serversEl.innerHTML = '';
     for (const s of state.servers) {
       const row = document.createElement('div');
@@ -1741,8 +1965,8 @@ module.exports = function (vscode) {
                 resolveWebviewView(webviewView) {
                     currentWebviewView = webviewView;
                     webviewView.webview.options = { enableScripts: true };
-                    const nonce = Math.random().toString(36).slice(2) +
-                        Math.random().toString(36).slice(2);
+                    const nonce = require('crypto')
+                        .randomBytes(16).toString('base64');
                     webviewView.webview.html = getHtml(webviewView.webview, nonce);
 
                     webviewView.webview.onDidReceiveMessage(async (msg) => {
@@ -2177,7 +2401,9 @@ module.exports = function (vscode) {
 
         // Diagnostic: log what VS Code thinks our manifest contributes look like.
         try {
-            const ext = vscode.extensions.getExtension('BlackPageDigital.orbit');
+            const ext = context.extension
+                || vscode.extensions.getExtension(
+                    'BlackPageDigital.orbit-agentic-pair-programming-for-smalltalk');
             const contributes = ext && ext.packageJSON && ext.packageJSON.contributes;
             const mcp = contributes && contributes.mcpServerDefinitionProviders;
             orbitLog('[orbit] packageJSON.contributes keys:', contributes && Object.keys(contributes));
@@ -2202,10 +2428,23 @@ module.exports = function (vscode) {
                     reachable.forEach(b => mcpReachable.add(b.name));
                     orbitLog('[orbit] MCP provider: reachable=' +
                         JSON.stringify(reachable.map(b => b.name)));
-                    return reachable.map(b => new vscode.McpHttpServerDefinition(
-                        b.name,
-                        vscode.Uri.parse(mcpUrlFor(b))
-                    ));
+                    return reachable.map(b => {
+                        const url = mcpUrlFor(b);
+                        if (!url) return null;
+                        // Bridge-kind backends are reachable only on
+                        // loopback (the Orbit webserver), so the bridge
+                        // accepts loopback POSTs without a bearer. We
+                        // deliberately do not pass a headers argument
+                        // here — the McpHttpServerDefinition
+                        // constructor's 3rd positional arg appears to
+                        // make VS Code silently fail to issue the
+                        // initialize POST.
+                        orbitLog(`[orbit] MCP def for ${b.name}: url=${url}`);
+                        return new vscode.McpHttpServerDefinition(
+                            b.name,
+                            vscode.Uri.parse(url)
+                        );
+                    }).filter(Boolean);
                 }
             });
             context.subscriptions.push(mcpProvider, mcpDefinitionsChanged);

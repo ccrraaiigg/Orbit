@@ -6893,12 +6893,20 @@ module('users.bert.SqueakJS.vm').requires().toRun(function() {
 			primitiveBeep: function(argCount) {
 			    var ctx = Squeak.startAudioOut();
 			    if (ctx) {
-				var beep = ctx.createOscillator();
-				beep.connect(ctx.destination);
-				beep.type = 'square';
-				beep.frequency.value = 880;
-				beep.start();
-				beep.stop(ctx.currentTime + 0.2);
+				var t0 = ctx.currentTime;
+				var attack = 0.01, release = 0.08, duration = 0.15;
+				var osc = ctx.createOscillator();
+				var gain = ctx.createGain();
+				osc.type = 'sine';
+				osc.frequency.value = 660;
+				gain.gain.setValueAtTime(0, t0);
+				gain.gain.linearRampToValueAtTime(0.2, t0 + attack);
+				gain.gain.setValueAtTime(0.2, t0 + duration - release);
+				gain.gain.linearRampToValueAtTime(0, t0 + duration);
+				osc.connect(gain);
+				gain.connect(ctx.destination);
+				osc.start(t0);
+				osc.stop(t0 + duration);
 			    } else {
 				this.vm.warnOnce("could not initialize audio");
 			    }

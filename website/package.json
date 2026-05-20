@@ -2,198 +2,213 @@
     "name": "orbit-agentic-pair-programming-for-smalltalk",
     "displayName": "Orbit: Agentic Pair Programming for Smalltalk",
     "description": "A livecoding pair-programming harness for Smalltalk.",
-    "version": "1.53.0",
+    "version": "1.94.0",
     "publisher": "BlackPageDigital",
     "icon": "public/pictures/icons/participant/orbit.jpg",
     "engines": {
-	"vscode": "^1.101.0"
+        "vscode": "^1.101.0"
     },
     "enabledApiProposals": [
-	"mcpServerDefinitions"
+        "mcpServerDefinitions",
+        "fileSearchProvider",
+        "textSearchProvider",
+        "fileSearchProvider2",
+        "textSearchProvider2"
     ],
     "categories": [
-	"Programming Languages"
+        "Programming Languages"
     ],
     "main": "./src/extension.js",
     "activationEvents": [
-	"onStartupFinished",
-	"onFileSystem:orbit-webdav",
-	"onCommand:orbit.start",
-	"onCommand:orbit.stop",
-	"onCommand:orbit.openSteering",
-	"onCommand:orbit.addWebdavFolder",
-	"onCommand:orbit.refreshWebdav",
-	"onMcpServerDefinitionProvider:orbitBackend",
-	"onChatParticipant:orbit.orbit",
-	"onChatParticipant:orbit.orbit-2300-backend",
-	"onChatParticipant:orbit.orbit-2300-ui",
-	"onView:orbit.status"
+        "onStartupFinished",
+        "onFileSystem:orbit-webdav",
+        "onCommand:orbit.start",
+        "onCommand:orbit.stop",
+        "onCommand:orbit.restartWebserver",
+        "onCommand:orbit.openSteering",
+        "onCommand:orbit.addWebdavFolder",
+        "onCommand:orbit.refreshWebdav",
+        "onMcpServerDefinitionProvider:orbitBackend",
+        "onChatParticipant:orbit.orbit",
+        "onChatParticipant:orbit.orbit-2300-backend",
+        "onChatParticipant:orbit.orbit-2300-ui",
+        "onView:orbit.status"
     ],
     "contributes": {
-	"configuration": {
-	    "title": "Orbit",
-	    "properties": {
-		"orbit.autoStart": {
-		    "type": "boolean",
-		    "default": false,
-		    "description": "Automatically start the Orbit web server when VS Code starts. When false (the default), Orbit only starts when the user clicks \"Start Orbit\" in the Orbit view. When true, Orbit starts on extension activation so browser tabs left open at the Orbit URL can reconnect after a restart."
-		},
-		"orbit.mountWebdav": {
-		    "type": "boolean",
-		    "default": true,
-		    "description": "Add a workspace folder for each reachable Smalltalk WebDAV backend (orbit-webdav://<backend>/) when Orbit starts, and remove them when Orbit stops. Served by the in-process FileSystemProvider; no host-OS WebDAV client is required."
-		}
-	    }
-	},
-	"commands": [
-	    {
-		"command": "orbit.start",
-		"title": "Orbit: Start"
-	    },
-	    {
-		"command": "orbit.stop",
-		"title": "Orbit: Stop"
-	    },
-	    {
-		"command": "orbit.openSteering",
-		"title": "Orbit: Open Steering"
-	    },
-	    {
-		"command": "orbit.runIsolatedSubagent",
-		"title": "Orbit: Run Isolated Subagent (Copilot CLI)"
-	    },
-	    {
-		"command": "orbit.addWebdavFolder",
-		"title": "Orbit: Add WebDAV Folder to Workspace"
-	    },
-	    {
-		"command": "orbit.refreshWebdav",
-		"title": "Orbit: Refresh WebDAV Folders"
-	    }
-	],
-	"keybindings": [
-	    {
-		"command": "orbit.refreshWebdav",
-		"key": "f5",
-		"when": "filesExplorerFocus && resourceScheme == orbit-webdav"
-	    }
-	],
-	"languageModelTools": [
-	    {
-		"name": "orbit_runIsolatedSubagent",
-		"displayName": "Run Isolated Subagent (Copilot CLI)",
-		"modelDescription": "Spawn a GitHub Copilot CLI subprocess to perform a task with access to the Orbit MCP backend (and the spawned process's own tools). The subprocess is its own tool-calling harness, so intermediate tool calls and their outputs do NOT appear in the VSCode chat activity UI; only the subagent's final text response is returned to the orchestrator. USE FOR: tasks where intermediate tool outputs (e.g. fetched method source code) must remain hidden from the VSCode UI. The subagent's final text WILL be visible \u2014 only intermediate work is isolated.",
-		"userDescription": "Runs a GitHub Copilot CLI subprocess with isolated tool calls; only the final response surfaces.",
-		"canBeReferencedInPrompt": true,
-		"toolReferenceName": "orbitIsolatedSubagent",
-		"icon": "$(robot)",
-		"tags": ["orbit", "subagent"],
-		"inputSchema": {
-		    "type": "object",
-		    "required": ["prompt"],
-		    "properties": {
-			"prompt": {
-			    "type": "string",
-			    "description": "Detailed task description for the isolated subagent. Include all context the subagent needs; it does not share your conversation."
-			},
-			"model": {
-			    "type": "string",
-			    "description": "Optional Copilot CLI model name (e.g. 'gpt-5.4', 'claude-sonnet-4'). Omit to use the CLI default."
-			}
-		    }
-		}
-	    }
-	],
-	"mcpServerDefinitionProviders": [
-	    {
-		"id": "orbitBackend",
-		"label": "Orbit Smalltalk Backends"
-	    }
-	],
-	"chatParticipants": [
-	    {
-		"id": "orbit.orbit",
-		"fullName": "Orbit",
-		"name": "orbit",
-		"description": "Orbit livecoding pair-programming agent for Smalltalk",
-		"isSticky": true
-	    },
-	    {
-		"id": "orbit.orbit-2300-backend",
-		"fullName": "Orbit (2300-backend)",
-		"name": "orbit-2300-backend",
-		"description": "Orbit pair-programming agent restricted to the 2300-backend Smalltalk MCP server",
-		"isSticky": true
-	    },
-	    {
-		"id": "orbit.orbit-2300-ui",
-		"fullName": "Orbit (2300-ui)",
-		"name": "orbit-2300-ui",
-		"description": "Orbit pair-programming agent restricted to the 2300-ui Smalltalk MCP server",
-		"isSticky": true
-	    }
-	],
-	"viewsContainers": {
-	    "activitybar": [
-		{
-		    "id": "orbit",
-		    "title": "Orbit",
-		    "icon": "public/pictures/icons/participant/orbit.svg"
-		}
-	    ]
-	},
-	"views": {
-	    "orbit": [
-		{
-		    "type": "webview",
-		    "id": "orbit.status",
-		    "name": "Orbit",
-		    "icon": "public/pictures/icons/participant/orbit.svg",
-		    "contextualTitle": "Orbit"
-		}
-	    ]
-	},
-	"walkthroughs": [
-	    {
-		"id": "orbit.getStarted",
-		"title": "Get Started with Orbit",
-		"description": "Set up your livecoding pair-programming environment for Smalltalk.",
-		"steps": [
-		    {
-			"id": "orbit.startServer",
-			"title": "Start Orbit",
-			"description": "Launch the Orbit web server and open the integrated browser.\n\n[Start Orbit](command:orbit.start)",
-			"media": {
-			    "image": "public/pictures/icons/participant/orbit.jpg",
-			    "altText": "Orbit logo"
-			}
-		    },
-		    {
-			"id": "orbit.viewSteering",
-			"title": "View Steering Instructions",
-			"description": "Open the agent steering file that defines how Orbit behaves.\n\n[Open Steering](command:orbit.openSteering)",
-			"media": {
-			    "image": "public/pictures/icons/participant/orbit.jpg",
-			    "altText": "Orbit logo"
-			}
-		    }
-		]
-	    }
-	]
+        "configuration": {
+            "title": "Orbit",
+            "properties": {
+                "orbit.autoStart": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Automatically start the Orbit web server when VS Code starts. When false (the default), Orbit only starts when the user clicks \"Start Orbit\" in the Orbit view. When true, Orbit starts on extension activation so browser tabs left open at the Orbit URL can reconnect after a restart."
+                },
+                "orbit.mountWebdav": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Add a workspace folder for each reachable Smalltalk WebDAV backend (orbit-webdav://<backend>/) when Orbit starts, and remove them when Orbit stops. Served by the in-process FileSystemProvider; no host-OS WebDAV client is required."
+                }
+            }
+        },
+        "commands": [
+            {
+                "command": "orbit.start",
+                "title": "Orbit: Start"
+            },
+            {
+                "command": "orbit.stop",
+                "title": "Orbit: Stop"
+            },
+            {
+                "command": "orbit.restartWebserver",
+                "title": "Orbit: Restart Webserver (preserve page)"
+            },
+            {
+                "command": "orbit.openSteering",
+                "title": "Orbit: Open Steering"
+            },
+            {
+                "command": "orbit.runIsolatedSubagent",
+                "title": "Orbit: Run Isolated Subagent (Copilot CLI)"
+            },
+            {
+                "command": "orbit.addWebdavFolder",
+                "title": "Orbit: Add WebDAV Folder to Workspace"
+            },
+            {
+                "command": "orbit.refreshWebdav",
+                "title": "Orbit: Refresh WebDAV Folders"
+            }
+        ],
+        "keybindings": [
+            {
+                "command": "orbit.refreshWebdav",
+                "key": "f5",
+                "when": "filesExplorerFocus && resourceScheme == orbit-webdav"
+            }
+        ],
+        "languageModelTools": [
+            {
+                "name": "orbit_runIsolatedSubagent",
+                "displayName": "Run Isolated Subagent (Copilot CLI)",
+                "modelDescription": "Spawn a GitHub Copilot CLI subprocess to perform a task with access to the Orbit MCP backend (and the spawned process's own tools). The subprocess is its own tool-calling harness, so intermediate tool calls and their outputs do NOT appear in the VSCode chat activity UI; only the subagent's final text response is returned to the orchestrator. USE FOR: tasks where intermediate tool outputs (e.g. fetched method source code) must remain hidden from the VSCode UI. The subagent's final text WILL be visible — only intermediate work is isolated.",
+                "userDescription": "Runs a GitHub Copilot CLI subprocess with isolated tool calls; only the final response surfaces.",
+                "canBeReferencedInPrompt": true,
+                "toolReferenceName": "orbitIsolatedSubagent",
+                "icon": "$(robot)",
+                "tags": [
+                    "orbit",
+                    "subagent"
+                ],
+                "inputSchema": {
+                    "type": "object",
+                    "required": [
+                        "prompt"
+                    ],
+                    "properties": {
+                        "prompt": {
+                            "type": "string",
+                            "description": "Detailed task description for the isolated subagent. Include all context the subagent needs; it does not share your conversation."
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": "Optional Copilot CLI model name (e.g. 'gpt-5.4', 'claude-sonnet-4'). Omit to use the CLI default."
+                        }
+                    }
+                }
+            }
+        ],
+        "mcpServerDefinitionProviders": [
+            {
+                "id": "orbitBackend",
+                "label": "Orbit Smalltalk Backends"
+            }
+        ],
+        "chatParticipants": [
+            {
+                "id": "orbit.orbit",
+                "fullName": "Orbit",
+                "name": "orbit",
+                "description": "Orbit livecoding pair-programming agent for Smalltalk",
+                "isSticky": true
+            },
+            {
+                "id": "orbit.orbit-2300-backend",
+                "fullName": "Orbit (2300-backend)",
+                "name": "orbit-2300-backend",
+                "description": "Orbit pair-programming agent restricted to the 2300-backend Smalltalk MCP server",
+                "isSticky": true
+            },
+            {
+                "id": "orbit.orbit-2300-ui",
+                "fullName": "Orbit (2300-ui)",
+                "name": "orbit-2300-ui",
+                "description": "Orbit pair-programming agent restricted to the 2300-ui Smalltalk MCP server",
+                "isSticky": true
+            }
+        ],
+        "viewsContainers": {
+            "activitybar": [
+                {
+                    "id": "orbit",
+                    "title": "Orbit",
+                    "icon": "public/pictures/icons/participant/orbit.svg"
+                }
+            ]
+        },
+        "views": {
+            "orbit": [
+                {
+                    "type": "webview",
+                    "id": "orbit.status",
+                    "name": "Orbit",
+                    "icon": "public/pictures/icons/participant/orbit.svg",
+                    "contextualTitle": "Orbit"
+                }
+            ]
+        },
+        "walkthroughs": [
+            {
+                "id": "orbit.getStarted",
+                "title": "Get Started with Orbit",
+                "description": "Set up your livecoding pair-programming environment for Smalltalk.",
+                "steps": [
+                    {
+                        "id": "orbit.startServer",
+                        "title": "Start Orbit",
+                        "description": "Launch the Orbit web server and open the integrated browser.\n\n[Start Orbit](command:orbit.start)",
+                        "media": {
+                            "image": "public/pictures/icons/participant/orbit.jpg",
+                            "altText": "Orbit logo"
+                        }
+                    },
+                    {
+                        "id": "orbit.viewSteering",
+                        "title": "View Steering Instructions",
+                        "description": "Open the agent steering file that defines how Orbit behaves.\n\n[Open Steering](command:orbit.openSteering)",
+                        "media": {
+                            "image": "public/pictures/icons/participant/orbit.jpg",
+                            "altText": "Orbit logo"
+                        }
+                    }
+                ]
+            }
+        ]
     },
     "scripts": {
-	"start": "node --inspect=9230 ./bin/www",
-	"package": "vsce package --allow-missing-repository --baseContentUrl ."
+        "start": "node --inspect=9230 ./bin/www",
+        "package": "vsce package --allow-missing-repository --baseContentUrl ."
     },
     "dependencies": {
-	"cookie-parser": "~1.4.3",
-	"debug": "~2.6.9",
-	"express": "~4.16.0",
-	"http-errors": "~1.6.2",
-	"jade": "~1.11.0",
-	"morgan": "~1.9.0"
+        "cookie-parser": "~1.4.3",
+        "debug": "~2.6.9",
+        "express": "~4.16.0",
+        "http-errors": "~1.6.2",
+        "jade": "~1.11.0",
+        "morgan": "~1.9.0",
+        "ws": "^8.20.1"
     },
     "devDependencies": {
-	"@vscode/vsce": "^3.0.0"
+        "@vscode/vsce": "^3.0.0"
     }
 }

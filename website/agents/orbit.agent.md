@@ -30,6 +30,15 @@ Whenever you notice that the Integrated Browser page isn't shared, use
 the VSCode API for asking the user to share the tab. Don't ask
 yourself in the conversation.
 
+### MCP tools are deferred — load their schemas first
+
+The Smalltalk MCP tools (e.g. `capabilities`, `role`, `runCode`,
+`evaluate`, `echo`, `send`, `compileMethod`, and the `mcp_2300-ui_*`
+family) are deferred: only their names appear in
+`<availableDeferredTools>`, not their input schemas. Before the first
+call to any of them in a conversation, use `tool_search` to load their
+schemas. Never guess parameter names — invoke each tool only with the
+exact parameters from its loaded schema.
 
 ## This project is Orbit, a livecoding pair-programming harness
 
@@ -55,7 +64,7 @@ The Orbit webapp provides full use of the remote Smalltalk GUI. You
 can see what the user sees: Smalltalk class browsers, workspaces,
 debuggers, etc. You can manipulate those tools just as the user can.
 
-### You can interact with the remote Smalltalk and other agents via the WebDAV filesystem
+### You can interact with the remote Smalltalk and other agents via WebDAV filesystems
 
 The normal way of interacting with the Smalltalk system is by sending
 messages. In Orbit, we have another way: reading and writing a WebDAV
@@ -65,8 +74,8 @@ agents who have access to it.
 #### You can get and change information about remote Smalltalk classes and methods
 
 You can invoke some remote Smalltalk actions and information access by
-reading and writing the WebDAV filesystem. The filesystem maps remote
-Smalltalk class information to a hierarchy of directories and
+reading and writing WebDAV filesystems. A WebDAV filesystem maps
+remote Smalltalk class information to a hierarchy of directories and
 files. Here's a sampling of the top of the filesystem:
 
 ```
@@ -120,8 +129,9 @@ files. Here's a sampling of the top of the filesystem:
 				resume
 				terminate
 				debug
+
 Note that the SqueakJS system running in the page is distinct from the
-remote Smalltalk system. The WebDAV filesystem is not relevant for
+remote Smalltalk system. WebDAV filesystems are not relevant for
 understanding the SqueakJS object memory.
 
 #### You can inspect and manipulate remote Smalltalk processes
@@ -137,7 +147,7 @@ description of what it does. The set of process subdirectories is
 recomputed on every listing, and subdirectory names use the form
 `<identityHash>-<sanitized name>`.
 
-#### You can use the WebDAV filesystem as shared agentic memory
+#### You can use WebDAV filesystems as shared agentic memory
 
 In /sessions/ (the session memory) you can externalize
 your context window for the benefit of:

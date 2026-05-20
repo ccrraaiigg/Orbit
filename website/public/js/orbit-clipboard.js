@@ -174,7 +174,15 @@
     // navigator.clipboard.readText permission. Instead we ask the
     // extension's webserver, which uses vscode.env.clipboard.
     function doPaste(timestamp) {
-      fetch('/clipboard', { cache: 'no-store' })
+      // The express bridge requires an Authorization: Bearer header
+      // from non-loopback callers. The token comes from
+      // /orbit-bridge-config.js, which the Orbit extension serves
+      // with a per-process random secret. Loopback callers don't
+      // need it but sending it is harmless.
+      var headers = {};
+      var t = window.__ORBIT_BRIDGE_BEARER__;
+      if (t) headers['Authorization'] = 'Bearer ' + t;
+      fetch('/clipboard', { cache: 'no-store', headers: headers })
         .then(function (r) { return r.ok ? r.json() : null; })
         .then(function (j) {
           if (!j || typeof j.text !== 'string') return;
