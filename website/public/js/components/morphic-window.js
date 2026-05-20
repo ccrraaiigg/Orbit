@@ -1101,9 +1101,15 @@ class MorphicWindow extends HTMLElement {
   }
 
   // Modifier-click model:
-  //   cmd-drag   -> move window (no need for a raise binding;
-  //                 clicking an occluded window already raises it
-  //                 without propagating the click into the window)
+  //   cmd-drag   -> move window (the gesture is fully buffered until
+  //                 the pointer crosses a small threshold; nothing
+  //                 leaks to the window content during arming)
+  //   cmd-click  -> pass through to the window content (e.g. Squeak
+  //                 in an iframe). The pointerdown is suppressed at
+  //                 first and the full pointerdown/mousedown/
+  //                 pointerup/mouseup/click sequence is synthesized
+  //                 onto the original target once we know the user
+  //                 isn't dragging.
   //   opt-click  -> collapse
   //
   // Installed once at the window level (capture phase) so it runs
@@ -1143,6 +1149,12 @@ class MorphicWindow extends HTMLElement {
   }
 
   static _handleModifierEvent(e, sourceIframe) {
+    // Ignore synthesized events (e.g. the ones _synthesizeClick
+    // dispatches on the no-drag path); only real user gestures should
+    // initiate arming. Without this guard, the synthetic pointerdown
+    // dispatched after a cmd-click would re-enter _beginArming and
+    // loop forever.
+    if (e.isTrusted === false) return;
     var meta = !!e.metaKey, alt = !!e.altKey;
     // Only handle plain cmd or plain opt (and never with ctrl).
     if (e.ctrlKey) return;
@@ -1153,22 +1165,282 @@ class MorphicWindow extends HTMLElement {
       ? MorphicWindow._findWindowAncestor(sourceIframe)
       : MorphicWindow._findWindowInPath(e.composedPath());
     if (!win) return;
+    if (alt) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      e.stopPropagation();
+      if (typeof win.collapse === 'function') win.collapse();
+      return;
+    }
+    // cmd: buffer the entire mouse/pointer gesture. The underlying
+    // content (e.g. Squeak in an iframe) must not see the gesture
+    // until we know whether the user is dragging the window or just
+    // clicking. If it's a click (no drag), we synthesize the full
+    // pointerdown/mousedown/pointerup/mouseup/click sequence onto the
+    // original target so Squeak receives a coherent cmd-click.
     e.preventDefault();
     e.stopImmediatePropagation();
     e.stopPropagation();
-    if (meta) { MorphicWindow._startModifierDrag(win, e, sourceIframe); return; }
-    if (alt)  { if (typeof win.collapse === 'function') win.collapse(); return; }
+    // Don't start a new gesture while one is in flight. Single source
+    // of truth is the global arm state; per-window flags can go stale.
+    if (window.__morphicArmState || win._modifierDragging) return;
+    if (e.type !== 'pointerdown') return;
+    MorphicWindow._beginArming(win, e, sourceIframe);
   }
 
-  static _startModifierDrag(win, e, sourceIframe) {
-    if (win._isMaximized && win._isMaximized()) return;
+  // Single-persistent-dispatcher design: one static listener is
+  // installed once on window/document/iframe-docs. It consults the
+  // single window-global `__morphicArmState`; when null (the common
+  // case) it returns immediately. No per-session closures are created,
+  // so cmd-click gestures cannot leak listeners that strand the page.
+  // Using a window-global (rather than a class-static) ensures that
+  // hot-reloads which create a new MorphicWindow class object in an
+  // eval scope still share the same state location.
+  static _beginArming(win, e, sourceIframe) {
+    // We arm even for maximized windows: cmd-click still needs to
+    // pass through to the underlying content (the no-drag synth-click
+    // path doesn't require window motion). _startModifierDrag itself
+    // guards against drag on maximized windows.
+    if (window.__morphicArmState) return; // already arming a gesture
+
+    var origTarget = e.target;
+    var origDoc = (origTarget && origTarget.ownerDocument) || document;
+    var origView = origDoc.defaultView || window;
     var iframeOX = 0, iframeOY = 0;
     if (sourceIframe) {
       var r = sourceIframe.getBoundingClientRect();
       iframeOX = r.left; iframeOY = r.top;
     }
-    var startX = e.clientX + iframeOX;
-    var startY = e.clientY + iframeOY;
+
+    var st = {
+      win: win,
+      sourceIframe: sourceIframe,
+      origTarget: origTarget,
+      origView: origView,
+      origPointerId: e.pointerId,
+      origPointerType: e.pointerType || 'mouse',
+      downSrcX: e.clientX,   downSrcY: e.clientY,
+      downScreenX: e.screenX, downScreenY: e.screenY,
+      iframeOX: iframeOX,    iframeOY: iframeOY,
+      startX: e.clientX + iframeOX,
+      startY: e.clientY + iframeOY,
+      threshold: 4,
+      decided: false,
+      captured: false,
+      safetyTimer: null,
+      bailListener: null
+    };
+    MorphicWindow._armState = st;
+    window.__morphicArmState = st;
+    win._modifierArming = true;
+
+    MorphicWindow._installArmDispatchers();
+
+    // Explicit pointer capture on the morphic-window element so that
+    // subsequent pointer events for this pointer reliably surface in
+    // the outer document, even if the cursor leaves the page or roams
+    // over iframes we can't introspect.
+    try {
+      if (typeof win.setPointerCapture === 'function' && e.pointerId != null) {
+        win.setPointerCapture(e.pointerId);
+        st.captured = true;
+      }
+    } catch (_) {}
+
+    // Safety net: if nothing resolves the gesture in 3 seconds, or if
+    // focus/visibility changes (usually meaning the gesture ended
+    // somewhere we can't observe), force-end arming.
+    st.safetyTimer = setTimeout(function() {
+      if (window.__morphicArmState !== st || st.decided) return;
+      st.decided = true;
+      MorphicWindow._endArming();
+    }, 3000);
+    st.bailListener = function(ev) {
+      if (window.__morphicArmState !== st || st.decided) return;
+      st.decided = true;
+      MorphicWindow._endArming();
+    };
+    // Only listen for visibilitychange. We deliberately do NOT listen
+    // for window 'blur', because pointerdown on a focusable element
+    // (e.g. the streamed VisualWorks window image) can fire blur as a
+    // side effect of the click itself, which would abort arming on
+    // the very gesture that started it.
+    document.addEventListener('visibilitychange', st.bailListener, true);
+  }
+
+  static _endArming() {
+    var st = window.__morphicArmState;
+    if (!st) return;
+    window.__morphicArmState = null;
+    MorphicWindow._armState = null;
+    if (st.win) st.win._modifierArming = false;
+    if (st.safetyTimer != null) {
+      clearTimeout(st.safetyTimer);
+      st.safetyTimer = null;
+    }
+    if (st.captured && st.win && st.origPointerId != null) {
+      try { st.win.releasePointerCapture(st.origPointerId); } catch (_) {}
+    }
+    if (st.bailListener) {
+      try { document.removeEventListener('visibilitychange', st.bailListener, true); } catch (_) {}
+      st.bailListener = null;
+    }
+    // Dispatcher listeners remain attached but become no-ops since
+    // __morphicArmState is null. Nothing to leak.
+  }
+
+  static get _SUP_TYPES() {
+    return ['pointerdown', 'pointermove', 'pointerup', 'pointercancel',
+            'mousedown', 'mousemove', 'mouseup',
+            'click', 'dblclick', 'auxclick', 'contextmenu'];
+  }
+
+  static _armDispatcher(ev) {
+    var st = window.__morphicArmState;
+    if (!st) return;                  // common path: do nothing
+    // Let our own synthesized events through unmodified; they are
+    // generated by _synthesizeClick on the no-drag path and must reach
+    // the underlying content.
+    if (ev.isTrusted === false) return;
+    // While armed, suppress every gesture event so the underlying
+    // content (Squeak/iframe/etc.) does not observe anything until we
+    // synthesize a clean sequence on the no-drag path.
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+    ev.stopPropagation();
+    if (st.decided) return;
+
+    if (ev.type === 'pointermove') {
+      var off = MorphicWindow._iframeOffsetForDoc(ev.target && ev.target.ownerDocument);
+      var dx = ev.clientX + off.x - st.startX;
+      var dy = ev.clientY + off.y - st.startY;
+      if (dx * dx + dy * dy < st.threshold * st.threshold) return;
+      st.decided = true;
+      var win = st.win, sourceIframe = st.sourceIframe;
+      var sX = st.startX, sY = st.startY;
+      setTimeout(function() {
+        MorphicWindow._endArming();
+        MorphicWindow._startModifierDrag(win, ev, sourceIframe, sX, sY);
+      }, 0);
+      return;
+    }
+
+    if (ev.type === 'pointerup' || ev.type === 'pointercancel') {
+      st.decided = true;
+      var upOff = MorphicWindow._iframeOffsetForDoc(ev.target && ev.target.ownerDocument);
+      var upOuterX = ev.clientX + upOff.x;
+      var upOuterY = ev.clientY + upOff.y;
+      var upSrcX = upOuterX - st.iframeOX;
+      var upSrcY = upOuterY - st.iframeOY;
+      var upScreenX = ev.screenX, upScreenY = ev.screenY;
+      var origTarget = st.origTarget, origView = st.origView;
+      var origPointerId = st.origPointerId, origPointerType = st.origPointerType;
+      var downSrcX = st.downSrcX, downSrcY = st.downSrcY;
+      var downScreenX = st.downScreenX, downScreenY = st.downScreenY;
+      setTimeout(function() {
+        MorphicWindow._endArming();
+        MorphicWindow._synthesizeClick(origTarget, origView, {
+          pointerId: origPointerId,
+          pointerType: origPointerType,
+          down: { clientX: downSrcX, clientY: downSrcY,
+                  screenX: downScreenX, screenY: downScreenY },
+          up:   { clientX: upSrcX,   clientY: upSrcY,
+                  screenX: upScreenX, screenY: upScreenY }
+        });
+      }, 0);
+      return;
+    }
+    // Other event types: pure suppression (handled above).
+  }
+
+  static _ensureArmDispatcherOn(target) {
+    if (!target) return;
+    if (target.__morphicArmDispatcherInstalled) return;
+    var types = MorphicWindow._SUP_TYPES;
+    for (var i = 0; i < types.length; i++) {
+      try { target.addEventListener(types[i], MorphicWindow._armDispatcher, true); } catch (_) {}
+    }
+    target.__morphicArmDispatcherInstalled = true;
+  }
+
+  static _installArmDispatchers() {
+    MorphicWindow._ensureArmDispatcherOn(window);
+    MorphicWindow._ensureArmDispatcherOn(document);
+    Array.from(document.querySelectorAll('iframe')).forEach(function(f) {
+      try {
+        if (f.contentDocument) MorphicWindow._ensureArmDispatcherOn(f.contentDocument);
+      } catch (_) {}
+    });
+  }
+
+  // Map a Document (which may belong to an iframe) to the outer-document
+  // (clientX,clientY) offset of that iframe's viewport origin. Returns
+  // {x:0,y:0} for the outer document or an unknown document.
+  static _iframeOffsetForDoc(doc) {
+    if (!doc || doc === document) return { x: 0, y: 0 };
+    var iframes = document.querySelectorAll('iframe');
+    for (var i = 0; i < iframes.length; i++) {
+      var f = iframes[i];
+      try {
+        if (f.contentDocument === doc) {
+          var r = f.getBoundingClientRect();
+          return { x: r.left, y: r.top };
+        }
+      } catch (_) {}
+    }
+    return { x: 0, y: 0 };
+  }
+
+  // Emergency: clear any current arm session. Now trivial because all
+  // state lives in MorphicWindow._armState.
+  static forceDisarmAll() {
+    MorphicWindow._endArming();
+  }
+
+  // Dispatch a synthetic cmd-click sequence on `target`. Used when a
+  // cmd-pointerdown on a morphic-window doesn't turn into a drag, so
+  // the underlying content (Squeak) receives a clean gesture that we
+  // had buffered.
+  static _synthesizeClick(target, view, info) {
+    if (!target) return;
+    var PE = view.PointerEvent || window.PointerEvent;
+    var ME = view.MouseEvent || window.MouseEvent;
+    var pid = (info.pointerId != null) ? info.pointerId : 1;
+    var ptype = info.pointerType || 'mouse';
+    var common = {
+      bubbles: true, cancelable: true, composed: true, view: view,
+      button: 0,
+      metaKey: true, ctrlKey: false, altKey: false, shiftKey: false,
+      detail: 1
+    };
+    function mkPointer(type, coords, buttons) {
+      var init = Object.assign({}, common, coords, {
+        buttons: buttons, pointerId: pid, pointerType: ptype, isPrimary: true
+      });
+      return new PE(type, init);
+    }
+    function mkMouse(type, coords, buttons) {
+      var init = Object.assign({}, common, coords, { buttons: buttons });
+      return new ME(type, init);
+    }
+    try { target.dispatchEvent(mkPointer('pointerdown', info.down, 1)); } catch (_) {}
+    try { target.dispatchEvent(mkMouse('mousedown',   info.down, 1)); } catch (_) {}
+    try { target.dispatchEvent(mkPointer('pointerup', info.up,   0)); } catch (_) {}
+    try { target.dispatchEvent(mkMouse('mouseup',     info.up,   0)); } catch (_) {}
+    try { target.dispatchEvent(mkMouse('click',       info.up,   0)); } catch (_) {}
+  }
+
+  static _startModifierDrag(win, e, sourceIframe, startX, startY) {
+    if (win._isMaximized && win._isMaximized()) return;
+    if (startX === undefined || startY === undefined) {
+      var iframeOX = 0, iframeOY = 0;
+      if (sourceIframe) {
+        var r = sourceIframe.getBoundingClientRect();
+        iframeOX = r.left; iframeOY = r.top;
+      }
+      startX = e.clientX + iframeOX;
+      startY = e.clientY + iframeOY;
+    }
     var rect = win.getBoundingClientRect();
     var offX = startX - rect.left;
     var offY = startY - rect.top;

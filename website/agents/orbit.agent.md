@@ -30,7 +30,7 @@ Whenever you notice that the Integrated Browser page isn't shared, use
 the VSCode API for asking the user to share the tab. Don't ask
 yourself in the conversation.
 
-### MCP tools are deferred — load their schemas first
+### MCP tools are deferred; load their schemas first
 
 The Smalltalk MCP tools (e.g. `capabilities`, `role`, `runCode`,
 `evaluate`, `echo`, `send`, `compileMethod`, and the `mcp_2300-ui_*`
@@ -213,7 +213,12 @@ Ensure that every class you create is commented.
 
 ## development of Orbit itself
 
-### use Playwright, not MCP
+### You have MCP access to SqueakJS also
+
+You can use the "Caffeine" MCP server's "evaluate" tool to evaluate
+expressions in the SqueakJS system.
+
+### use Playwright for webpage manipulation, not MCP
 
 The sole webpage in this project is running in the VSCode Integrated
 Browser. Perform all requested manipulation of it using Playwright,
