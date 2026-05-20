@@ -36,6 +36,25 @@ class MorphicWindow extends HTMLElement {
     return ['caption', 'title'];
   }
 
+  // Single source of truth for instance methods that must be bound in
+  // the constructor (and re-bound on hot-reload). Keep this list in sync
+  // with the methods that get add/removeEventListener'd by name.
+  static get _BOUND_METHODS() {
+    return [
+      '_onPointerMove',
+      '_onPointerUp',
+      '_onViewportResize',
+      '_onResizePointerMove',
+      '_onResizePointerUp'
+    ];
+  }
+
+  // Tag names recognised as "windows" for cmd-click ancestor detection.
+  // Note: _allWindows() (z-ordering) intentionally uses a smaller set.
+  static get _WINDOW_TAGS() {
+    return ['morphic-window', 'transient-window', 'workbook-window'];
+  }
+
   constructor() {
     super();
     this.attachShadow({ mode: 'open' });
@@ -50,13 +69,9 @@ class MorphicWindow extends HTMLElement {
     this._offsetY = 0;
     this._startX = 0;
     this._startY = 0;
-    this._onPointerMove = this._onPointerMove.bind(this);
-    this._onPointerUp = this._onPointerUp.bind(this);
-    this._onCursorMove = this._onCursorMove.bind(this);
-    this._onCursorLeave = this._onCursorLeave.bind(this);
-    this._onViewportResize = this._onViewportResize.bind(this);
-    this._onResizePointerMove = this._onResizePointerMove.bind(this);
-    this._onResizePointerUp = this._onResizePointerUp.bind(this);
+    MorphicWindow._BOUND_METHODS.forEach(function(name) {
+      this[name] = this[name].bind(this);
+    }, this);
     this._resizing = false;
     this._resizeEdges = null; // { top, left, bottom, right } booleans
     this._resizeStartRect = null;
@@ -72,10 +87,16 @@ class MorphicWindow extends HTMLElement {
   }
 
   static _allWindows() {
+    // NB: intentionally excludes 'workbook-window' from the z-ordering pool.
+    // Workbook windows manage their own stacking; only morphic + transient
+    // windows participate in _bringToFront/_sendToBack.
     return Array.from(document.querySelectorAll('morphic-window, transient-window'));
   }
 
-  _bringToFront() {
+  // Reorder z-indices among morphic + transient windows. `position` is
+  // 'top' (this window above all morphics) or 'bottom' (below all).
+  // Transients always sit above morphics.
+  _assignZ(position) {
     var self = this;
     var allWins = MorphicWindow._allWindows();
     var morphics = allWins.filter(function(w) {
@@ -85,54 +106,28 @@ class MorphicWindow extends HTMLElement {
       return w.tagName.toLowerCase() === 'transient-window';
     });
     if (morphics.length <= 1 && transients.length === 0) return;
-    // Sort others by current z, preserving their relative order
     var others = morphics.filter(function(w) { return w !== self; });
     others.sort(function(a, b) {
       return (parseInt(a.style.zIndex, 10) || 0) - (parseInt(b.style.zIndex, 10) || 0);
     });
-    // Assign compact sequential z-indices: others 0..N-2, self N-1
-    for (var i = 0; i < others.length; i++) {
-      others[i].style.zIndex = i;
+    if (position === 'top') {
+      for (var i = 0; i < others.length; i++) others[i].style.zIndex = i;
+      this.style.zIndex = others.length;
+    } else {
+      this.style.zIndex = 0;
+      for (var j = 0; j < others.length; j++) others[j].style.zIndex = j + 1;
     }
-    this.style.zIndex = others.length;
-    // Ensure transient windows remain above all morphic windows
     var transientBase = morphics.length;
     transients.sort(function(a, b) {
       return (parseInt(a.style.zIndex, 10) || 0) - (parseInt(b.style.zIndex, 10) || 0);
     });
-    for (var i = 0; i < transients.length; i++) {
-      transients[i].style.zIndex = transientBase + i;
+    for (var k = 0; k < transients.length; k++) {
+      transients[k].style.zIndex = transientBase + k;
     }
   }
 
-  _sendToBack() {
-    var self = this;
-    var allWins = MorphicWindow._allWindows();
-    var morphics = allWins.filter(function(w) {
-      return w.tagName.toLowerCase() !== 'transient-window';
-    });
-    var transients = allWins.filter(function(w) {
-      return w.tagName.toLowerCase() === 'transient-window';
-    });
-    if (morphics.length <= 1 && transients.length === 0) return;
-    // Desired order: self on bottom, then others in their current relative order
-    var others = morphics.filter(function(w) { return w !== self; });
-    others.sort(function(a, b) {
-      return (parseInt(a.style.zIndex, 10) || 0) - (parseInt(b.style.zIndex, 10) || 0);
-    });
-    this.style.zIndex = 0;
-    for (var i = 0; i < others.length; i++) {
-      others[i].style.zIndex = i + 1;
-    }
-    // Ensure transient windows remain above all morphic windows
-    var transientBase = morphics.length;
-    transients.sort(function(a, b) {
-      return (parseInt(a.style.zIndex, 10) || 0) - (parseInt(b.style.zIndex, 10) || 0);
-    });
-    for (var i = 0; i < transients.length; i++) {
-      transients[i].style.zIndex = transientBase + i;
-    }
-  }
+  _bringToFront() { this._assignZ('top'); }
+  _sendToBack()   { this._assignZ('bottom'); }
 
   _isMaximized() {
     return this._windowState === 'maximized';
@@ -140,7 +135,7 @@ class MorphicWindow extends HTMLElement {
 
   _scaledMs(ms) {
     var scale = this._transitionTimeScale;
-    if (typeof scale !== 'number' || !isFinite(scale) || scale <= 0) scale = 4;
+    if (typeof scale !== 'number' || !isFinite(scale) || scale <= 0) scale = 1;
     return Math.round(ms * scale);
   }
 
@@ -151,6 +146,9 @@ class MorphicWindow extends HTMLElement {
   }
 
   _yieldToRenderer() {
+    // Two rAFs to flush style + paint (start-of-frame + post-commit), then
+    // a 100 ms slack timer to allow the SqueakJS VM to repaint its canvas
+    // after a geometry change before we begin a fade-in transition.
     return new Promise(function(resolve) {
       requestAnimationFrame(function() {
         requestAnimationFrame(function() {
@@ -174,7 +172,9 @@ class MorphicWindow extends HTMLElement {
     if (!canvas) return null;
     try {
       return canvas.toDataURL();
-    } catch (_) {
+    } catch (err) {
+      // Cross-origin or tainted canvas: cutout-flicker fallback engages.
+      console.debug('morphic-window: canvas toDataURL failed; cutout fallback in use', err);
       return null;
     }
   }
@@ -214,6 +214,9 @@ class MorphicWindow extends HTMLElement {
   _setCutoutMode(enabled) {
     var color = this._lockedFrameColor || 'rgb(192, 192, 192)';
     if (enabled) {
+      // Contract: callers MUST clear the lingering 'transition: none' once
+      // the cutout phase ends (the disable branch and _onResizePointerUp
+      // both do this). Otherwise later transitions are silently suppressed.
       this.style.transition = 'none';
       this.style.background =
         'linear-gradient(' + color + ',' + color + ') top/100% 25px no-repeat,' +
@@ -543,6 +546,12 @@ class MorphicWindow extends HTMLElement {
         await this._maximize();
       }
       return this._windowState;
+    } catch (err) {
+      // If maximize/restore failed mid-flight, force a coherent visible
+      // state instead of leaving the window half-faded with cutout chrome.
+      try { this._setCutoutMode(false); } catch (_) {}
+      try { this._setContentsOpacityImmediate(1); } catch (_) {}
+      throw err;
     } finally {
       // Release the frame color lock without a visible transition.
       this.style.transition = 'none';
@@ -568,13 +577,10 @@ class MorphicWindow extends HTMLElement {
   }
 
   disconnectedCallback() {
-    var titlebar = this.shadowRoot.querySelector('.titlebar');
-    if (titlebar) {
-      titlebar.removeEventListener('pointermove', this._onPointerMove);
-      titlebar.removeEventListener('pointerup', this._onPointerUp);
-    }
-    this.removeEventListener('pointermove', this._onResizePointerMove);
-    this.removeEventListener('pointerup', this._onResizePointerUp);
+    // The titlebar inside shadowRoot will be GC'd along with this element;
+    // its listeners are bound to closures that don't outlive it, so we don't
+    // need to remove them. Only listeners attached to objects that outlive
+    // this element (window, document) need explicit cleanup.
     window.removeEventListener('resize', this._onViewportResize);
   }
 
@@ -593,7 +599,6 @@ class MorphicWindow extends HTMLElement {
   }
 
   _render() {
-    var title = this.getAttribute('caption') || '';
     this.shadowRoot.innerHTML = `
       <style>
         :host {
@@ -715,7 +720,7 @@ class MorphicWindow extends HTMLElement {
           <line x1="4.5" y1="4.5" x2="10.5" y2="10.5" stroke="white" stroke-width="1.5" stroke-linecap="round"/>
           <line x1="10.5" y1="4.5" x2="4.5" y2="10.5" stroke="white" stroke-width="1.5" stroke-linecap="round"/>
         </svg>
-        <span class="title-text">${title}</span>
+        <span class="title-text"></span>
         <slot name="titlebar-extras"></slot>
         <svg class="btn" id="send-to-back-button" width="15" height="15" viewBox="0 0 15 15">
           <circle cx="7.5" cy="7.5" r="6.5" fill="#5b86e5" stroke="#4a6fc0" stroke-width="0.5"/>
@@ -743,6 +748,11 @@ class MorphicWindow extends HTMLElement {
       <div class="resize-zone corner-bl"   data-edges="bl"></div>
       <div class="resize-zone corner-br"   data-edges="br"></div>
     `;
+    // Set caption via textContent (NOT innerHTML) to prevent XSS via the
+    // 'caption' attribute, whose values come from remote Smalltalk window
+    // titles and are not trusted as HTML.
+    var titleSpan = this.shadowRoot.querySelector('.title-text');
+    if (titleSpan) titleSpan.textContent = this.getAttribute('caption') || '';
   }
 
   _attachBehavior() {
@@ -874,81 +884,6 @@ class MorphicWindow extends HTMLElement {
     this._bringToFront();
   }
 
-  _edgeCursorForPoint(clientX, clientY) {
-    var rect = this.getBoundingClientRect();
-    var x = clientX - rect.left;
-    var y = clientY - rect.top;
-    var edgeT = 5;
-    var cornerT = 7;
-
-    var nearLeftEdge = x >= 0 && x <= edgeT;
-    var nearRightEdge = x <= rect.width && x >= (rect.width - edgeT);
-    var nearTopEdge = y >= 0 && y <= edgeT;
-    var nearBottomEdge = y <= rect.height && y >= (rect.height - edgeT);
-
-    var nearLeftCorner = x >= 0 && x <= cornerT;
-    var nearRightCorner = x <= rect.width && x >= (rect.width - cornerT);
-    var nearTopCorner = y >= 0 && y <= cornerT;
-    var nearBottomCorner = y <= rect.height && y >= (rect.height - cornerT);
-
-    if ((nearTopCorner && nearLeftCorner) || (nearBottomCorner && nearRightCorner)) return 'nwse-resize';
-    if ((nearTopCorner && nearRightCorner) || (nearBottomCorner && nearLeftCorner)) return 'nesw-resize';
-    if (nearTopEdge || nearBottomEdge) return 'ns-resize';
-    if (nearLeftEdge || nearRightEdge) return 'ew-resize';
-    return '';
-  }
-
-  _onCursorMove(e) {
-    if (this._dragging) return;
-    var cursor = this._edgeCursorForPoint(e.clientX, e.clientY);
-    this.style.cursor = cursor;
-    var titlebar = this.shadowRoot.querySelector('.titlebar');
-    if (titlebar) titlebar.style.cursor = cursor || '';
-  }
-
-  _onCursorLeave(e) {
-    // Capture-phase pointerleave fires for descendants too (e.g. the
-    // slotted iframe). Only clear cursor when the host itself is left.
-    if (e && e.target !== this) return;
-    if (!this._dragging && !this._resizing) {
-      this.style.cursor = '';
-      var titlebar = this.shadowRoot.querySelector('.titlebar');
-      if (titlebar) titlebar.style.cursor = '';
-    }
-  }
-
-  _edgesForPoint(clientX, clientY) {
-    var rect = this.getBoundingClientRect();
-    var x = clientX - rect.left;
-    var y = clientY - rect.top;
-    var edgeT = 5;
-    var cornerT = 7;
-
-    var top = y >= 0 && y <= edgeT;
-    var bottom = y <= rect.height && y >= (rect.height - edgeT);
-    var left = x >= 0 && x <= edgeT;
-    var right = x <= rect.width && x >= (rect.width - edgeT);
-
-    // Expand to corner zones
-    if (top || bottom) {
-      if (x >= 0 && x <= cornerT) left = true;
-      if (x <= rect.width && x >= (rect.width - cornerT)) right = true;
-    }
-    if (left || right) {
-      if (y >= 0 && y <= cornerT) top = true;
-      if (y <= rect.height && y >= (rect.height - cornerT)) bottom = true;
-    }
-
-    if (!top && !bottom && !left && !right) return null;
-    return { top: top, bottom: bottom, left: left, right: right };
-  }
-
-  _startResize(e) {
-    var edges = this._edgesForPoint(e.clientX, e.clientY);
-    if (!edges) return false;
-    return this._startResizeWithEdges(e, edges);
-  }
-
   _startResizeWithEdges(e, edges) {
     if (this._isMaximized()) return false;
 
@@ -1028,7 +963,7 @@ class MorphicWindow extends HTMLElement {
   async _onResizePointerUp(e) {
     if (!this._resizing) return;
     this._resizing = false;
-    this.releasePointerCapture(this._resizePointerId);
+    try { this.releasePointerCapture(this._resizePointerId); } catch (_) {}
 
     // _onResizePointerMove pinned style.transition to 'none' on every
     // move to prevent animating live geometry changes. Clear it now so
@@ -1083,17 +1018,21 @@ class MorphicWindow extends HTMLElement {
   }
 
   _onPointerUp(e) {
-    if (this._dragging && !this._didDrag) {
-      // Click without drag: bring to front
-      this._bringToFront();
+    try {
+      if (this._dragging && !this._didDrag) {
+        // Click without drag: bring to front
+        this._bringToFront();
+      }
+      var titlebar = this.shadowRoot.querySelector('.titlebar');
+      if (titlebar) {
+        try { titlebar.releasePointerCapture(e.pointerId); } catch (_) {}
+        titlebar.style.cursor = '';
+      }
+    } finally {
+      this._dragging = false;
+      this._didDrag = false;
+      this.style.cursor = '';
     }
-
-    this._dragging = false;
-    this._didDrag = false;
-    var titlebar = this.shadowRoot.querySelector('.titlebar');
-    titlebar.releasePointerCapture(e.pointerId);
-    titlebar.style.cursor = '';
-    this.style.cursor = '';
   }
 
   toggleMaximize() {
@@ -1128,8 +1067,9 @@ class MorphicWindow extends HTMLElement {
   }
 
   static _isWindowEl(el) {
-    return el && el.tagName &&
-      /^(morphic-window|transient-window|workbook-window)$/i.test(el.tagName);
+    if (!el || !el.tagName) return false;
+    var tag = el.tagName.toLowerCase();
+    return MorphicWindow._WINDOW_TAGS.indexOf(tag) !== -1;
   }
 
   static _findWindowInPath(path) {
@@ -1500,7 +1440,13 @@ class MorphicWindow extends HTMLElement {
         doc._morphicModifierClickInstalled = true;
       };
       attach();
-      iframe.addEventListener('load', attach);
+      // Gate the load listener so repeated _attachBehavior calls (each
+      // hot-reload, each reconnect) don't accumulate fresh closures on
+      // the same iframe.
+      if (!iframe.__morphicLoadHookInstalled) {
+        iframe.__morphicLoadHookInstalled = true;
+        iframe.addEventListener('load', attach);
+      }
     });
   }
 
@@ -1514,13 +1460,24 @@ class MorphicWindow extends HTMLElement {
     this.style.visibility = 'visible';
     this.style.opacity = '1';
     this.dataset.iconManagerPendingHidden = 'true';
-    function onFadeOut(ev) {
-      if (ev.propertyName !== 'opacity') return;
+    var fallbackTimer = null;
+    function finish() {
       self.removeEventListener('transitionend', onFadeOut);
+      if (fallbackTimer != null) { clearTimeout(fallbackTimer); fallbackTimer = null; }
+      if (self.dataset.iconManagerPendingHidden !== 'true') return;
       self.style.visibility = 'hidden';
       delete self.dataset.iconManagerPendingHidden;
     }
+    function onFadeOut(ev) {
+      if (ev.propertyName !== 'opacity') return;
+      finish();
+    }
     this.addEventListener('transitionend', onFadeOut);
+    // Fallback: if the opacity transition is interrupted (maximize toggled,
+    // _setCutoutMode resets style.transition, etc.) transitionend never
+    // fires. Clean up after a slack window so the listener doesn't leak
+    // and the dataset flag doesn't get pinned.
+    fallbackTimer = setTimeout(finish, 500);
     requestAnimationFrame(function() {
       self.style.opacity = '0';
     });
@@ -1541,6 +1498,8 @@ class MorphicWindow extends HTMLElement {
   }
 
   isMaximized() {
+    // Returns 1/0 (not true/false) for Smalltalk consumers that expect
+    // a SmallInteger; do not "fix" to a boolean.
     return this._isMaximized() ? 1 : 0;
   }
 
@@ -1601,12 +1560,11 @@ class MorphicWindow extends HTMLElement {
           }
           mw.removeEventListener('pointermove', mw._onResizePointerMove);
           mw.removeEventListener('pointerup', mw._onResizePointerUp);
-          mw._onPointerMove = ExistingClass.prototype._onPointerMove.bind(mw);
-          mw._onPointerUp = ExistingClass.prototype._onPointerUp.bind(mw);
-          mw._onResizePointerMove = ExistingClass.prototype._onResizePointerMove.bind(mw);
-          mw._onResizePointerUp = ExistingClass.prototype._onResizePointerUp.bind(mw);
-          mw._onCursorMove = ExistingClass.prototype._onCursorMove.bind(mw);
-          mw._onCursorLeave = ExistingClass.prototype._onCursorLeave.bind(mw);
+          window.removeEventListener('resize', mw._onViewportResize);
+          ExistingClass._BOUND_METHODS.forEach(function(name) {
+            mw[name] = ExistingClass.prototype[name].bind(mw);
+          });
+          window.addEventListener('resize', mw._onViewportResize);
           mw._render();
           mw._attachBehavior();
         });
