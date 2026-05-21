@@ -11,9 +11,6 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# VS Code extension build output
-*.vsix
-
 # Logs
 logs/
 *.log

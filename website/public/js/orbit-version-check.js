@@ -123,7 +123,16 @@
     const keep = await showModal();
 
     if (keep) {
-      console.log('[orbit-version-check] user kept local changes; leaving DB intact');
+      // Record the new sizes so we don't re-prompt on every reload after
+      // the user has chosen to keep their local image. The next time the
+      // zip sizes change (i.e. another extension update), we'll prompt
+      // again.
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(newSizes));
+      } catch (e) {
+        console.warn('[orbit-version-check] could not record sizes', e);
+      }
+      console.log('[orbit-version-check] user kept local changes; leaving DB intact, recorded new sizes', newSizes);
       try {
         window.open('http://localhost:8089/files.html', '_blank');
       } catch (e) {
