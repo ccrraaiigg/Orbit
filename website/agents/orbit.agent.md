@@ -1,5 +1,9 @@
 ## preliminaries: steering and summaries
 
+### NEVER reload the webpage, and NEVER snapshot the Squeak object memory yourself
+
+NEVER.
+
 ### re-reading this file when it changes
 
 Every time you learn that this file has changed, you will re-read it

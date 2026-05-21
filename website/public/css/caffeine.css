@@ -13,6 +13,14 @@ html {
     background-size: cover;
 }
 
+/* Dev hosts (melody, rhythm) get a different scene. The
+   data-dev-host attribute is set by an inline script in orbit.html,
+   keyed off the same ?backend=192.168.1.140 query param the Orbit
+   extension adds when serving the page on those hosts. */
+html[data-dev-host] {
+    background-image: url(../pictures/backgrounds/scenes/8.jpg);
+}
+
 blockquote {
     position: relative;
     display: inline-block;

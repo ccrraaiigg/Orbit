@@ -9,6 +9,20 @@
          script that calls those endpoints. -->
     <script src="/orbit-bridge-config.js"></script>
 
+    <script>
+      // Mark the document for dev-host styling before caffeine.css
+      // parses, so the background image rule resolves correctly on
+      // first paint. The Orbit extension only adds
+      // ?backend=192.168.1.140 when serving the page on the dev
+      // hosts (melody, rhythm). See orbitUrl() in
+      // website/src/extension-impl.js.
+      try {
+        if (new URLSearchParams(location.search).get('backend') === '192.168.1.140') {
+          document.documentElement.setAttribute('data-dev-host', '');
+        }
+      } catch (_) {}
+    </script>
+
     <link rel="stylesheet"
 	  href="css/caffeine.css">
 
