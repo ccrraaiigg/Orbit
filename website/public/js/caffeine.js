@@ -117,6 +117,50 @@ window.onload = function () {
 
 document.addEventListener('contextmenu', function(e) { e.preventDefault(); }, true);
 
+// Raise the Caffeine window on a plain (no-modifier) mousedown anywhere
+// inside it — including inside the SqueakJS iframe, whose events don't
+// bubble out to the parent document. We attach a capture-phase mousedown
+// listener to both the morphic-window host and the iframe's contentDocument,
+// and call _bringToFront() when no shift/ctrl/alt/meta keys are held.
+(function() {
+  function bareMousedown(e) {
+    // Raise on plain mousedown (no modifiers) or on cmd-left-mousedown
+    // (meta only, button 0). Cmd-left still continues into the existing
+    // cmd-click / cmd-drag pipeline in morphic-window; we just also
+    // bring the Caffeine window to the front.
+    var noMods = !(e.shiftKey || e.ctrlKey || e.altKey || e.metaKey);
+    var cmdLeft = e.metaKey && !e.shiftKey && !e.ctrlKey && !e.altKey && e.button === 0;
+    if (!noMods && !cmdLeft) return;
+    var win = document.getElementById('embeddedSqueak');
+    if (win && typeof win._bringToFront === 'function') win._bringToFront();
+  }
+  function attachToIframeDoc(iframe) {
+    var doc;
+    try { doc = iframe.contentDocument; } catch (_) { return; }
+    if (!doc || doc.__caffeineRaiseAttached) return;
+    doc.__caffeineRaiseAttached = true;
+    doc.addEventListener('mousedown', bareMousedown, true);
+  }
+  function wire() {
+    var win = document.getElementById('embeddedSqueak');
+    if (win && !win.__caffeineRaiseAttached) {
+      win.__caffeineRaiseAttached = true;
+      win.addEventListener('mousedown', bareMousedown, true);
+    }
+    var iframe = document.getElementById('Caffeine');
+    if (iframe) {
+      if (!iframe.__caffeineRaiseLoadAttached) {
+        iframe.__caffeineRaiseLoadAttached = true;
+        iframe.addEventListener('load', function() { attachToIframeDoc(iframe); });
+      }
+      attachToIframeDoc(iframe);
+    }
+  }
+  wire();
+  window.addEventListener('load', wire);
+  document.addEventListener('DOMContentLoaded', wire);
+})();
+
 // Hide the cursor while typing; restore on mouse movement.
 (function() {
   var hidden = false;

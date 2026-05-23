@@ -181,12 +181,12 @@ method selector, only expressions. It's what a Smalltalk user would
 evaluate in a workspace.
 
 Before you can use that tool, you need Smalltalk to grant capabilities
-to you. Smalltalk uses a capabilities system, which "roles" comprised
-of capabilities are granted to remote clients. Some capabilities
-pertain to source code evaluation. The first tool you will call is
-"capabilities"; it provides a list of the names of available
-capabilities. Next, you'll call the "role" tool, specifying the
-capabilities you want for that role. Finally, you can use the
+to you. Smalltalk uses a capabilities system, in which "roles"
+comprised of capabilities are granted to remote clients. Some
+capabilities pertain to source code evaluation. The first tool you
+will call is "capabilities"; it provides a list of the names of
+available capabilities. Next, you'll call the "role" tool, specifying
+the capabilities you want for that role. Finally, you can use the
 "evaluate" tool to evaluate source code.
 
 When the output of the "evaluate" tool is a literal value that can be
@@ -196,20 +196,22 @@ integer.
 
 There is no need to escape "<" and other HTML-related strings.
 
+You can't use object reference integers directly in source code. You
+can only pass them in as variables when using the MCP "evaluate" tool.
+
 #### You can detect and manipulate unhandled exceptions
 
+In source code you evaluate, "self" is bound to an instance of a
+session-specific subclass of AgentSession.
+
 When source code you evaluate causes an unhandled exception, the
-result you get will be a reference to that exception object. From that
-object, you can access the debugger window and underlying debugger
-model.
+result you get will be a reference to the process in which the
+exception was raised. From that object, you can use convenience
+functions provided by class AgentSession, for manipulating the
+debugger the system opens for the exception.
 
 You can use the WebDAV access to source code described above to read
-about these facilities. In source code you evaluate, "self" is bound
-to an instance of a session-specific subclass of
-AgentSession. Check out the code for
-\>>debuggerClientForException: and \>>debuggerServiceForException: in
-AgentSession, as well as the code for the DebuggerClient and
-DebuggerService classes.
+about these facilities.
 
 ### You can use Smalltalk MCP tools
 
@@ -236,6 +238,25 @@ console.warn(), console.error(), console.info(), console.debug(),
 console.dir(), console.table(), and console.trace() are instrumented
 so that you have access to the outputs of calls to those functions. I
 may ask you to comment on those outputs.
+
+### always show your mouse position with the purple dot
+
+The Orbit page has a translucent purple cursor overlay (source:
+[js/agent-mouse-cursor.js](../js/agent-mouse-cursor.js)) that
+visualizes the agent's mouse position to the user. It is updated by
+calling `window.__agentMouse(x, y)` (or `window.__agentMouse(x, y,
+{click: true})` for a brief click flash).
+
+Whenever you do *anything* with the Playwright mouse — `mouse.move`,
+`mouse.click`, `mouse.dblclick`, `mouse.down`, `mouse.up`, or any
+intermediate stop in a multi-segment path — you must call
+`window.__agentMouse(x, y, …)` with the same coordinates so the user
+can see where your mouse is. If the cursor overlay isn't installed
+yet (e.g. at the start of a conversation, or after a hot-reload of
+the page), install it first by injecting the script into the page's
+`<head>` and writing/refreshing the source file. Treat this overlay
+as part of the page contract: it must never go stale while you are
+driving the mouse.
 
 ### script injection
 
@@ -281,6 +302,28 @@ If you only need to repair the livecoding symlinks against the
 already-installed VSIX (e.g. after a manual reinstall overwrote
 them), run ./shellscripts/install-extension.sh instead. It does no
 build and no version bump.
+
+## the Keep store
+
+There is a reflective-memory store ("Keep") living in the remote
+Smalltalk image as `KStore current`. It is exposed via the
+`mcp_caffeine_keep*` family of deferred MCP tools (`keepOrient`,
+`keepGet`, `keepPut`, `keepTag`, `keepRemove`, `keepQuery`,
+`keepFindDeep`, `keepNow`, `keepArchive`, `keepDeclareEdgeTag`).
+Like the other deferred tools, load their schemas with `tool_search`
+before the first call in a conversation.
+
+If the user asks you to coordinate a multi-agent task through the
+store, or to dispatch subagents that share state, read
+`designs/keep-smalltalk/ORCHESTRATOR-GUIDE.md` first.
+
+If the user asks you to help review or audit work that an agent
+team left behind in the store ("what did the catalog-1 worker find?",
+"list open requests in phase X", "show me the breakdowns"), read
+`designs/keep-smalltalk/REVIEWER-GUIDE.md` first. That file explains
+the tag vocabulary (`topic`, `phase`, `agent`, `act`, `type`,
+`status`), the four-tool reviewer subset, and the conventions for
+writing human review notes back into the store.
 
 ## shared secret
 

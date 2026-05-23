@@ -410,12 +410,30 @@ class MorphicWindow extends HTMLElement {
     if (!suppressResizeEvent && iframe.contentWindow) iframe.contentWindow.dispatchEvent(new Event('resize'));
   }
 
+  // Total width and height contributed by the window's decoration (titlebar
+  // and padding around the slotted content area). Subtract these from the
+  // host's clientWidth/clientHeight to get the content area's extent.
+  // Returns { width, height } in CSS pixels. Works before the element is
+  // connected to the DOM (when getComputedStyle returns empty values) by
+  // falling back to the known defaults defined in the :host CSS rule
+  // (padding: 25px 5px 5px 5px).
+  get borderExtent() {
+    if (this.isConnected) {
+      var cs = getComputedStyle(this);
+      var w = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight);
+      var h = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom);
+      if (!isNaN(w) && !isNaN(h)) return { width: w, height: h };
+    }
+    return { width: 10, height: 30 };
+  }
+
   _resizeEmbeddedSurfaceToWindow() {
     var iframe = this._embeddedIframe();
     if (!iframe) return;
 
-    var width = Math.max(1, Math.floor(this.clientWidth - 10));
-    var height = Math.max(1, Math.floor(this.clientHeight - 30));
+    var be = this.borderExtent;
+    var width = Math.max(1, Math.floor(this.clientWidth - be.width));
+    var height = Math.max(1, Math.floor(this.clientHeight - be.height));
 
     iframe.setAttribute('width', String(width));
     iframe.setAttribute('height', String(height));
@@ -713,6 +731,20 @@ class MorphicWindow extends HTMLElement {
         .resize-zone.corner-tr   { top: 0;    right: 0; width: 7px;  height: 7px; }
         .resize-zone.corner-bl   { bottom: 0; left: 0;  width: 7px;  height: 7px; }
         .resize-zone.corner-br   { bottom: 0; right: 0; width: 7px;  height: 7px; }
+        /* While the command key is held, show the open-hand cursor over
+           the whole window (host, resize zones, and slotted content),
+           matching the titlebar's drag affordance. */
+        :host(.cmd-held) { cursor: grab; }
+        :host(.cmd-held) .titlebar,
+        :host(.cmd-held) .resize-zone { cursor: grab; }
+        :host(.cmd-held) ::slotted(*) { cursor: grab; }
+        /* During a cmd-drag move, switch to the closed-hand cursor,
+           matching the titlebar drag. Listed after .cmd-held so it
+           wins via source order at equal specificity. */
+        :host(.cmd-dragging) { cursor: grabbing; }
+        :host(.cmd-dragging) .titlebar,
+        :host(.cmd-dragging) .resize-zone { cursor: grabbing; }
+        :host(.cmd-dragging) ::slotted(*) { cursor: grabbing; }
       </style>
       <div class="titlebar">
         <svg class="btn" id="close-button" width="15" height="15" viewBox="0 0 15 15">
@@ -764,6 +796,7 @@ class MorphicWindow extends HTMLElement {
     // page at the window level so it runs before any per-instance
     // capture-phase handlers in transient-window/workbook-window/etc.
     MorphicWindow._installGlobalModifierClickHandler();
+    MorphicWindow._installGlobalCmdCursorHandler();
     this._installIframeModifierClickHandlers();
 
     // Resize zones in the shadow DOM provide native CSS cursors and
@@ -804,6 +837,7 @@ class MorphicWindow extends HTMLElement {
     // Button click events
     this.shadowRoot.getElementById('close-button').addEventListener('click', function(e) {
       e.stopPropagation();
+      self.style.opacity = '0.8';
       self.dispatchEvent(new CustomEvent('morphic-close', { bubbles: true }));
     });
 
@@ -1064,6 +1098,116 @@ class MorphicWindow extends HTMLElement {
     window.addEventListener('pointerdown', topHandler, true);
     window.addEventListener('mousedown', topHandler, true);
     window._morphicModifierClickInstalled = true;
+  }
+
+  // Toggles a 'cmd-held' class on every morphic-window element while
+  // the Meta (command) key is held, so CSS can switch the cursor to
+  // 'grab' (open hand) over the whole window — matching the titlebar's
+  // drag affordance and previewing the cmd-drag gesture.
+  static _installGlobalCmdCursorHandler() {
+    if (window._morphicCmdCursorInstalled) return;
+    window.addEventListener('keydown', function(e) {
+      if (e.key === 'Meta' || e.metaKey) MorphicWindow._setCmdHeld(true);
+    }, true);
+    window.addEventListener('keyup', function(e) {
+      // After a Meta keyup, metaKey on the event itself is false.
+      if (e.key === 'Meta' || !e.metaKey) MorphicWindow._setCmdHeld(false);
+    }, true);
+    window.addEventListener('blur', function() {
+      MorphicWindow._setCmdHeld(false);
+    }, true);
+    window._morphicCmdCursorInstalled = true;
+  }
+
+  // Toggle the cmd-held visual state across the host page and any
+  // tracked iframe documents (SqueakJS in the Caffeine window, etc.).
+  // Maximized windows are skipped: cmd-drag does nothing on them, so
+  // showing the open-hand cursor would be misleading.
+  static _setCmdHeld(on) {
+    document.querySelectorAll('morphic-window').forEach(function(mw) {
+      if (on && typeof mw._isMaximized === 'function' && mw._isMaximized()) {
+        mw.classList.remove('cmd-held');
+        return;
+      }
+      mw.classList.toggle('cmd-held', !!on);
+    });
+    var docs = MorphicWindow._cmdCursorDocs;
+    if (!docs) return;
+    docs.forEach(function(doc) {
+      try {
+        if (!doc || !doc.documentElement) return;
+        // Skip iframes whose enclosing morphic-window is maximized.
+        var apply = !!on;
+        if (apply) {
+          var iframes = document.querySelectorAll('iframe');
+          for (var i = 0; i < iframes.length; i++) {
+            if (iframes[i].contentDocument === doc) {
+              var host = MorphicWindow._findWindowAncestor(iframes[i]);
+              if (host && typeof host._isMaximized === 'function' && host._isMaximized()) {
+                apply = false;
+              }
+              break;
+            }
+          }
+        }
+        doc.documentElement.classList.toggle('morphic-cmd-held', apply);
+      } catch (_) { /* cross-origin; ignore */ }
+    });
+  }
+
+  // Toggle the cmd-drag (closed-hand) visual state on a single
+  // morphic-window and across all tracked iframe documents. We apply
+  // the iframe cursor globally so the cursor stays 'grabbing' even
+  // when the pointer passes over an iframe whose pointer-events were
+  // disabled for the duration of the drag.
+  static _setCmdDragging(win, on) {
+    if (win) win.classList.toggle('cmd-dragging', !!on);
+    var docs = MorphicWindow._cmdCursorDocs;
+    if (!docs) return;
+    docs.forEach(function(doc) {
+      try {
+        if (!doc || !doc.documentElement) return;
+        doc.documentElement.classList.toggle('morphic-cmd-dragging', !!on);
+      } catch (_) { /* ignore */ }
+    });
+  }
+
+  // Register an iframe's document so its cursor and keyboard state
+  // participate in cmd-held tracking. Injects a stylesheet that
+  // forces `cursor: grab` over the whole iframe while the html
+  // element carries the 'morphic-cmd-held' class.
+  static _registerCmdCursorDoc(doc) {
+    if (!doc || !doc.documentElement) return;
+    if (!MorphicWindow._cmdCursorDocs) MorphicWindow._cmdCursorDocs = new Set();
+    var alreadyRegistered = MorphicWindow._cmdCursorDocs.has(doc);
+    MorphicWindow._cmdCursorDocs.add(doc);
+    var cursorCss =
+      'html.morphic-cmd-held, html.morphic-cmd-held * { cursor: grab !important; }\n' +
+      'html.morphic-cmd-dragging, html.morphic-cmd-dragging * { cursor: grabbing !important; }';
+    try {
+      var style = doc.getElementById('morphic-cmd-cursor-style');
+      if (!style) {
+        style = doc.createElement('style');
+        style.id = 'morphic-cmd-cursor-style';
+        (doc.head || doc.documentElement).appendChild(style);
+      }
+      // Refresh content so hot-reloads picking up new rules apply
+      // immediately without recreating the element.
+      if (style.textContent !== cursorCss) style.textContent = cursorCss;
+    } catch (_) { /* ignore */ }
+    if (alreadyRegistered) return;
+    var keydown = function(e) {
+      if (e.key === 'Meta' || e.metaKey) MorphicWindow._setCmdHeld(true);
+    };
+    var keyup = function(e) {
+      if (e.key === 'Meta' || !e.metaKey) MorphicWindow._setCmdHeld(false);
+    };
+    var blur = function() { MorphicWindow._setCmdHeld(false); };
+    try {
+      doc.addEventListener('keydown', keydown, true);
+      doc.addEventListener('keyup', keyup, true);
+      if (doc.defaultView) doc.defaultView.addEventListener('blur', blur, true);
+    } catch (_) { /* ignore */ }
   }
 
   static _isWindowEl(el) {
@@ -1385,6 +1529,7 @@ class MorphicWindow extends HTMLElement {
     var offX = startX - rect.left;
     var offY = startY - rect.top;
     win._modifierDragging = true;
+    MorphicWindow._setCmdDragging(win, true);
     var prevSel = document.body.style.userSelect;
     document.body.style.userSelect = 'none';
     var allIframes = Array.from(document.querySelectorAll('iframe'));
@@ -1402,9 +1547,16 @@ class MorphicWindow extends HTMLElement {
       win.style.left = (ev.clientX + ox - offX) + 'px';
       win.style.top  = (ev.clientY + oy - offY) + 'px';
     };
-    var onUp = function() {
+    var onUp = function(ev) {
       if (!win._modifierDragging) return;
       win._modifierDragging = false;
+      MorphicWindow._setCmdDragging(win, false);
+      // The 'cmd-held' class may have been cleared during the drag
+      // (e.g. by a window blur fired as a side effect of pointerdown
+      // on a focusable target). If the Meta key is still down at
+      // mouseup, restore the open-hand cursor immediately rather than
+      // waiting for the next Meta keydown.
+      if (ev && ev.metaKey) MorphicWindow._setCmdHeld(true);
       window.removeEventListener('pointermove', onMove, true);
       window.removeEventListener('pointerup', onUp, true);
       if (sourceIframe) {
@@ -1433,6 +1585,7 @@ class MorphicWindow extends HTMLElement {
         var doc;
         try { doc = iframe.contentDocument; } catch (_) { return; }
         if (!doc) return;
+        MorphicWindow._registerCmdCursorDoc(doc);
         if (doc._morphicModifierClickInstalled) return;
         var pd = function(e) { MorphicWindow._handleModifierEvent(e, iframe); };
         doc.addEventListener('pointerdown', pd, true);
