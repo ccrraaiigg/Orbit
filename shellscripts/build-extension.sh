@@ -8,7 +8,8 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-WEBSITE="$SCRIPT_DIR/../website"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+WEBSITE="$PROJECT_ROOT/website"
 
 . "$SCRIPT_DIR/_symlink-extension.sh"
 
@@ -32,11 +33,12 @@ fi
 VERSION="$(node -p "require('$WEBSITE/package.json').version")"
 PUBLISHER="$(node -p "require('$WEBSITE/package.json').publisher.toLowerCase()")"
 NAME="$(node -p "require('$WEBSITE/package.json').name")"
-VSIX="$WEBSITE/$NAME-$VERSION.vsix"
+VSIX="$PROJECT_ROOT/$NAME-$VERSION.vsix"
 
 # Remove any older packaged VSIX files so the workspace doesn't accumulate
-# stale builds.
-for old in "$WEBSITE/$NAME-"*.vsix; do
+# stale builds. Check both the project root (current location) and the
+# website directory (previous location) for cleanup.
+for old in "$PROJECT_ROOT/$NAME-"*.vsix "$WEBSITE/$NAME-"*.vsix; do
   [ -f "$old" ] || continue
   [ "$old" = "$VSIX" ] && continue
   rm -f "$old"
