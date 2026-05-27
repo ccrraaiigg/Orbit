@@ -11,6 +11,24 @@ module.exports = function (vscode) {
     const fs = require('fs');
     const os = require('os');
 
+    // True iff the installed extension was wired up by
+    // ./scripts/install-extension.sh (or build-extension.sh),
+    // which replaces selected files inside the installed extension
+    // directory with symlinks back to the workspace source. We use
+    // public/orbit.html as the canary; the script always symlinks it.
+    // This is the signal we use to default `orbit.autoStart` to true
+    // on developer machines while keeping the default false for
+    // end-user installs from the Marketplace.
+    function isDeveloperInstall(context) {
+        try {
+            if (!context || !context.extensionPath) return false;
+            const canary = path.join(context.extensionPath, 'public', 'orbit.html');
+            return fs.lstatSync(canary).isSymbolicLink();
+        } catch (_) {
+            return false;
+        }
+    }
+
     // Dedicated output channel. All [orbit]-tagged log calls go
     // through orbitLog/orbitError, which write to both this channel
     // and console. The channel is created lazily on first log so
@@ -428,6 +446,297 @@ module.exports = function (vscode) {
         }
         try {
             if (fs.existsSync(CLIPBOARD_PORT_FILE)) fs.unlinkSync(CLIPBOARD_PORT_FILE);
+        } catch (_) {}
+    }
+
+    // ---- Chat bridge -----------------------------------------------------
+    // Lets the Orbit webapp open a VS Code Copilot Chat session from
+    // inside the Integrated Browser. The page POSTs to /chat against the
+    // public Orbit origin; app-impl.js proxies the call to a private
+    // loopback server we start here, which dispatches to
+    // workbench.action.chat.open. Same port-file convention as the
+    // clipboard bridge.
+    //
+    // Body: { query?: string, mode?: 'panel' | 'sidebar', newSession?: boolean }
+    //   query:      initial prompt text (optional)
+    //   mode:       'panel' (default) opens the chat panel; 'sidebar' opens
+    //               chat in the secondary side bar.
+    //   newSession: when true, start a fresh chat session before opening,
+    //               so `query` does not append to the in-progress
+    //               conversation.
+    const CHAT_PORT_FILE = path.join(os.tmpdir(), 'orbit-chat.port');
+    let chatServer = null;
+    let extensionContext = null;
+
+    // Locate the workspace-scoped chatSessions/ directory. Copilot Chat
+    // writes one <sessionId>.jsonl per session there. Returns null if
+    // the extension hasn't been activated yet or VS Code didn't give
+    // us a workspace storageUri (e.g. no workspace open).
+    function chatSessionsDir() {
+        if (!extensionContext || !extensionContext.storageUri) return null;
+        return path.join(extensionContext.storageUri.fsPath, '..', 'chatSessions');
+    }
+
+    function firstRequestText(v) {
+        const reqs = v && Array.isArray(v.requests) ? v.requests : [];
+        for (const r of reqs) {
+            const msg = r && r.message;
+            if (msg && typeof msg.text === 'string' && msg.text.trim()) {
+                return msg.text.trim();
+            }
+        }
+        return '';
+    }
+
+    function summarizeTitle(s, max) {
+        if (!s) return '';
+        const oneLine = s.replace(/\s+/g, ' ').trim();
+        return oneLine.length > max ? oneLine.slice(0, max - 1) + '…' : oneLine;
+    }
+
+    // Apply a JSON-patch-like "set at path" operation to `state`,
+    // creating intermediate objects/arrays as needed. `path` is an
+    // array of string/number keys; for missing intermediates we
+    // create an array when the next key is a number, otherwise an
+    // object. We only walk paths we care about, so this is a small
+    // helper, not a general patcher.
+    function setAtPath(state, path, value) {
+        if (!Array.isArray(path) || path.length === 0) return;
+        let cur = state;
+        for (let i = 0; i < path.length - 1; i++) {
+            const key = path[i];
+            const next = path[i + 1];
+            if (cur[key] == null || typeof cur[key] !== 'object') {
+                cur[key] = (typeof next === 'number') ? [] : {};
+            }
+            cur = cur[key];
+        }
+        cur[path[path.length - 1]] = value;
+    }
+
+    // Read the JSONL session file, applying patch lines (kind 1/2 with
+    // a `k` path and `v` value) to the initial `v` state. VS Code
+    // writes the session's `customTitle` and `requests` after the
+    // first line in newer versions, so we must scan the whole file to
+    // get an accurate header. We only apply patches whose path starts
+    // with "customTitle" or "requests" to avoid building unnecessary
+    // structure from unrelated patches.
+    function readSessionHeader(file) {
+        try {
+            const stat = fs.statSync(file);
+            const text = fs.readFileSync(file, 'utf8');
+            const nl = text.indexOf('\n');
+            const firstLine = nl < 0 ? text : text.slice(0, nl);
+            const obj = JSON.parse(firstLine);
+            const v = obj && obj.v;
+            if (!v) return null;
+            if (nl >= 0) {
+                let start = nl + 1;
+                while (start < text.length) {
+                    let end = text.indexOf('\n', start);
+                    if (end < 0) end = text.length;
+                    const line = text.slice(start, end);
+                    start = end + 1;
+                    if (!line) continue;
+                    let patch;
+                    try { patch = JSON.parse(line); } catch (_) { continue; }
+                    if (!patch || !Array.isArray(patch.k) || patch.k.length === 0) continue;
+                    const root = patch.k[0];
+                    if (root !== 'customTitle' && root !== 'requests') continue;
+                    setAtPath(v, patch.k, patch.v);
+                }
+            }
+            const customTitle = (typeof v.customTitle === 'string' ? v.customTitle : '').trim();
+            const derivedTitle = customTitle || summarizeTitle(firstRequestText(v), 80);
+            return {
+                id:           v.sessionId || path.basename(file, '.jsonl'),
+                title:        derivedTitle,
+                customTitle:  customTitle,
+                createdAt:    v.creationDate || null,
+                location:     v.initialLocation || null,
+                requestCount: Array.isArray(v.requests) ? v.requests.length : 0,
+                modifiedAt:   stat.mtimeMs,
+                sizeBytes:    stat.size
+            };
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function listChatSessions() {
+        const dir = chatSessionsDir();
+        if (!dir || !fs.existsSync(dir)) return [];
+        const out = [];
+        for (const name of fs.readdirSync(dir)) {
+            if (!name.endsWith('.jsonl')) continue;
+            const desc = readSessionHeader(path.join(dir, name));
+            if (desc) out.push(desc);
+        }
+        out.sort((a, b) => (b.modifiedAt || 0) - (a.modifiedAt || 0));
+        return out;
+    }
+
+    function readChatSession(id) {
+        const dir = chatSessionsDir();
+        if (!dir) return null;
+        const file = path.join(dir, id + '.jsonl');
+        if (!fs.existsSync(file)) return null;
+        const text = fs.readFileSync(file, 'utf8');
+        return text;
+    }
+
+    // Substring search across all session JSONL files. Case-insensitive.
+    // Returns up to `limit` matches; each entry is the session header
+    // plus a short snippet around the first match in that file.
+    function searchChatSessions(query, limit) {
+        const q = String(query || '').toLowerCase();
+        if (!q) return [];
+        const max = Math.max(1, Math.min(parseInt(limit, 10) || 50, 500));
+        const dir = chatSessionsDir();
+        if (!dir || !fs.existsSync(dir)) return [];
+        const out = [];
+        for (const name of fs.readdirSync(dir)) {
+            if (!name.endsWith('.jsonl')) continue;
+            const file = path.join(dir, name);
+            let text;
+            try { text = fs.readFileSync(file, 'utf8'); } catch (_) { continue; }
+            const lc = text.toLowerCase();
+            const idx = lc.indexOf(q);
+            if (idx < 0) continue;
+            const header = readSessionHeader(file) ||
+                { id: path.basename(name, '.jsonl'), title: '', createdAt: null,
+                  location: null, requestCount: 0, modifiedAt: 0, sizeBytes: 0 };
+            const start = Math.max(0, idx - 120);
+            const end = Math.min(text.length, idx + q.length + 120);
+            header.snippet = text.slice(start, end);
+            out.push(header);
+            if (out.length >= max) break;
+        }
+        out.sort((a, b) => (b.modifiedAt || 0) - (a.modifiedAt || 0));
+        return out;
+    }
+
+    function startChatBridge() {
+        if (chatServer) return;
+        const srv = http.createServer((req, res) => {
+            const remote = req.socket && req.socket.remoteAddress;
+            if (remote && remote !== '127.0.0.1' && remote !== '::1' && remote !== '::ffff:127.0.0.1') {
+                res.statusCode = 403;
+                res.end();
+                return;
+            }
+            const url = req.url || '';
+            // GET /chat/sessions          → list
+            // GET /chat/sessions/:id      → raw jsonl
+            // GET /chat/search?q=…&limit= → search
+            if (req.method === 'GET' && url === '/chat/sessions') {
+                try {
+                    const list = listChatSessions();
+                    res.statusCode = 200;
+                    res.setHeader('content-type', 'application/json');
+                    res.end(JSON.stringify({ ok: true, sessions: list }));
+                } catch (err) {
+                    res.statusCode = 500;
+                    res.setHeader('content-type', 'application/json');
+                    res.end(JSON.stringify({ error: String(err && err.message || err) }));
+                }
+                return;
+            }
+            const sessMatch = req.method === 'GET' && url.match(/^\/chat\/sessions\/([A-Za-z0-9_\-]+)$/);
+            if (sessMatch) {
+                const text = readChatSession(sessMatch[1]);
+                if (text == null) {
+                    res.statusCode = 404;
+                    res.setHeader('content-type', 'application/json');
+                    res.end(JSON.stringify({ error: 'session not found' }));
+                    return;
+                }
+                res.statusCode = 200;
+                res.setHeader('content-type', 'application/x-ndjson');
+                res.end(text);
+                return;
+            }
+            if (req.method === 'GET' && url.startsWith('/chat/search')) {
+                try {
+                    const qs = new URL('http://x' + url).searchParams;
+                    const matches = searchChatSessions(qs.get('q'), qs.get('limit'));
+                    res.statusCode = 200;
+                    res.setHeader('content-type', 'application/json');
+                    res.end(JSON.stringify({ ok: true, query: qs.get('q') || '', matches }));
+                } catch (err) {
+                    res.statusCode = 500;
+                    res.setHeader('content-type', 'application/json');
+                    res.end(JSON.stringify({ error: String(err && err.message || err) }));
+                }
+                return;
+            }
+            if (url !== '/chat') {
+                res.statusCode = 404;
+                res.end();
+                return;
+            }
+            if (req.method !== 'POST') {
+                res.statusCode = 405;
+                res.end();
+                return;
+            }
+            let chunks = '';
+            req.setEncoding('utf8');
+            req.on('data', (c) => { chunks += c; if (chunks.length > 1 * 1024 * 1024) req.destroy(); });
+            req.on('end', () => {
+                let query = '';
+                let mode = 'panel';
+                let newSession = false;
+                try {
+                    const parsed = chunks ? JSON.parse(chunks) : {};
+                    if (parsed && typeof parsed.query === 'string') query = parsed.query;
+                    if (parsed && typeof parsed.mode === 'string') mode = parsed.mode;
+                    if (parsed && parsed.newSession) newSession = true;
+                } catch (_) {}
+                const command = mode === 'sidebar'
+                    ? 'workbench.action.chat.openInSidebar'
+                    : 'workbench.action.chat.open';
+                const args = query ? { query } : undefined;
+                const startNew = newSession
+                    ? Promise.resolve(vscode.commands.executeCommand('workbench.action.chat.newChat'))
+                          .catch((err) => {
+                              orbitError('[orbit] chat bridge: newChat failed:', err && err.message);
+                          })
+                    : Promise.resolve();
+                startNew.then(() => vscode.commands.executeCommand(command, args)).then(() => {
+                    res.statusCode = 200;
+                    res.setHeader('content-type', 'application/json');
+                    res.end(JSON.stringify({ ok: true, command, query, newSession }));
+                }, (err) => {
+                    orbitError('[orbit] chat bridge: ' + command + ' failed:', err && err.message);
+                    res.statusCode = 500;
+                    res.setHeader('content-type', 'application/json');
+                    res.end(JSON.stringify({ error: String(err && err.message || err) }));
+                });
+            });
+        });
+        srv.on('error', (err) => {
+            orbitError('[orbit] chat bridge error:', err && err.message);
+        });
+        srv.listen(0, '127.0.0.1', () => {
+            const port = srv.address().port;
+            try {
+                fs.writeFileSync(CHAT_PORT_FILE, String(port), { mode: 0o600 });
+            } catch (e) {
+                orbitError('[orbit] failed to write chat port file:', e && e.message);
+            }
+            orbitLog('[orbit] chat bridge listening on 127.0.0.1:' + port);
+        });
+        chatServer = srv;
+    }
+
+    function stopChatBridge() {
+        if (chatServer) {
+            try { chatServer.close(); } catch (_) {}
+            chatServer = null;
+        }
+        try {
+            if (fs.existsSync(CHAT_PORT_FILE)) fs.unlinkSync(CHAT_PORT_FILE);
         } catch (_) {}
     }
 
@@ -1076,6 +1385,10 @@ module.exports = function (vscode) {
                 try { app.attachMcpBridge(server); }
                 catch (e) { orbitError('[orbit] attachMcpBridge failed:', e && e.message); }
             }
+            if (typeof app.attachSnowglobeServer === 'function') {
+                try { app.attachSnowglobeServer(server); }
+                catch (e) { orbitError('[orbit] attachSnowglobeServer failed:', e && e.message); }
+            }
 
             server.listen(8089, () => {
                 const addr = server.address();
@@ -1363,6 +1676,7 @@ module.exports = function (vscode) {
     function activate(context) {
         const ch = ensureOutputChannel();
         if (ch) context.subscriptions.push(ch);
+        extensionContext = context;
         orbitLog('[orbit] activate: extension v' +
             (vscode.extensions.getExtension('BlackPageDigital.orbit-agentic-pair-programming-for-smalltalk')
                 && vscode.extensions.getExtension('BlackPageDigital.orbit-agentic-pair-programming-for-smalltalk').packageJSON.version
@@ -1370,6 +1684,7 @@ module.exports = function (vscode) {
             ' workspaceFolders=' +
             JSON.stringify((vscode.workspace.workspaceFolders || []).map(f => f.uri.toString())));
         startClipboardBridge();
+        startChatBridge();
         startWorkspaceFsBridge();
         setRunningContext(false);
 
@@ -2463,8 +2778,14 @@ module.exports = function (vscode) {
             for (const b of BACKENDS) mcpRunning[b.name] = false;
             const wantAutoStart = (() => {
                 try {
-                    if (!vscode.workspace.getConfiguration('orbit')
-                        .get('autoStart', false)) return false;
+                    const cfg = vscode.workspace.getConfiguration('orbit').inspect('autoStart');
+                    const explicit = cfg && (
+                        cfg.workspaceFolderValue !== undefined ? cfg.workspaceFolderValue :
+                        cfg.workspaceValue       !== undefined ? cfg.workspaceValue :
+                        cfg.globalValue          !== undefined ? cfg.globalValue :
+                        undefined);
+                    const effective = (explicit !== undefined) ? !!explicit : isDeveloperInstall(context);
+                    if (!effective) return false;
                     const stoppedAt = +context.workspaceState
                         .get(EXPLICIT_STOP_KEY, 0) || 0;
                     if (stoppedAt > 0
@@ -2505,11 +2826,28 @@ module.exports = function (vscode) {
         // Auto-start the web server at activation time so that browser
         // tabs left open at the Orbit URL across VS Code restarts can
         // reconnect without the user having to invoke `orbit.start`.
-        // Controlled by the `orbit.autoStart` setting (default: true).
+        //
+        // Controlled by the `orbit.autoStart` setting. The default
+        // depends on whether this looks like a developer machine: on
+        // a dev install (where ./scripts/install-extension.sh
+        // has replaced files inside the installed extension with
+        // symlinks back to the workspace source) we default to true,
+        // so livecoding sessions start automatically. On a normal
+        // user install the default is false.
         try {
-            const autoStart = vscode.workspace
+            const autoStartCfg = vscode.workspace
                 .getConfiguration('orbit')
-                .get('autoStart', false);
+                .inspect('autoStart');
+            const explicit = autoStartCfg && (
+                autoStartCfg.workspaceFolderValue !== undefined ? autoStartCfg.workspaceFolderValue :
+                autoStartCfg.workspaceValue       !== undefined ? autoStartCfg.workspaceValue :
+                autoStartCfg.globalValue          !== undefined ? autoStartCfg.globalValue :
+                undefined);
+            const developerMachine = isDeveloperInstall(context);
+            const autoStart = (explicit !== undefined) ? !!explicit : developerMachine;
+            if (explicit === undefined && developerMachine) {
+                orbitLog('[orbit] auto-start defaulting to true (developer install detected)');
+            }
             const explicitlyStopped = (() => {
                 try {
                     const stoppedAt = +context.workspaceState.get(EXPLICIT_STOP_KEY, 0) || 0;
@@ -2556,6 +2894,7 @@ module.exports = function (vscode) {
 
     function deactivate() {
         stopClipboardBridge();
+        stopChatBridge();
         stopWorkspaceFsBridge();
         stopBackendActivationRetries();
         stopMcpDisconnectWatcher();

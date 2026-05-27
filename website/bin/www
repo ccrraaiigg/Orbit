@@ -30,6 +30,9 @@ var server = http.createServer(app);
 if (typeof app.attachMcpBridge === 'function') {
   app.attachMcpBridge(server);
 }
+if (typeof app.attachSnowglobeServer === 'function') {
+  app.attachSnowglobeServer(server);
+}
 
 /**
  * Listen on provided port, on all network interfaces.

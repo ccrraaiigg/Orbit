@@ -268,6 +268,51 @@ class McpBridge {
         }
     }
 
+    // Return the singleton page-side Tether (the SqueakJS webapp
+    // opens exactly one /orbit-tether connection).
+    pageTether() {
+        for (const t of this.tethers.values()) return t;
+        return null;
+    }
+
+    // Fire-and-forget message-send to the page-side Tether (selector
+    // with a JSON-string arg). Mirrors _forwardRequest but for
+    // sibling bridges. Resolves with the raw answer bytes (we ignore
+    // them on most call sites). Throws synchronously if the peer's
+    // exposureHash hasn't been announced yet.
+    forwardCall(tether, selector, args) {
+        if (typeof tether.peerExposureHash !== 'number') {
+            return Promise.reject(new Error(
+                'peer exposureHash unknown; page has not announced yet'));
+        }
+        const FORWARD_TIMEOUT_MS = 30000;
+        return new Promise((resolve, reject) => {
+            const uuid = new caffeine.UUID();
+            let settled = false;
+            const cleanup = () => {
+                if (settled) return;
+                settled = true;
+                try { clearTimeout(timer); } catch (_) {}
+                tether.outgoingMessages.delete(uuid);
+            };
+            const wrapped = (value) => { if (settled) return; cleanup(); resolve(value); };
+            wrapped.__reject = (err) => { if (settled) return; cleanup(); reject(err); };
+            const timer = setTimeout(() => {
+                wrapped.__reject(new Error(
+                    'forwarded call timed out after ' + FORWARD_TIMEOUT_MS + 'ms'));
+            }, FORWARD_TIMEOUT_MS);
+            tether.outgoingMessages.set(uuid, wrapped);
+            tether.send(() => {
+                tether.nextBytesPut([32, 0, 0, 7]);
+                tether.store(uuid);
+                tether.nextWordPut(tether.peerExposureHash);
+                tether.nextBytesPut([32, 0, 0, 33]);
+                tether.storeSymbol(selector);
+                tether.storeArray(args);
+            });
+        });
+    }
+
     // ---- SSE plumbing -------------------------------------------------------
 
     _startEventStream(registry, sessionId, res) {

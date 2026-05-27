@@ -33,7 +33,11 @@
 class MorphicWindow extends HTMLElement {
 
   static get observedAttributes() {
-    return ['caption', 'title'];
+    // 'chromeless' has no JS-side handling: pure CSS via :host([chromeless])
+    // rules hides the titlebar, resize zones, padding, and hover tint.
+    // Set it on a window whose content (e.g. a Squeak SystemWindow rendered
+    // into our canvas) already draws its own chrome.
+    return ['caption', 'title', 'chromeless'];
   }
 
   // Single source of truth for instance methods that must be bound in
@@ -126,8 +130,118 @@ class MorphicWindow extends HTMLElement {
     }
   }
 
-  _bringToFront() { this._assignZ('top'); }
+  _bringToFront() {
+    this._assignZ('top');
+    // A maximized window must stay above frozen overlays (z 2147483646).
+    if (this._isMaximized()) this.style.zIndex = '2147483647';
+    // Delay thaw so the freshly-raised window has time to repaint in
+    // Squeak before we drop the snapshot overlay — otherwise we can
+    // see a flash of stale pixels from the about-to-be-redrawn area.
+    var self = this;
+    setTimeout(function() { MorphicWindow._thawFrozenSnapshot(self); }, 500);
+  }
   _sendToBack()   { this._assignZ('bottom'); }
+
+  // True iff no other morphic-window (transients excluded) has a
+  // z-index strictly greater than this one's.
+  _isFrontMostMorphic() {
+    var myZ = parseInt(this.style.zIndex, 10) || 0;
+    var all = MorphicWindow._allWindows();
+    for (var i = 0; i < all.length; i++) {
+      var w = all[i];
+      if (w === this) continue;
+      if (w.tagName.toLowerCase() === 'transient-window') continue;
+      var z = parseInt(w.style.zIndex, 10) || 0;
+      if (z > myZ) return false;
+    }
+    return true;
+  }
+
+  // Freeze (snapshot + overlay) every chromeless morphic-window with
+  // a higher z-index than `clicked`. The remote Squeak windows those
+  // wrappers mirror may overlap the clicked one in Squeak's world even
+  // when their DOM rects don't overlap here, and they're about to be
+  // lowered (and possibly repainted) in Squeak by the click that
+  // passes through. Each frozen window keeps its overlay until itself
+  // is raised (see `_thawFrozenSnapshot`).
+  static _freezeUpperOverlappingChromeless(clicked) {
+    var clickedZ = parseInt(clicked.style.zIndex, 10) || 0;
+    var all = MorphicWindow._allWindows();
+    for (var i = 0; i < all.length; i++) {
+      var w = all[i];
+      if (w === clicked) continue;
+      if (!w.hasAttribute || !w.hasAttribute('chromeless')) continue;
+      var z = parseInt(w.style.zIndex, 10) || 0;
+      if (z <= clickedZ) continue;
+      MorphicWindow._freezeChromelessSnapshot(w);
+    }
+  }
+
+  static _freezeChromelessSnapshot(win) {
+    if (win._frozenSnapshotOverlay) return;
+    var canvas = win.querySelector && win.querySelector('canvas');
+    if (!canvas) return;
+    var cw = canvas.width, ch = canvas.height;
+    if (cw <= 0 || ch <= 0) return;
+    var snap = document.createElement('canvas');
+    snap.width = cw;
+    snap.height = ch;
+    try { snap.getContext('2d').drawImage(canvas, 0, 0); }
+    catch (_) { return; }
+    var rect = canvas.getBoundingClientRect();
+    // Place the overlay at document.body level so it stays above
+    // every morphic-window in the page — including the lower window
+    // that's about to be raised. Without that, the snapshot would sit
+    // inside the upper window's shadow DOM and follow it as Squeak
+    // shuffles z-order, defeating the purpose.
+    // Mute the snapshot a bit so frozen (stale) windows visibly read as
+    // inactive next to live ones. The filter is animated in over 500ms
+    // (and back out in `_thawFrozenSnapshot`) so the freeze/thaw
+    // transitions don't pop.
+    snap.style.cssText =
+      'position:fixed;' +
+      'left:' + rect.left + 'px;top:' + rect.top + 'px;' +
+      'width:' + rect.width + 'px;height:' + rect.height + 'px;' +
+      'pointer-events:none;z-index:2147483646;opacity:1;' +
+      'border-radius:7px;' +
+      'transition:filter 500ms ease;' +
+      'filter:grayscale(0) brightness(1);';
+    document.body.appendChild(snap);
+    win._frozenSnapshotOverlay = snap;
+    // Force the browser to commit the initial (un-muted) filter before
+    // we set the target value, so the transition actually runs.
+    // eslint-disable-next-line no-unused-expressions
+    snap.getBoundingClientRect();
+    requestAnimationFrame(function() {
+      snap.style.filter = 'grayscale(0.55) brightness(0.88)';
+    });
+  }
+
+  static _thawFrozenSnapshot(win) {
+    if (!win || !win._frozenSnapshotOverlay) return;
+    var snap = win._frozenSnapshotOverlay;
+    win._frozenSnapshotOverlay = null;
+    // Animate the filter back to a no-op, then remove the overlay.
+    snap.style.filter = 'grayscale(0) brightness(1)';
+    setTimeout(function() {
+      if (snap.parentNode) snap.parentNode.removeChild(snap);
+    }, 500);
+  }
+
+  // Reposition the frozen overlay to stay aligned with the window's
+  // canvas after a drag move. Called from _onPointerMove and the
+  // cmd-drag onMove handler.
+  static _syncFrozenOverlayPosition(win) {
+    if (!win || !win._frozenSnapshotOverlay) return;
+    var canvas = win.querySelector && win.querySelector('canvas');
+    if (!canvas) return;
+    var rect = canvas.getBoundingClientRect();
+    var snap = win._frozenSnapshotOverlay;
+    snap.style.left = rect.left + 'px';
+    snap.style.top = rect.top + 'px';
+    snap.style.width = rect.width + 'px';
+    snap.style.height = rect.height + 'px';
+  }
 
   _isMaximized() {
     return this._windowState === 'maximized';
@@ -418,6 +532,7 @@ class MorphicWindow extends HTMLElement {
   // falling back to the known defaults defined in the :host CSS rule
   // (padding: 25px 5px 5px 5px).
   get borderExtent() {
+    if (this.hasAttribute('chromeless')) return { width: 0, height: 0 };
     if (this.isConnected) {
       var cs = getComputedStyle(this);
       var w = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight);
@@ -500,12 +615,15 @@ class MorphicWindow extends HTMLElement {
     this.style.height = '100vh';
     this.style.margin = '0';
 
+    // Put this window above frozen snapshot overlays (z-index
+    // 2147483646) before the fade-in so the content appears in front.
+    this._bringToFront();
+    this.style.zIndex = '2147483647';
+
     // Resize to final dimensions, then yield so the VM redraw
     // completes before the fade-in transition starts.
     this._resizeEmbeddedSurfaceToWindow();
     await this._yieldToRenderer();
-
-    this._bringToFront();
 
     // Phase 3: Fade content back in (from cutout)
     await this._fadeContentsTo(1, this._scaledMs(250));
@@ -525,8 +643,15 @@ class MorphicWindow extends HTMLElement {
     // Switch to cutout (invisible because content fills the area)
     this._setCutoutMode(true);
 
-    // Phase 1: Fade content → dissolves to reveal cutout
+    // Phase 1: Fade content → dissolves to reveal cutout.
+    // Keep the high z-index (2147483647) during the fade so frozen
+    // overlays (at z 2147483646) are revealed THROUGH the dissolving
+    // cutout rather than popping in front immediately.
     await this._fadeContentsTo(0, this._scaledMs(250));
+
+    // NOW drop z-index — content is fully transparent so the
+    // visual transition is seamless.
+    this._assignZ('top');
 
     // Phase 2: Geometry animation with cutout visible
     await this._animateGeometryToRect(targetRect, this._scaledMs(500));
@@ -540,8 +665,6 @@ class MorphicWindow extends HTMLElement {
     // Yield so the VM redraw from geometry restore completes
     // before the fade-in transition starts.
     await this._yieldToRenderer();
-
-    this._bringToFront();
 
     // Phase 3: Fade content back in (from cutout)
     await this._fadeContentsTo(1, this._scaledMs(250));
@@ -614,6 +737,112 @@ class MorphicWindow extends HTMLElement {
       var span = this.shadowRoot.querySelector('.title-text');
       if (span) span.textContent = this.getAttribute('caption') || '';
     }
+    if (name === 'chromeless') {
+      if (this.hasAttribute('chromeless')) {
+        this._installChromelessResizeFade();
+      } else {
+        this._uninstallChromelessResizeFade();
+      }
+    }
+  }
+
+  // Mask the flash that happens when a remote Squeak window collapses
+  // or expands by snapshotting the slotted canvas just before each
+  // dimension change and fading the snapshot out over 500ms on top of
+  // the resized canvas. Since we can't delay the upstream resize, this
+  // gives a smooth cross-fade from the old visual to the new one.
+  _installChromelessResizeFade() {
+    if (this._chromelessResizeFadeInstalled) return;
+    this._chromelessResizeFadeInstalled = true;
+    var self = this;
+    this._instrumentSlottedCanvases();
+    // Watch for the slotted canvas being added/replaced later.
+    var slot = this.shadowRoot.querySelector('slot:not([name])');
+    if (slot) {
+      slot.addEventListener('slotchange', function() {
+        self._instrumentSlottedCanvases();
+      });
+    }
+  }
+
+  _uninstallChromelessResizeFade() {
+    this._chromelessResizeFadeInstalled = false;
+    // We leave any per-canvas instrumentation in place; it harmlessly
+    // no-ops while the host isn't chromeless because we gate snapshot
+    // emission on the chromeless attribute.
+  }
+
+  _instrumentSlottedCanvases() {
+    var slot = this.shadowRoot.querySelector('slot:not([name])');
+    if (!slot) return;
+    var assigned = slot.assignedElements ? slot.assignedElements() : [];
+    var canvases = [];
+    assigned.forEach(function(el) {
+      if (el.tagName === 'CANVAS') canvases.push(el);
+      else if (el.querySelectorAll) {
+        el.querySelectorAll('canvas').forEach(function(c) { canvases.push(c); });
+      }
+    });
+    var host = this;
+    canvases.forEach(function(c) { MorphicWindow._instrumentCanvasForResizeFade(c, host); });
+  }
+
+  static _instrumentCanvasForResizeFade(canvas, host) {
+    if (canvas.__resizeSnapshotInstalled) {
+      canvas.__resizeSnapshotHost = host;
+      return;
+    }
+    canvas.__resizeSnapshotInstalled = true;
+    canvas.__resizeSnapshotHost = host;
+    var widthDesc = Object.getOwnPropertyDescriptor(HTMLCanvasElement.prototype, 'width');
+    var heightDesc = Object.getOwnPropertyDescriptor(HTMLCanvasElement.prototype, 'height');
+    var pendingSnapshot = false;
+    function maybeSnapshot() {
+      if (pendingSnapshot) return;
+      var h = canvas.__resizeSnapshotHost;
+      if (!h || !h.hasAttribute('chromeless')) return;
+      var oldW = widthDesc.get.call(canvas);
+      var oldH = heightDesc.get.call(canvas);
+      if (oldW <= 0 || oldH <= 0) return;
+      pendingSnapshot = true;
+      // Snapshot synchronously before the resize is applied.
+      var snap = document.createElement('canvas');
+      snap.width = oldW;
+      snap.height = oldH;
+      try { snap.getContext('2d').drawImage(canvas, 0, 0); }
+      catch (_) { pendingSnapshot = false; return; }
+      var rect = canvas.getBoundingClientRect();
+      snap.style.cssText =
+        'position:absolute;top:0;left:0;' +
+        'width:' + rect.width + 'px;height:' + rect.height + 'px;' +
+        'pointer-events:none;z-index:50;' +
+        'opacity:1;transition:opacity 500ms ease;';
+      h.shadowRoot.appendChild(snap);
+      // Force layout, then fade out.
+      requestAnimationFrame(function() {
+        requestAnimationFrame(function() { snap.style.opacity = '0'; });
+      });
+      setTimeout(function() {
+        if (snap.parentNode) snap.parentNode.removeChild(snap);
+        pendingSnapshot = false;
+      }, 600);
+    }
+    Object.defineProperty(canvas, 'width', {
+      configurable: true,
+      get: function() { return widthDesc.get.call(this); },
+      set: function(v) {
+        if (v !== widthDesc.get.call(this)) maybeSnapshot();
+        widthDesc.set.call(this, v);
+      }
+    });
+    Object.defineProperty(canvas, 'height', {
+      configurable: true,
+      get: function() { return heightDesc.get.call(this); },
+      set: function(v) {
+        if (v !== heightDesc.get.call(this)) maybeSnapshot();
+        heightDesc.set.call(this, v);
+      }
+    });
   }
 
   _render() {
@@ -627,10 +856,67 @@ class MorphicWindow extends HTMLElement {
           background-color: #c0c0c0;
           border-radius: 7px;
           padding: 25px 5px 5px 5px;
-          transition: background-color 200ms;
+          transition: background-color 200ms, box-shadow 200ms;
         }
         :host(:hover) {
           background-color: #a8c8c8;
+        }
+        /* Chromeless mode: the slotted content (typically a canvas painted
+           by Squeak, which draws its own title bar, borders, and resize
+           handles) fills the host edge to edge. The titlebar, resize
+           zones, hover tint, padding, and content-area border-radius are
+           all suppressed; only the structural <slot> remains visible.
+           Drag, resize, send-to-back, maximize, and collapse remain
+           callable via the public JS API. */
+        :host([chromeless]) {
+          padding: 0;
+          background-color: transparent;
+          border-radius: 7px;
+          overflow: hidden;
+          box-shadow:
+            0 2px 6px rgba(0, 0, 0, 0.25),
+            0 0 12px rgba(80, 140, 255, 0.35);
+          transition: box-shadow 200ms, opacity 500ms ease;
+        }
+        :host([chromeless]:hover) {
+          background-color: transparent;
+          box-shadow:
+            0 4px 10px rgba(0, 0, 0, 0.3),
+            0 0 18px rgba(80, 140, 255, 0.55);
+        }
+        :host([chromeless]) .transition-overlay,
+        :host([chromeless]) .content-bg {
+          top: 0;
+          left: 0;
+          right: 0;
+          bottom: 0;
+          width: 100%;
+          height: 100%;
+        }
+        :host([chromeless]) ::slotted(*) {
+          border-radius: 7px;
+        }
+        /* Chromeless titlebar: only the .title-text strip in the middle
+           catches pointer events for wrapper-window dragging. The button
+           positions and slotted extras pass clicks through to the
+           underlying canvas, where Squeak draws its own titlebar buttons
+           and handles them natively. Use opacity:0 (not visibility:hidden)
+           on the buttons so they keep their flex layout footprint without
+           disabling hit-testing on .title-text. Resize zones already use
+           a near-zero alpha background and need no changes. */
+        :host([chromeless]) .titlebar {
+          background: transparent;
+          pointer-events: none;
+        }
+        :host([chromeless]) .titlebar > .btn,
+        :host([chromeless]) ::slotted([slot="titlebar-extras"]) {
+          opacity: 0;
+          pointer-events: none;
+        }
+        :host([chromeless]) .titlebar > .title-text {
+          opacity: 0;
+          pointer-events: auto;
+          cursor: grab;
         }
         .titlebar {
           position: absolute;
@@ -791,6 +1077,35 @@ class MorphicWindow extends HTMLElement {
     var self = this;
     var titlebar = this.shadowRoot.querySelector('.titlebar');
     var buttons = this.shadowRoot.querySelectorAll('.btn');
+
+    // Chromeless occlusion guard: if this chromeless window is not the
+    // front-most morphic-window, raise it on pointerdown. The event is
+    // not consumed — it still flows through to the slotted Squeak
+    // canvas (or the title-text drag strip). Before raising, freeze a
+    // static snapshot of every higher chromeless morphic-window whose
+    // rect overlaps this one's. Those Squeak originals are about to be
+    // partially obscured by the raise; their canvases would otherwise
+    // be repainted (and lose content) as Squeak reshuffles. The frozen
+    // overlays stay visible until each of those windows is itself
+    // raised again.
+    if (!this._chromelessOcclusionGuardInstalled) {
+      this._chromelessOcclusionGuardInstalled = true;
+      this.addEventListener('pointerdown', function(e) {
+        if (!self.hasAttribute('chromeless')) return;
+        if (self._isFrontMostMorphic()) return;
+        MorphicWindow._freezeUpperOverlappingChromeless(self);
+        self._bringToFront();
+        // Tell the remote SystemWindow to activate itself, instead of
+        // letting the click reach the canvas (which would translate into
+        // a mouse event in Squeak/Morphic at the pointer's world coords —
+        // possibly landing on a fragment of an overlapping window and
+        // raising the wrong one). Stop the event so the canvas never
+        // sees this pointerdown.
+        self._activateRemoteWindow();
+        try { e.stopPropagation(); e.stopImmediatePropagation(); } catch (_) {}
+        try { e.preventDefault(); } catch (_) {}
+      }, true);
+    }
 
     // Modifier-click handling (cmd/opt/ctrl) is installed once per
     // page at the window level so it runs before any per-instance
@@ -1049,13 +1364,28 @@ class MorphicWindow extends HTMLElement {
     this._didDrag = true;
     this.style.left = (e.clientX - this._offsetX) + 'px';
     this.style.top = (e.clientY - this._offsetY) + 'px';
+    MorphicWindow._syncFrozenOverlayPosition(this);
   }
 
   _onPointerUp(e) {
     try {
       if (this._dragging && !this._didDrag) {
-        // Click without drag: bring to front
-        this._bringToFront();
+        // Click without drag: in chromeless mode the slotted canvas
+        // (e.g. a Squeak window with its own titlebar) sits underneath
+        // the wrapper's drag strip. Forward the click through so a
+        // single click on the wrapper's draggable area reaches the
+        // remote window. Otherwise (chromed mode), just bring to front.
+        if (this.hasAttribute('chromeless')) {
+          // Click on the wrapper's drag strip without a drag: don't
+          // synthesize a click on the canvas (it could land on a
+          // fragment of an overlapping window in the Squeak world).
+          // Ask the SnowglobeMorphicService to #activate the real
+          // SystemWindow instead, and raise the wrapper.
+          this._activateRemoteWindow();
+          this._bringToFront();
+        } else {
+          this._bringToFront();
+        }
       }
       var titlebar = this.shadowRoot.querySelector('.titlebar');
       if (titlebar) {
@@ -1067,6 +1397,50 @@ class MorphicWindow extends HTMLElement {
       this._didDrag = false;
       this.style.cursor = '';
     }
+  }
+
+  // Tell the SnowglobeMorphicService (running inside the Caffeine
+  // SqueakJS image) to activate the real Morphic SystemWindow this
+  // wrapper is mirroring. The Smalltalk side installs an
+  // 'activate-remote' listener in Snowglobe>>mapWindow: that maps the
+  // wrapper back to its remote-window id and forwards to
+  // SnowglobeMorphicService>>activateWindowID:. No-op on non-chromeless
+  // wrappers (they don't have the listener).
+  _activateRemoteWindow() {
+    try {
+      this.dispatchEvent(new CustomEvent('activate-remote', {
+        bubbles: false, cancelable: false, composed: false
+      }));
+    } catch (_) {}
+  }
+
+  _forwardClickToContent(e) {
+    // Find the slotted canvas (or first slotted element) and dispatch
+    // a mousedown/mouseup pair on it at the same screen coordinates.
+    var slot = this.shadowRoot.querySelector('slot:not([name])');
+    if (!slot) return;
+    var assigned = slot.assignedElements ? slot.assignedElements() : [];
+    var target = null;
+    for (var i = 0; i < assigned.length; i++) {
+      var el = assigned[i];
+      if (el.tagName === 'CANVAS') { target = el; break; }
+      var c = el.querySelector && el.querySelector('canvas');
+      if (c) { target = c; break; }
+      if (!target) target = el;
+    }
+    if (!target) return;
+    var common = {
+      bubbles: true, cancelable: true, composed: true,
+      clientX: e.clientX, clientY: e.clientY,
+      screenX: e.screenX, screenY: e.screenY,
+      button: 0, buttons: 0, view: window
+    };
+    try {
+      target.dispatchEvent(new MouseEvent('mousedown', common));
+      target.dispatchEvent(new MouseEvent('mouseup', common));
+      target.dispatchEvent(new MouseEvent('click', common));
+    } catch (_) {}
+    this._bringToFront();
   }
 
   toggleMaximize() {
@@ -1546,6 +1920,7 @@ class MorphicWindow extends HTMLElement {
       }
       win.style.left = (ev.clientX + ox - offX) + 'px';
       win.style.top  = (ev.clientY + oy - offY) + 'px';
+      MorphicWindow._syncFrozenOverlayPosition(win);
     };
     var onUp = function(ev) {
       if (!win._modifierDragging) return;
@@ -1642,11 +2017,13 @@ class MorphicWindow extends HTMLElement {
   }
 
   titlebarThickness() {
+    if (this.hasAttribute('chromeless')) return 0;
     var titlebar = this.shadowRoot.querySelector('.titlebar');
     return titlebar ? titlebar.offsetHeight : 25;
   }
 
   sideBorderThickness() {
+    if (this.hasAttribute('chromeless')) return 0;
     return parseInt(getComputedStyle(this.shadowRoot.host).paddingLeft, 10) || 5;
   }
 

@@ -4,6 +4,55 @@
 
 NEVER.
 
+### NEVER stop the Orbit server or the page without consent
+
+Do not run `orbit.stop`, `orbit.restart`, or any other VSCode command,
+terminal command, or tool call whose effect is to stop, restart, kill,
+or otherwise interrupt the Orbit server, the Orbit extension host, or
+the shared page. Nothing you do should stop the page without the
+user's explicit consent. If you believe the server needs to be
+restarted to recover from a fault, ASK first and wait for the user to
+agree (or to do it themselves).
+
+### NEVER remove the Caffeine host element when cleaning up remote windows
+
+The Caffeine SqueakJS VM lives inside a `<morphic-window
+id="embeddedSqueak">` element in the outer `orbit.html` document.
+Removing that element destroys the iframe, kills the SqueakJS VM, and
+takes down the in-image MCP server with it — destroying all live
+image state. A blanket selector like
+`document.querySelectorAll("morphic-window, transient-window")` will
+match the Caffeine host and is therefore forbidden.
+
+Always scope cleanup selectors to exclude the Caffeine host. Safe forms:
+
+```js
+document.querySelectorAll("morphic-window:not(#embeddedSqueak)").forEach(el => el.remove());
+```
+
+or filter explicitly:
+
+```js
+document.querySelectorAll("morphic-window").forEach(el => {
+  if (el.id !== "embeddedSqueak") el.remove();
+});
+```
+
+Likewise, `#dashboard`, `#status`, and `#agent-mouse-cursor` are part
+of the host chrome, not Snowglobe-mapped remote-window proxies, and
+must not be removed by cleanup code. Only touch elements you have
+positive evidence are Snowglobe-mapped remote windows.
+
+### never enumerate all classes in the remote Smalltalk
+
+Do not iterate over `Smalltalk allClassesDo:` (or equivalent
+whole-system scans) to search for senders, references, source
+substrings, etc. It's slow and can destabilize the image. Use the
+dedicated MCP tools instead: `getAllSenders`, `getAllImplementors`,
+`getAllReferences`, `findByName`, etc. If you only need to inspect a
+known class, query it directly (`SomeClass methodDictionary`,
+`SomeClass classPool`).
+
 ### re-reading this file when it changes
 
 Every time you learn that this file has changed, you will re-read it
@@ -30,9 +79,14 @@ or delete an existing summary file.
 
 ### ensure the page is shared
 
-Whenever you notice that the Integrated Browser page isn't shared, use
-the VSCode API for asking the user to share the tab. Don't ask
-yourself in the conversation.
+Whenever you need the Integrated Browser page to be shared and it
+isn't (no shared page in your context, only an unshared page open),
+you MUST use the VSCode elicitation API to ask the user to share the
+tab. Do not ask in the conversation. Do not proceed with a workaround
+that pretends sharing isn't needed (e.g. "I can't inject because the
+page isn't shared — let me know when you've shared it"). Always
+elicit. This applies every time you discover the page isn't shared,
+not just the first time in a conversation.
 
 ### MCP tools are deferred; load their schemas first
 
@@ -199,6 +253,9 @@ There is no need to escape "<" and other HTML-related strings.
 You can't use object reference integers directly in source code. You
 can only pass them in as variables when using the MCP "evaluate" tool.
 
+You don't need to use the return operator (^) with the MCP "evaluate"
+tool, and shouldn't.
+
 #### You can detect and manipulate unhandled exceptions
 
 In source code you evaluate, "self" is bound to an instance of a
@@ -241,11 +298,12 @@ may ask you to comment on those outputs.
 
 ### always show your mouse position with the purple dot
 
-The Orbit page has a translucent purple cursor overlay (source:
-[js/agent-mouse-cursor.js](../js/agent-mouse-cursor.js)) that
-visualizes the agent's mouse position to the user. It is updated by
-calling `window.__agentMouse(x, y)` (or `window.__agentMouse(x, y,
-{click: true})` for a brief click flash).
+The Orbit page has a translucent purple cursor overlay served as part
+of orbit.html (source:
+[website/public/js/agent-mouse-cursor.js](../website/public/js/agent-mouse-cursor.js)).
+It visualizes the agent's mouse position to the user. It is updated
+by calling `window.__agentMouse(x, y)` (or
+`window.__agentMouse(x, y, {click: true})` for a brief click flash).
 
 Whenever you do *anything* with the Playwright mouse — `mouse.move`,
 `mouse.click`, `mouse.dblclick`, `mouse.down`, `mouse.up`, or any
@@ -294,14 +352,18 @@ the status of all three sync targets:
 
 ### rebuilding the Orbit extension
 
-To rebuild the Orbit extension, run ./shellscripts/build-extension.sh,
+If you change anything under ./website/src/ (or anything else that
+ships inside the VSIX), the extension needs a rebuild. Do not stop at
+"the change is on disk" or tell the user "rebuild when you're ready"
+— always rebuild it yourself in the same turn, so the live VSCode
+extension matches the source. Run ./scripts/build-extension.sh,
 which bumps the version, packages a fresh VSIX, installs it, and
 re-establishes the livecoding symlinks.
 
 If you only need to repair the livecoding symlinks against the
-already-installed VSIX (e.g. after a manual reinstall overwrote
-them), run ./shellscripts/install-extension.sh instead. It does no
-build and no version bump.
+already-installed VSIX (e.g. after a manual reinstall overwrote them),
+run ./scripts/install-extension.sh instead. It does no build and no
+version bump.
 
 ## the Keep store
 

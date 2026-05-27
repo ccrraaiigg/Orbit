@@ -92,6 +92,7 @@ app.mcpBearer  = mcpBearer;
 
 const CLIPBOARD_PORT_FILE = path.join(os.tmpdir(), 'orbit-clipboard.port');
 const WORKSPACE_FS_PORT_FILE = path.join(os.tmpdir(), 'orbit-workspace-fs.port');
+const CHAT_PORT_FILE = path.join(os.tmpdir(), 'orbit-chat.port');
 
 function readPortFile(file) {
   try {
@@ -163,6 +164,81 @@ app.post('/clipboard', async (req, res) => {
   }
 });
 
+// Chat bridge: lets the page open a VS Code Copilot Chat session by
+// POSTing { query?, mode? } to /chat. Proxied to a private loopback
+// server started by the extension, which dispatches to
+// workbench.action.chat.open. Loopback-only on the bridge side; this
+// proxy is gated by the standard bridge bearer/loopback check.
+app.post('/chat', async (req, res) => {
+  if (!allowBridgeAccess(req, res)) return;
+  const port = readPortFile(CHAT_PORT_FILE);
+  if (!port) {
+    return res.status(503).json({ error: 'chat bridge unavailable (VS Code not running?)' });
+  }
+  const query = (req.body && typeof req.body.query === 'string') ? req.body.query : '';
+  const mode  = (req.body && typeof req.body.mode  === 'string') ? req.body.mode  : 'panel';
+  const newSession = !!(req.body && req.body.newSession);
+  const body  = JSON.stringify({ query, mode, newSession });
+  const upstream = httpmod.request({
+    method: 'POST',
+    host: '127.0.0.1',
+    port,
+    path: '/chat',
+    headers: {
+      'content-type': 'application/json',
+      'content-length': Buffer.byteLength(body)
+    }
+  }, (upRes) => {
+    let chunks = '';
+    upRes.setEncoding('utf8');
+    upRes.on('data', (c) => { chunks += c; });
+    upRes.on('end', () => {
+      res.status(upRes.statusCode).type('application/json').send(chunks);
+    });
+  });
+  upstream.on('error', (err) => {
+    res.status(502).json({ error: err.message });
+  });
+  upstream.write(body);
+  upstream.end();
+});
+
+// Read-only chat session inspection. Proxied straight through to the
+// same private bridge as POST /chat.
+function proxyChatGet(req, res, path) {
+  const port = readPortFile(CHAT_PORT_FILE);
+  if (!port) {
+    return res.status(503).json({ error: 'chat bridge unavailable (VS Code not running?)' });
+  }
+  const upstream = httpmod.request({
+    method: 'GET', host: '127.0.0.1', port, path
+  }, (upRes) => {
+    res.status(upRes.statusCode);
+    for (const [k, v] of Object.entries(upRes.headers)) {
+      if (k === 'connection' || k === 'transfer-encoding') continue;
+      res.setHeader(k, v);
+    }
+    upRes.pipe(res);
+  });
+  upstream.on('error', (err) => { res.status(502).json({ error: err.message }); });
+  upstream.end();
+}
+app.get('/chat/sessions', (req, res) => {
+  if (!allowBridgeAccess(req, res)) return;
+  proxyChatGet(req, res, '/chat/sessions');
+});
+app.get('/chat/sessions/:id', (req, res) => {
+  if (!allowBridgeAccess(req, res)) return;
+  proxyChatGet(req, res, '/chat/sessions/' + encodeURIComponent(req.params.id));
+});
+app.get('/chat/search', (req, res) => {
+  if (!allowBridgeAccess(req, res)) return;
+  const qs = new URLSearchParams();
+  if (typeof req.query.q === 'string') qs.set('q', req.query.q);
+  if (typeof req.query.limit === 'string') qs.set('limit', req.query.limit);
+  proxyChatGet(req, res, '/chat/search?' + qs.toString());
+});
+
 // Workspace FS bridge: pass GETs through to the private workspace-fs
 // bridge started by the Orbit extension. The bridge gates URIs by
 // scheme and exposes vscode.workspace.fs (every registered
@@ -206,6 +282,16 @@ app.attachMcpBridge = function (server) {
   mcpBridge.attachToHttpServer(server);
 };
 app.mcpBridge = mcpBridge;
+
+// Snowglobe server: accepts the in-page Caffeine Snowglobe client at
+// /snowglobe and speaks the same wire protocol VW Snowglobe servers
+// do. See src/snowglobe-server.js.
+const { SnowglobeServer } = require('./src/snowglobe-server');
+const snowglobeServer = new SnowglobeServer();
+app.attachSnowglobeServer = function (server) {
+  snowglobeServer.attachToHttpServer(server);
+};
+app.snowglobeServer = snowglobeServer;
 
 // Mount point for routes registered later by the Orbit extension
 // (e.g. /mcp-events SSE). Mounted before the 404 catchall so
