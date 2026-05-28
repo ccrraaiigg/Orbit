@@ -293,6 +293,28 @@ app.attachSnowglobeServer = function (server) {
 };
 app.snowglobeServer = snowglobeServer;
 
+// Caffeine window bounds persistence: the page PUTs its bounds here
+// so they survive a reload. Served back by express.static as a plain
+// JSON file at /caffeine-bounds.json.
+const BOUNDS_FILE = path.join(__dirname, 'public', 'caffeine-bounds.json');
+app.put('/caffeine-bounds.json', (req, res) => {
+  const b = req.body;
+  if (!b || typeof b !== 'object') {
+    return res.status(400).json({ error: 'expected JSON object' });
+  }
+  // Only allow the four expected string keys
+  const clean = {};
+  for (const k of ['top', 'left', 'width', 'height']) {
+    if (typeof b[k] === 'string') clean[k] = b[k];
+  }
+  try {
+    fsmod.writeFileSync(BOUNDS_FILE, JSON.stringify(clean, null, 2) + '\n');
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Mount point for routes registered later by the Orbit extension
 // (e.g. /mcp-events SSE). Mounted before the 404 catchall so
 // late-added routes still match.
