@@ -37,8 +37,10 @@ class TransientWindow extends HTMLElement {
     var transients = allWins.filter(function(w) {
       return w.tagName.toLowerCase() === 'transient-window';
     });
-    // Transient windows layer above all morphic windows
-    var transientBase = morphics.length;
+    // Transient windows layer above all morphic windows using the
+    // shared tier constant from MorphicWindow.
+    var MW = customElements.get('morphic-window');
+    var transientBase = (MW && MW.Z_TRANSIENT_BASE) || 5000;
     if (transients.length <= 1) {
       this.style.zIndex = transientBase;
       return;
@@ -72,7 +74,7 @@ class TransientWindow extends HTMLElement {
         :host {
           display: block;
           position: absolute;
-          z-index: 100;
+          z-index: 5000;
           isolation: isolate;
           padding: 0;
           margin: 0;

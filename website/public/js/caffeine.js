@@ -269,14 +269,14 @@ document.addEventListener('contextmenu', function(e) { e.preventDefault(); }, tr
 
     // Override _bringToFront on the Caffeine host instance to freeze
     // chromeless windows when the user clicks it. The Caffeine host
-    // must always sit above frozen overlays (z 2147483646) when active,
-    // not just when maximized, so we unconditionally set z 2147483647.
-    // We call the prototype method directly rather than capturing a
-    // reference that can go stale after hot-reload patches.
+    // must sit above frozen overlays (z 4000) when active, so we set
+    // it to 4500 (Z_MAXIMIZED tier). We call the prototype method
+    // directly rather than capturing a reference that can go stale
+    // after hot-reload patches.
     host._bringToFront = function() {
       var MW = customElements.get('morphic-window');
       MW.prototype._bringToFront.call(host);
-      host.style.zIndex = '2147483647';
+      host.style.zIndex = String(MW.Z_MAXIMIZED || 4500);
       if (!host._isTransitioning) freezeAll();
     };
 

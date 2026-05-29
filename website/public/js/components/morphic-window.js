@@ -97,6 +97,29 @@ class MorphicWindow extends HTMLElement {
     return Array.from(document.querySelectorAll('morphic-window, transient-window'));
   }
 
+  static _updateOcclusionShields() {
+    // For each non-Caffeine chromed morphic-window, toggle `inert` on
+    // slotted children so the first click into an occluded window raises
+    // it without passing the event into the content.
+    var all = MorphicWindow._allWindows();
+    for (var i = 0; i < all.length; i++) {
+      var w = all[i];
+      if (w.tagName.toLowerCase() === 'transient-window') continue;
+      if (w.id === 'embeddedSqueak') continue;
+      if (w.hasAttribute('chromeless')) continue;
+      var isFront = w._isFrontMostMorphic();
+      var children = w.children;
+      for (var j = 0; j < children.length; j++) {
+        if (children[j].slot) continue;
+        if (isFront) {
+          children[j].removeAttribute('inert');
+        } else {
+          children[j].setAttribute('inert', '');
+        }
+      }
+    }
+  }
+
   // Reorder z-indices among morphic + transient windows. `position` is
   // 'top' (this window above all morphics) or 'bottom' (below all).
   // Transients always sit above morphics.
@@ -121,7 +144,7 @@ class MorphicWindow extends HTMLElement {
       this.style.zIndex = 0;
       for (var j = 0; j < others.length; j++) others[j].style.zIndex = j + 1;
     }
-    var transientBase = morphics.length;
+    var transientBase = MorphicWindow.Z_TRANSIENT_BASE;
     transients.sort(function(a, b) {
       return (parseInt(a.style.zIndex, 10) || 0) - (parseInt(b.style.zIndex, 10) || 0);
     });
@@ -130,17 +153,32 @@ class MorphicWindow extends HTMLElement {
     }
   }
 
+  // Z-index tiers (low → high):
+  //   Morphic windows (normal _assignZ): 0 .. N-1
+  //   Frozen snapshot overlays:          4000
+  //   Caffeine active / maximized:       4500
+  //   Transient windows:                 5000+
+  //   Icon manager:                      9999
+  static get Z_FROZEN_OVERLAY()  { return 4000; }
+  static get Z_MAXIMIZED()       { return 4500; }
+  static get Z_TRANSIENT_BASE()  { return 5000; }
+
   _bringToFront() {
     this._assignZ('top');
-    // A maximized window must stay above frozen overlays (z 2147483646).
-    if (this._isMaximized()) this.style.zIndex = '2147483647';
+    // A maximized window must stay above frozen overlays.
+    if (this._isMaximized()) this.style.zIndex = String(MorphicWindow.Z_MAXIMIZED);
     // Delay thaw so the freshly-raised window has time to repaint in
     // Squeak before we drop the snapshot overlay — otherwise we can
     // see a flash of stale pixels from the about-to-be-redrawn area.
     var self = this;
     setTimeout(function() { MorphicWindow._thawFrozenSnapshot(self); }, 500);
+    // Toggle occlusion shields: disable ours, enable on all others.
+    MorphicWindow._updateOcclusionShields();
   }
-  _sendToBack()   { this._assignZ('bottom'); }
+  _sendToBack() {
+    this._assignZ('bottom');
+    MorphicWindow._updateOcclusionShields();
+  }
 
   // True iff no other morphic-window (transients excluded) has a
   // z-index strictly greater than this one's.
@@ -151,6 +189,7 @@ class MorphicWindow extends HTMLElement {
       var w = all[i];
       if (w === this) continue;
       if (w.tagName.toLowerCase() === 'transient-window') continue;
+      if (w.id === 'embeddedSqueak') continue;
       var z = parseInt(w.style.zIndex, 10) || 0;
       if (z > myZ) return false;
     }
@@ -202,7 +241,7 @@ class MorphicWindow extends HTMLElement {
       'position:fixed;' +
       'left:' + rect.left + 'px;top:' + rect.top + 'px;' +
       'width:' + rect.width + 'px;height:' + rect.height + 'px;' +
-      'pointer-events:none;z-index:2147483646;opacity:1;' +
+      'pointer-events:none;z-index:' + MorphicWindow.Z_FROZEN_OVERLAY + ';opacity:1;' +
       'border-radius:7px;' +
       'transition:filter 500ms ease;' +
       'filter:grayscale(0) brightness(1);';
@@ -615,10 +654,10 @@ class MorphicWindow extends HTMLElement {
     this.style.height = '100vh';
     this.style.margin = '0';
 
-    // Put this window above frozen snapshot overlays (z-index
-    // 2147483646) before the fade-in so the content appears in front.
+    // Put this window above frozen snapshot overlays before the
+    // fade-in so the content appears in front.
     this._bringToFront();
-    this.style.zIndex = '2147483647';
+    this.style.zIndex = String(MorphicWindow.Z_MAXIMIZED);
 
     // Resize to final dimensions, then yield so the VM redraw
     // completes before the fade-in transition starts.
@@ -644,9 +683,9 @@ class MorphicWindow extends HTMLElement {
     this._setCutoutMode(true);
 
     // Phase 1: Fade content → dissolves to reveal cutout.
-    // Keep the high z-index (2147483647) during the fade so frozen
-    // overlays (at z 2147483646) are revealed THROUGH the dissolving
-    // cutout rather than popping in front immediately.
+    // Keep the high z-index during the fade so frozen overlays are
+    // revealed THROUGH the dissolving cutout rather than popping in
+    // front immediately.
     await this._fadeContentsTo(0, this._scaledMs(250));
 
     // NOW drop z-index — content is fully transparent so the
@@ -1104,6 +1143,38 @@ class MorphicWindow extends HTMLElement {
         self._activateRemoteWindow();
         try { e.stopPropagation(); e.stopImmediatePropagation(); } catch (_) {}
         try { e.preventDefault(); } catch (_) {}
+      }, true);
+    }
+
+    // Non-Caffeine chromed window occlusion guard: when this window is
+    // not front-most, slotted children are marked `inert` so the first
+    // pointerdown hits the host's capture listener (which raises the
+    // window) without reaching the content. Also raises when behind
+    // embeddedSqueak even if front among chromed windows.
+    if (!this._chromedOcclusionGuardInstalled) {
+      this._chromedOcclusionGuardInstalled = true;
+      this.addEventListener('pointerdown', function(e) {
+        if (self.hasAttribute('chromeless')) return;
+        if (self.id === 'embeddedSqueak') return;
+        var es = document.getElementById('embeddedSqueak');
+        var behindES = es && (parseInt(es.style.zIndex, 10) || 0) >= (parseInt(self.style.zIndex, 10) || 0);
+        if (!behindES && self._isFrontMostMorphic()) return;
+        // Consume the first click so it raises without passing through.
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+        e.preventDefault();
+        self._bringToFront();
+      }, true);
+      MorphicWindow._updateOcclusionShields();
+    }
+
+    // embeddedSqueak reclaim: when the Caffeine canvas is clicked while a
+    // chromed window is above it, reclaim z-index top.
+    if (this.id === 'embeddedSqueak' && !this._esReclaimInstalled) {
+      this._esReclaimInstalled = true;
+      this.addEventListener('pointerdown', function() {
+        self._assignZ('top');
+        MorphicWindow._updateOcclusionShields();
       }, true);
     }
 

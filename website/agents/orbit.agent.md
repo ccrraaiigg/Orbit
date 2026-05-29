@@ -187,6 +187,7 @@ files. Here's a sampling of the top of the filesystem:
 				resume
 				terminate
 				debug
+```
 
 Note that the SqueakJS system running in the page is distinct from the
 remote Smalltalk system. WebDAV filesystems are not relevant for
@@ -222,9 +223,9 @@ I'm very interested in any thoughts you may develop about this.
 
 ### You can run remote Smalltalk methods
 
-If you don't need to pass parameters or debug potential unhandled
-exceptions, use the "runCode" MCP tool rather than the "evaluate" MCP
-tool.
+With VisualWorks, if you don't need to pass parameters or debug
+potential unhandled exceptions, use the "runCode" MCP tool rather than
+the "evaluate" MCP tool.
 
 If you do need to pass parameters or debug potential unhandled
 exceptions, use the "evaluate" MCP tool. You specify Smalltalk source
@@ -256,6 +257,10 @@ can only pass them in as variables when using the MCP "evaluate" tool.
 You don't need to use the return operator (^) with the MCP "evaluate"
 tool, and shouldn't.
 
+Smalltalk source uses CR (carriage return, `\r`) as the line
+separator, not LF. When compiling methods, ensure multi-line source
+strings use CRs between lines.
+
 #### You can detect and manipulate unhandled exceptions
 
 In source code you evaluate, "self" is bound to an instance of a
@@ -272,7 +277,9 @@ about these facilities.
 
 ### You can use Smalltalk MCP tools
 
-Ensure that every class you create is commented.
+Do not use the "evaluate" MCP tool to compile methods. Instead, use
+the "compile" MCP tool. Ensure that every class you create is
+commented.
 
 ## development of Orbit itself
 
@@ -315,6 +322,44 @@ the page), install it first by injecting the script into the page's
 `<head>` and writing/refreshing the source file. Treat this overlay
 as part of the page contract: it must never go stale while you are
 driving the mouse.
+
+### clicking inside the Squeak canvas — coordinate mapping
+
+The SqueakJS canvas is inside an iframe within `#embeddedSqueak`.
+Playwright `page.mouse.click(x, y)` uses **CSS pixel** coordinates
+relative to the page viewport. Screenshots returned by
+`screenshot_page` are in **device pixels** (CSS × `devicePixelRatio`,
+typically 2.5 on a Retina display). To click a point you identified
+in a screenshot, divide by `devicePixelRatio` first.
+
+**Squeak world coordinates → CSS click coordinates:**
+
+```
+cssX = iframeRect.left + squeakX
+cssY = iframeRect.top  + squeakY
+```
+
+where `iframeRect` is `document.querySelector('#embeddedSqueak
+iframe').getBoundingClientRect()`. Squeak coordinates are 1:1 with the
+canvas pixels (no additional scaling).
+
+**Do not guess button positions from screenshots.** Instead, query
+Squeak for the bounds of the target morph using `mcp_caffeine_evaluate`,
+then convert. For example, to find a button in a notifier:
+
+```smalltalk
+| notifier buttons |
+notifier := Project current world submorphs detect: [:m |
+  (m isKindOf: SystemWindow) and: [m label beginsWith: 'Halt:']
+] ifNone: [nil].
+buttons := notifier allMorphs select: [:m |
+  m isKindOf: PluggableButtonMorph or: [m isKindOf: SimpleButtonMorph]
+].
+buttons collect: [:b | {b class name. b bounds printString. b label}]
+```
+
+Then compute the center of the desired button's bounds and apply the
+mapping above.
 
 ### script injection
 

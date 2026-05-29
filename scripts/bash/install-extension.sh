@@ -9,7 +9,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-WEBSITE="$SCRIPT_DIR/../website"
+WEBSITE="$SCRIPT_DIR/../../website"
 
 . "$SCRIPT_DIR/_symlink-extension.sh"
 

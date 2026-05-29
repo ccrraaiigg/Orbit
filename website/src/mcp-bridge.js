@@ -547,4 +547,4 @@ class McpBridge {
     }
 }
 
-module.exports = { McpBridge };
+module.exports = { McpBridge, objectFromTetherEncodedJSON };
