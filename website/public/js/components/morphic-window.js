@@ -98,20 +98,28 @@ class MorphicWindow extends HTMLElement {
   }
 
   static _updateOcclusionShields() {
-    // For each non-Caffeine chromed morphic-window, toggle `inert` on
-    // slotted children so the first click into an occluded window raises
-    // it without passing the event into the content.
+    // For each non-Caffeine morphic-window, use actual rect-overlap
+    // occlusion (not mere z-order) to decide whether clicks should
+    // pass through. When not occluded, all clicks reach content.
+    // When occluded, clicks are blocked (chromed: inert children) or
+    // limited to the titlebar drag strip (chromeless: .occluded class).
     var all = MorphicWindow._allWindows();
     for (var i = 0; i < all.length; i++) {
       var w = all[i];
       if (w.tagName.toLowerCase() === 'transient-window') continue;
       if (w.id === 'embeddedSqueak') continue;
-      if (w.hasAttribute('chromeless')) continue;
-      var isFront = w._isFrontMostMorphic();
+      var occluded = w.isOccluded();
+      if (w.hasAttribute('chromeless')) {
+        // Toggle .occluded so CSS can switch pointer-events on the
+        // title-text drag strip: none when not occluded (all clicks
+        // pass through to content), auto when occluded (titlebar drag).
+        w.classList.toggle('occluded', occluded);
+        continue;
+      }
       var children = w.children;
       for (var j = 0; j < children.length; j++) {
         if (children[j].slot) continue;
-        if (isFront) {
+        if (!occluded) {
           children[j].removeAttribute('inert');
         } else {
           children[j].setAttribute('inert', '');
@@ -180,20 +188,11 @@ class MorphicWindow extends HTMLElement {
     MorphicWindow._updateOcclusionShields();
   }
 
-  // True iff no other morphic-window (transients excluded) has a
-  // z-index strictly greater than this one's.
+  // True iff this window is not visually occluded (no higher-z window
+  // overlaps its rect). Used by occlusion guards to decide whether
+  // clicks should pass through without raising.
   _isFrontMostMorphic() {
-    var myZ = parseInt(this.style.zIndex, 10) || 0;
-    var all = MorphicWindow._allWindows();
-    for (var i = 0; i < all.length; i++) {
-      var w = all[i];
-      if (w === this) continue;
-      if (w.tagName.toLowerCase() === 'transient-window') continue;
-      if (w.id === 'embeddedSqueak') continue;
-      var z = parseInt(w.style.zIndex, 10) || 0;
-      if (z > myZ) return false;
-    }
-    return true;
+    return !this.isOccluded();
   }
 
   // Freeze (snapshot + overlay) every chromeless morphic-window with
@@ -762,6 +761,8 @@ class MorphicWindow extends HTMLElement {
     // need to remove them. Only listeners attached to objects that outlive
     // this element (window, document) need explicit cleanup.
     window.removeEventListener('resize', this._onViewportResize);
+    // Recalculate occlusion so the next window in line becomes non-inert.
+    MorphicWindow._updateOcclusionShields();
   }
 
   attributeChangedCallback(name) {
@@ -957,6 +958,9 @@ class MorphicWindow extends HTMLElement {
           pointer-events: auto;
           cursor: grab;
         }
+        :host([chromeless]:not(.occluded)) .titlebar > .title-text {
+          pointer-events: none;
+        }
         .titlebar {
           position: absolute;
           top: 0;
@@ -1132,40 +1136,54 @@ class MorphicWindow extends HTMLElement {
       this.addEventListener('pointerdown', function(e) {
         if (!self.hasAttribute('chromeless')) return;
         if (self._isFrontMostMorphic()) return;
+        // If the event targets the title-text drag strip, raise the
+        // window but let the event continue so the titlebar drag
+        // handler can initiate a move gesture.
+        var titleText = self.shadowRoot.querySelector('.title-text');
+        var isTitleTextHit = titleText && e.composedPath().indexOf(titleText) !== -1;
         MorphicWindow._freezeUpperOverlappingChromeless(self);
         self._bringToFront();
-        // Tell the remote SystemWindow to activate itself, instead of
-        // letting the click reach the canvas (which would translate into
-        // a mouse event in Squeak/Morphic at the pointer's world coords —
-        // possibly landing on a fragment of an overlapping window and
-        // raising the wrong one). Stop the event so the canvas never
-        // sees this pointerdown.
         self._activateRemoteWindow();
-        try { e.stopPropagation(); e.stopImmediatePropagation(); } catch (_) {}
-        try { e.preventDefault(); } catch (_) {}
+        if (!isTitleTextHit) {
+          try { e.stopPropagation(); e.stopImmediatePropagation(); } catch (_) {}
+          try { e.preventDefault(); } catch (_) {}
+        }
       }, true);
     }
 
     // Non-Caffeine chromed window occlusion guard: when this window is
-    // not front-most, slotted children are marked `inert` so the first
-    // pointerdown hits the host's capture listener (which raises the
-    // window) without reaching the content. Also raises when behind
-    // embeddedSqueak even if front among chromed windows.
+    // occluded (visually overlapped by a higher window), the first
+    // pointerdown raises it. Slotted children are `inert` so the event
+    // hits this capture listener. If the pointerdown is on the titlebar,
+    // let it through so the drag handler can start a move.
     if (!this._chromedOcclusionGuardInstalled) {
       this._chromedOcclusionGuardInstalled = true;
       this.addEventListener('pointerdown', function(e) {
         if (self.hasAttribute('chromeless')) return;
         if (self.id === 'embeddedSqueak') return;
-        var es = document.getElementById('embeddedSqueak');
-        var behindES = es && (parseInt(es.style.zIndex, 10) || 0) >= (parseInt(self.style.zIndex, 10) || 0);
-        if (!behindES && self._isFrontMostMorphic()) return;
-        // Consume the first click so it raises without passing through.
-        e.stopPropagation();
-        e.stopImmediatePropagation();
-        e.preventDefault();
+        if (!self.isOccluded()) return;
+        // Raise the window. If the pointerdown landed on the titlebar,
+        // let the event continue so the drag handler can start a move.
+        var titlebar = self.shadowRoot.querySelector('.titlebar');
+        var isTitlebarHit = titlebar && e.composedPath().indexOf(titlebar) !== -1;
         self._bringToFront();
+        if (!isTitlebarHit) {
+          e.stopPropagation();
+          e.stopImmediatePropagation();
+          e.preventDefault();
+        }
       }, true);
       MorphicWindow._updateOcclusionShields();
+    }
+
+    // Recalculate occlusion when the mouse enters this window. This
+    // ensures that after a window closes, the next window the mouse
+    // hovers over becomes non-inert without requiring a click.
+    if (!this._pointerEnterOcclusionInstalled) {
+      this._pointerEnterOcclusionInstalled = true;
+      this.addEventListener('pointerenter', function() {
+        MorphicWindow._updateOcclusionShields();
+      });
     }
 
     // embeddedSqueak reclaim: when the Caffeine canvas is clicked while a
@@ -1529,6 +1547,7 @@ class MorphicWindow extends HTMLElement {
   //                 onto the original target once we know the user
   //                 isn't dragging.
   //   opt-click  -> collapse
+  //   ctrl-click -> send to back (non-iframe windows only)
   //
   // Installed once at the window level (capture phase) so it runs
   // before per-instance pointerdown handlers (transient-window and
@@ -1684,16 +1703,30 @@ class MorphicWindow extends HTMLElement {
     // dispatched after a cmd-click would re-enter _beginArming and
     // loop forever.
     if (e.isTrusted === false) return;
-    var meta = !!e.metaKey, alt = !!e.altKey;
-    // Only handle plain cmd or plain opt (and never with ctrl).
-    if (e.ctrlKey) return;
-    var n = (meta?1:0) + (alt?1:0);
+    var meta = !!e.metaKey, alt = !!e.altKey, ctrl = !!e.ctrlKey;
+    // Handle plain cmd, plain opt, or plain ctrl (never combinations).
+    var n = (meta?1:0) + (alt?1:0) + (ctrl?1:0);
     if (n !== 1) return;
     if (e.button !== 0) return;
     var win = sourceIframe
       ? MorphicWindow._findWindowAncestor(sourceIframe)
       : MorphicWindow._findWindowInPath(e.composedPath());
     if (!win) return;
+    if (ctrl) {
+      // ctrl-click sends the window to back, but only for windows
+      // that don't have an iframe as their slotted content (i.e. not
+      // the Caffeine window, whose ctrl-clicks belong to Squeak).
+      if (win.querySelector('iframe')) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      e.stopPropagation();
+      // Suppress the rest of the gesture (pointerup/mouseup/click)
+      // so nothing leaks to content or other handlers.
+      MorphicWindow._suppressNextGestureTail();
+      win._sendToBack();
+      win.dispatchEvent(new CustomEvent('morphic-send-to-back', { bubbles: true }));
+      return;
+    }
     if (alt) {
       e.preventDefault();
       e.stopImmediatePropagation();
@@ -1924,6 +1957,28 @@ class MorphicWindow extends HTMLElement {
   // state lives in MorphicWindow._armState.
   static forceDisarmAll() {
     MorphicWindow._endArming();
+  }
+
+  // Suppress the remaining events in a pointer gesture (pointerup,
+  // mouseup, click) after a modifier-click that was fully handled on
+  // pointerdown/mousedown. Installs one-shot capture-phase listeners
+  // that eat the next occurrence of each event type and then remove
+  // themselves.
+  static _suppressNextGestureTail() {
+    var types = ['pointerup', 'mouseup', 'click', 'contextmenu'];
+    types.forEach(function(type) {
+      var handler = function(ev) {
+        ev.preventDefault();
+        ev.stopImmediatePropagation();
+        ev.stopPropagation();
+        window.removeEventListener(type, handler, true);
+      };
+      window.addEventListener(type, handler, true);
+      // Safety: auto-remove after 2s in case the events never fire.
+      setTimeout(function() {
+        window.removeEventListener(type, handler, true);
+      }, 2000);
+    });
   }
 
   // Dispatch a synthetic cmd-click sequence on `target`. Used when a

@@ -278,8 +278,11 @@ about these facilities.
 ### You can use Smalltalk MCP tools
 
 Do not use the "evaluate" MCP tool to compile methods. Instead, use
-the "compile" MCP tool. Ensure that every class you create is
-commented.
+the "compile" MCP tool.
+
+Ensure that every class you create is commented.
+
+Keep all your VisualWorks code in the "Snowglobe" package.
 
 ## development of Orbit itself
 
@@ -360,6 +363,29 @@ buttons collect: [:b | {b class name. b bounds printString. b label}]
 
 Then compute the center of the desired button's bounds and apply the
 mapping above.
+
+### unoccluded window screenshots
+
+Each Snowglobe-mapped remote window has its own `<canvas>` element,
+but the backing store is managed by an OffscreenCanvas worker.
+Playwright's `element.screenshot()` clips to the DOM-reported canvas
+size (which may be stale), and `canvas.toDataURL()` returns
+incomplete frames from the worker. The only reliable capture is a
+full-viewport `screenshot_page` (no element selector), which reads
+the actual compositor output.
+
+To capture a specific window without occlusion:
+
+1. Hide overlapping elements with `visibility: hidden` (no layout
+   shift, minimal flash):
+   - `<morphic-window>` elements that overlap the target (excluding
+     the target itself and `#embeddedSqueak`)
+   - `#dashboard icon-manager` if it overlaps
+2. Use `screenshot_page` with no selector (full viewport).
+3. Immediately restore `visibility` on all hidden elements.
+
+Never use `setViewportSize` to work around capture issues — it
+desynchronizes the page from the Integrated Browser panel.
 
 ### script injection
 

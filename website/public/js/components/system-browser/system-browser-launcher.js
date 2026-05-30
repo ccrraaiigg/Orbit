@@ -55,7 +55,7 @@ window.SystemBrowserLauncher = (function () {
 
     // 1. Ensure the web component class is registered.
     if (!customElements.get('system-browser')) {
-      await loadScript('/js/components/system-browser.js');
+      await loadScript('/js/components/system-browser/system-browser.js');
       await new Promise(r => requestAnimationFrame(r));
     }
 

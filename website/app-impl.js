@@ -275,63 +275,9 @@ app.get('/workspace-fs/*', (req, res) => {
 // endpoint over the Tether protocol; see src/mcp-bridge.js.
 // bin/www calls app.attachMcpBridge(server) after the http.Server is
 // created so the bridge can install its `upgrade` listener.
-const { McpBridge, objectFromTetherEncodedJSON } = require('./src/mcp-bridge');
+const { McpBridge } = require('./src/mcp-bridge');
 const mcpBridge = new McpBridge({ extensionPath: __dirname });
 app.use(mcpBridge.middleware());
-
-// VW System Browser RPC: lets the <system-browser> web component call
-// methods on VW's BrowserWebComponentAdapter via the tether. The bridge
-// forwards calls through SqueakJS to VW and returns JSON responses.
-// No MCP involved — pure tether message-sends through SqueakJS relay.
-const browserSSEClients = new Map(); // adapterHash → [res, ...]
-
-app.post('/orbit-browser-rpc', async (req, res) => {
-  const tether = mcpBridge.pageTether();
-  if (!tether) {
-    return res.status(503).json({ error: 'No tether connection (page not loaded?)' });
-  }
-
-  const { method, params } = req.body || {};
-
-  try {
-    // Send a browserRpc: message to SqueakJS, which relays to VW
-    const payload = JSON.stringify({ method, params: params || {} });
-    const raw = await mcpBridge.forwardCall(tether, 'browserRpc:', [payload]);
-    const result = objectFromTetherEncodedJSON(raw);
-    return res.json(result);
-  } catch (e) {
-    console.error('[browser-rpc]', e.message || e);
-    return res.status(502).json({ error: e.message || 'RPC failed' });
-  }
-});
-
-// SSE endpoint for VW→JS push notifications (phase 2)
-app.get('/orbit-browser-events', (req, res) => {
-  const adapter = req.query.adapter;
-  if (!adapter) return res.status(400).end();
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive'
-  });
-  res.write(': connected\n\n');
-  const clients = browserSSEClients.get(adapter) || [];
-  clients.push(res);
-  browserSSEClients.set(adapter, clients);
-  req.on('close', () => {
-    const arr = browserSSEClients.get(adapter) || [];
-    browserSSEClients.set(adapter, arr.filter(r => r !== res));
-  });
-});
-
-// Helper to push events to browser SSE clients (called by VW via tether)
-app.pushBrowserEvent = function(adapterHash, selector, args) {
-  const clients = browserSSEClients.get(String(adapterHash)) || [];
-  const data = JSON.stringify({ selector, args });
-  for (const c of clients) {
-    try { c.write(`data: ${data}\n\n`); } catch (_) {}
-  }
-};
 app.attachMcpBridge = function (server) {
   mcpBridge.attachToHttpServer(server);
 };

@@ -88,7 +88,7 @@ class SystemBrowser extends HTMLElement {
   set classes(arr) { this._classes = arr || []; this._renderList('classes'); }
 
   get protocols() { return this._protocols.slice(); }
-  set protocols(arr) { this._protocols = arr || []; this._renderList('protocols'); }
+  set protocols(arr) { this._protocols = arr || []; this._selectedProtocol = -1; this._renderList('protocols'); }
 
   get methods() { return this._methods.slice(); }
   set methods(arr) { this._methods = arr || []; this._selectedMethod = -1; this._renderList('methods'); }

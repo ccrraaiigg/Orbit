@@ -9,7 +9,7 @@
 //   VWSystemBrowserLauncher.open()
 //
 // The launcher:
-//  1. Connects a VWBrowserTether to the bridge
+//  1. Gets the shared VWBrowserTether from the icon manager
 //  2. Asks VW to create a BrowserWebComponentAdapter (exposed on the tether)
 //  3. Intercepts <system-browser> events, sends them to VW, applies responses
 
@@ -21,6 +21,7 @@ window.VWSystemBrowserLauncher = (function () {
   const CONTENT_ID = 'vw-sb-content';
 
   let _tether = null;
+  let _adapterHash = null;
   let _lastMouseX = 200, _lastMouseY = 200;
 
   document.addEventListener('mousemove', (e) => {
@@ -35,16 +36,11 @@ window.VWSystemBrowserLauncher = (function () {
 
     // 1. Ensure the web component class is registered.
     if (!customElements.get('system-browser')) {
-      await _loadScript('/js/components/system-browser.js');
+      await _loadScript('/js/components/system-browser/system-browser.js');
       await new Promise(r => requestAnimationFrame(r));
     }
 
-    // 2. Ensure the tether client is loaded.
-    if (!window.VWBrowserTether) {
-      await _loadScript('/js/vw-browser-tether.js');
-    }
-
-    // 3. Create (or reuse) the morphic-window + system-browser pair.
+    // 2. Create (or reuse) the morphic-window + system-browser pair.
     let mw = document.getElementById(WINDOW_ID);
     let sb;
     if (!mw) {
@@ -64,32 +60,37 @@ window.VWSystemBrowserLauncher = (function () {
       sb = document.getElementById(CONTENT_ID);
     }
 
-    // 4. Close on morphic-close.
+    // 3. Close on morphic-close.
     if (!mw._closeWired) {
       mw._closeWired = true;
       mw.addEventListener('morphic-close', () => {
         mw.remove();
-        if (_tether) { _tether.disconnect(); _tether = null; }
+        _tether = null;
+        _adapterHash = null;
       });
     }
 
-    // 5. Connect tether and create the VW adapter.
+    // 4. Get the shared tether from the icon manager.
     try {
-      _tether = new VWBrowserTether();
-      const initResult = await _tether.connect();
+      const im = document.querySelector('icon-manager');
+      if (!im || !im.tether) throw new Error('No shared tether available');
+      _tether = im.tether;
+
+      const initResult = await _tether.sendToTether('createBrowserAdapter', []);
+      _adapterHash = initResult.exposureHash;
 
       // Populate the initial categories list
       sb.packages = initResult.categories || [];
 
-      // 6. Wire events from the component to tether calls
-      _wireEvents(sb, _tether);
+      // 5. Wire events from the component to tether calls
+      _wireEvents(sb);
 
-      // 7. Register push notification handler
+      // 6. Register push notification handler
       _tether.onPush((selector, args) => {
         _handlePush(sb, selector, args);
       });
 
-      // 8. Bring to front
+      // 7. Bring to front
       if (typeof mw._bringToFront === 'function') mw._bringToFront();
 
     } catch (e) {
@@ -100,30 +101,28 @@ window.VWSystemBrowserLauncher = (function () {
     return sb;
   }
 
-  // ---- VW adapter initialization ----
+  // ---- Send to the browser adapter via the shared tether ----
 
-  async function _initAdapter(tether) {
-    // Create the VW-side BrowserWebComponentAdapter
-    const result = await tether.connect();
-    return result;
+  function _send(selector, args) {
+    return _tether.sendTo(_adapterHash, selector, args || []);
   }
 
   // ---- Event wiring ----
 
-  function _wireEvents(sb, tether) {
+  function _wireEvents(sb) {
     // Override dispatchEvent to intercept browser events
     const origDispatch = HTMLElement.prototype.dispatchEvent.bind(sb);
     sb.dispatchEvent = function (evt) {
       if (evt.type === 'browser-select') {
-        _handleSelect(sb, tether, evt.detail);
+        _handleSelect(sb, evt.detail);
         return true;
       }
       if (evt.type === 'browser-side') {
-        _handleSideToggle(sb, tether, evt.detail);
+        _handleSideToggle(sb, evt.detail);
         return true;
       }
       if (evt.type === 'browser-comment') {
-        _handleComment(sb, tether);
+        _handleComment(sb);
         return true;
       }
       if (evt.type === 'browser-source-change') {
@@ -137,21 +136,21 @@ window.VWSystemBrowserLauncher = (function () {
     sb.addEventListener('keydown', (e) => {
       if ((e.metaKey || e.ctrlKey) && e.key === 's') {
         e.preventDefault();
-        _acceptSource(sb, tether);
+        _acceptSource(sb);
       }
     });
   }
 
-  async function _handleSelect(sb, tether, detail) {
+  async function _handleSelect(sb, detail) {
     const { pane, value } = detail;
 
     if (value == null) {
       // Deselection
       if (pane === 'methods') {
-        const result = await tether.send('deselectMethod', []);
-        if (result.source !== undefined) sb.source = result.source;
+        const result = await _send('deselectMethod', []);
+        if (result.source !== undefined) _setSource(sb, result);
       } else if (pane === 'protocols') {
-        const result = await tether.send('deselectProtocol', []);
+        const result = await _send('deselectProtocol', []);
         if (result.methods) sb.methods = result.methods;
         if (result.comment !== undefined) sb.commentText = result.comment;
       }
@@ -170,7 +169,7 @@ window.VWSystemBrowserLauncher = (function () {
 
         case 'packages':
         case 'categories':
-          result = await tether.send('selectCategory:', [val]);
+          result = await _send('selectCategory:', [val]);
           if (result.classes) sb.classes = result.classes;
           sb.protocols = [];
           sb.methods = [];
@@ -178,21 +177,21 @@ window.VWSystemBrowserLauncher = (function () {
           break;
 
         case 'classes':
-          result = await tether.send('selectClass:', [val]);
+          result = await _send('selectClass:', [val]);
           if (result.protocols) sb.protocols = result.protocols;
-          if (result.source !== undefined) sb.source = result.source;
           if (result.side) sb.side = result.side;
+          sb.commentText = result.comment || 'This class has no comment.';
           sb.methods = [];
           break;
 
         case 'protocols':
-          result = await tether.send('selectProtocol:', [val]);
+          result = await _send('selectProtocol:', [val]);
           if (result.methods) sb.methods = result.methods;
           break;
 
         case 'methods':
-          result = await tether.send('selectMethod:', [val]);
-          if (result.source !== undefined) sb.source = result.source;
+          result = await _send('selectMethod:', [val]);
+          if (result.source !== undefined) _setSource(sb, result);
           break;
       }
 
@@ -203,9 +202,9 @@ window.VWSystemBrowserLauncher = (function () {
     }
   }
 
-  async function _handleSideToggle(sb, tether, detail) {
+  async function _handleSideToggle(sb, detail) {
     try {
-      const result = await tether.send('toggleSide', []);
+      const result = await _send('toggleSide', []);
       if (result.protocols) sb.protocols = result.protocols;
       if (result.methods) sb.methods = result.methods;
       if (result.source !== undefined) sb.source = result.source;
@@ -215,21 +214,21 @@ window.VWSystemBrowserLauncher = (function () {
     }
   }
 
-  async function _handleComment(sb, tether) {
+  async function _handleComment(sb) {
     try {
-      const result = await tether.send('showComment', []);
+      const result = await _send('showComment', []);
       if (result.comment !== undefined) sb.commentText = result.comment;
     } catch (e) {
       sb.statusText = 'Error: ' + e.message;
     }
   }
 
-  async function _acceptSource(sb, tether) {
+  async function _acceptSource(sb) {
     const source = sb.source;
     if (!source) return;
     sb.statusText = 'Compiling...';
     try {
-      const result = await tether.send('acceptSource:', [source]);
+      const result = await _send('acceptSource:', [source]);
       if (result.success) {
         sb.statusText = 'Compiled.';
       } else {
@@ -266,6 +265,80 @@ window.VWSystemBrowserLauncher = (function () {
   }
 
   // ---- helpers ----
+
+  // VW CodeHighlightingParser token type → CSS style map
+  const _tokenStyles = {
+    code_unaryMethodName:       'font-weight:bold',
+    code_keywordMethodName:     'font-weight:bold',
+    code_binaryMethodName:      'font-weight:bold',
+    code_comment:               'color:#555;font-style:italic',
+    code_string:                'color:darkgreen',
+    code_symbol:                'color:darkgreen',
+    code_number:                'color:darkgreen',
+    code_character:             'color:darkgreen',
+    code_array:                 'color:darkgreen',
+    code_byteArray:             'color:darkgreen',
+    code_true:                  'color:darkgreen',
+    code_false:                 'color:darkgreen',
+    code_nil:                   'color:darkgreen',
+    code_qualifiedReference:    'color:darkgreen',
+    code_self:                  'color:blue',
+    code_super:                 'color:blue',
+    code_thisContext:           'color:blue',
+    code_classReference:        'color:brown',
+    code_sharedVariableReference: 'color:darkcyan',
+    code_nameSpaceReference:    'color:blue',
+    code_instanceVariable:      'color:navy',
+    code_temporaryVariable:     'color:darkmagenta',
+    code_temporaryVariableDefinition: 'color:darkmagenta',
+    code_methodVariableDefinition: 'font-weight:bold;color:darkmagenta',
+    code_blockArgument:         'color:darkmagenta',
+    code_return:                'font-weight:bold',
+    code_primitive:             'color:darkred',
+    code_syntaxError:           'text-decoration:underline wavy red',
+    code_dnu:                   'text-decoration:underline wavy red',
+    code_undeclaredVariable:    'text-decoration:underline wavy red',
+    code_redefinedVariableDefinition: 'text-decoration:underline wavy red',
+  };
+
+  function _highlightRunsToHTML(source, runsJSON) {
+    let runs;
+    try { runs = JSON.parse(runsJSON); } catch (_) { return null; }
+    const parts = [];
+    let pos = 0;
+    for (const [len, token] of runs) {
+      const chunk = source.substring(pos, pos + len);
+      const escaped = chunk
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+      const style = token ? _tokenStyles[token] : null;
+      if (style) {
+        parts.push(`<span style="${style}">${escaped}</span>`);
+      } else {
+        parts.push(escaped);
+      }
+      pos += len;
+    }
+    // Append any trailing unhighlighted text
+    if (pos < source.length) {
+      parts.push(source.substring(pos)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;'));
+    }
+    return parts.join('');
+  }
+
+  function _setSource(sb, result) {
+    const source = typeof result === 'string' ? result : result.source;
+    const highlights = typeof result === 'string' ? null : result.highlights;
+    if (highlights) {
+      const html = _highlightRunsToHTML(source, highlights);
+      if (html) { sb.sourceHTML = html; return; }
+    }
+    sb.source = source;
+  }
 
   function _loadScript(src) {
     return new Promise((resolve, reject) => {
