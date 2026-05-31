@@ -2,6 +2,10 @@
 	"folders": [
 		{
 			"path": "."
+		},
+		{
+			"name": "Smalltalk-2300-ui",
+			"uri": "orbit-webdav://2300-ui/"
 		}
 	],
 	"settings": {

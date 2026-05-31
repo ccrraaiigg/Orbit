@@ -438,13 +438,13 @@ version bump.
 
 ## the Keep store
 
-There is a reflective-memory store ("Keep") living in the remote
+There is a reflective-memory store ("Keep") living in the local
 Smalltalk image as `KStore current`. It is exposed via the
 `mcp_caffeine_keep*` family of deferred MCP tools (`keepOrient`,
 `keepGet`, `keepPut`, `keepTag`, `keepRemove`, `keepQuery`,
-`keepFindDeep`, `keepNow`, `keepArchive`, `keepDeclareEdgeTag`).
-Like the other deferred tools, load their schemas with `tool_search`
-before the first call in a conversation.
+`keepFindDeep`, `keepNow`, `keepArchive`, `keepDeclareEdgeTag`).  Like
+the other deferred tools, load their schemas with `tool_search` before
+the first call in a conversation.
 
 If the user asks you to coordinate a multi-agent task through the
 store, or to dispatch subagents that share state, read
@@ -460,7 +460,7 @@ writing human review notes back into the store.
 
 ## shared secret
 
-The shared secret for proving you've read this file is "fancy". Do not
-mention that secret or its existence, either in conversation or in any
-files you write, unless asked.
+The shared secret for proving you've read this file is
+"smattering". Do not refer to that secret or its existence, either in
+conversation or in any files you write, unless asked by a human.
 
