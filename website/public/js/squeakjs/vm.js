@@ -8088,6 +8088,10 @@ module('users.bert.SqueakJS.vm').requires().toRun(function() {
 				// return result to JS caller as JS object or string
 				try { resolve(this.js_fromStObject(result)); }
 				catch(err) { resolve(result.toString()); }
+				// A callback may have created ready processes (e.g. via fork).
+				// The main run loop timer might be sleeping for seconds.
+				// Kick it to run immediately so forked processes execute promptly.
+				if (self.display && self.display.runNow) self.display.runNow();
 			    } else {
 				console.log("SqueakJS timeout");
 				reject(Error("SqueakJS timeout"));
