@@ -362,7 +362,7 @@ class MarkdownViewer extends HTMLElement {
       if (inCode) { codeBuf.push(ln); continue; }
       var h = /^(#{1,6})\s+(.*)$/.exec(ln);
       if (h) { flushPara();
-        out.push('<h' + h[1].length + '>' + esc(h[2]) +
+        out.push('<h' + h[1].length + '>' + h[2] +
                  '</h' + h[1].length + '>');
         continue;
       }

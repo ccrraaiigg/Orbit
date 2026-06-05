@@ -261,6 +261,10 @@ Smalltalk source uses CR (carriage return, `\r`) as the line
 separator, not LF. When compiling methods, ensure multi-line source
 strings use CRs between lines.
 
+In a method, you must declare all temporary variables in a single
+pipe-delimited section at the beginning. You cannot have multiple
+temporary variable declaration sections.
+
 #### You can detect and manipulate unhandled exceptions
 
 In source code you evaluate, "self" is bound to an instance of a
@@ -457,6 +461,36 @@ team left behind in the store ("what did the catalog-1 worker find?",
 the tag vocabulary (`topic`, `phase`, `agent`, `act`, `type`,
 `status`), the four-tool reviewer subset, and the conventions for
 writing human review notes back into the store.
+
+### Keep audit trail
+
+The Keep store lives only in volatile image memory until explicitly
+snapshotted. To enable crash recovery, every `keepPut` or `keepTag`
+operation MUST be followed by an append to the audit trail file
+`./audit/YYYY-MM-DD-keep-ops.jsonl` (use the date of the first
+entry in the file; don't start a new file mid-session).
+
+**Required fields for `put` entries:**
+
+```json
+{"op":"put","id":"<note-id>","ts":"<ISO8601>","agent":"<agent>","summary":"<summary>","tags":{...},"content":"<full note content>"}
+```
+
+Every `put` entry MUST include the full `content` and `tags` fields —
+these are the recovery payload. An entry without `content` is useless
+for crash recovery. Copy the content exactly as passed to `keepPut`.
+
+**Required fields for `tag` entries:**
+
+```json
+{"op":"tag","id":"<note-id>","ts":"<ISO8601>","tags":{...}}
+```
+
+**Rules:**
+- One JSON object per line, no trailing comma.
+- Newlines within `content` must be escaped as `\n` (standard JSON).
+- After a confirmed image snapshot, the audit file may be deleted.
+- Never delete the audit file without user consent.
 
 ## shared secret
 

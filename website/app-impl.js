@@ -315,6 +315,35 @@ app.put('/caffeine-bounds.json', (req, res) => {
   }
 });
 
+// File upload: accepts PUT /upload/<filename> with a raw binary body
+// and writes it to the uploads/ directory. Gated by bridge access
+// (loopback or bearer). The filename is sanitized to prevent path
+// traversal.
+const UPLOADS_DIR = path.join(__dirname, 'public', 'uploads');
+app.put('/upload/:filename', (req, res) => {
+  if (!allowBridgeAccess(req, res)) return;
+  const basename = path.basename(req.params.filename);
+  if (!basename || basename === '.' || basename === '..') {
+    return res.status(400).json({ error: 'invalid filename' });
+  }
+  try { fsmod.mkdirSync(UPLOADS_DIR, { recursive: true }); } catch (_) {}
+  const chunks = [];
+  req.on('data', (chunk) => chunks.push(chunk));
+  req.on('end', () => {
+    const buf = Buffer.concat(chunks);
+    const dest = path.join(UPLOADS_DIR, basename);
+    try {
+      fsmod.writeFileSync(dest, buf);
+      res.json({ ok: true, path: '/uploads/' + basename, size: buf.length });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+  req.on('error', (err) => {
+    res.status(500).json({ error: err.message });
+  });
+});
+
 // Mount point for routes registered later by the Orbit extension
 // (e.g. /mcp-events SSE). Mounted before the 404 catchall so
 // late-added routes still match.

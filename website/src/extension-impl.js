@@ -79,8 +79,8 @@ module.exports = function (vscode) {
     // the local Orbit webserver port (8089).
     const ORBIT_WEB_PORT = 8089;
     const BACKENDS = [
-        { name: '2300-backend', kind: 'tcp',    mcpPort: 15072, webdavPort: 19072 },
-        { name: '2300-ui',      kind: 'tcp',    mcpPort: 15070, webdavPort: 19070 },
+        { name: '2300-backend', kind: 'tcp',    mcpPort: 15072, webdavPort: 19072, toolPrefix: '2300-backend', proxyPort: 15172 },
+        { name: '2300-ui',      kind: 'tcp',    mcpPort: 15070, webdavPort: 19070, toolPrefix: '2300-ui',      proxyPort: 15170 },
         { name: 'Caffeine',     kind: 'bridge' }
     ];
 
@@ -125,6 +125,13 @@ module.exports = function (vscode) {
             // because VS Code's MCP HTTP client appears to silently
             // refuse to POST initialize to a bare-IP loopback URL.
             return `http://localhost:${ORBIT_WEB_PORT}${ep}`;
+        }
+        // Route TCP backends through their per-backend proxy server
+        // (own port → own origin → isolated OAuth). Fall back to
+        // direct URL if proxies aren't running yet.
+        if (mcpProxies && mcpProxies.has(backend.name)) {
+            const p = mcpProxies.get(backend.name);
+            return `http://localhost:${p.port}/mcpservice/v1/mcp`;
         }
         return `http://${mcpHost}:${backend.mcpPort}/mcpservice/v1/mcp`;
     }
@@ -202,6 +209,10 @@ module.exports = function (vscode) {
     }
 
     let server = null;
+    // Per-backend MCP proxy servers (Map<name, {port, server}>),
+    // started in startServer(). Each proxy gives a TCP backend its
+    // own origin so OAuth discovery is isolated.
+    let mcpProxies = null;
     // Reference to the WebDAV FileSystemProvider, set when activate()
     // registers it. Module-scoped so the orbit web server's
     // /fs-changed route (registered in startServer) can call back into
@@ -275,6 +286,16 @@ module.exports = function (vscode) {
     // EXPLICIT_STOP_TTL_MS is ignored.
     const EXPLICIT_STOP_KEY = 'orbit.explicitlyStoppedAt';
     const EXPLICIT_STOP_TTL_MS = 2 * 1000;
+
+    // workspaceState key: timestamp (ms since epoch) set just before
+    // addWebdavWorkspaceFolders() in a single-root workspace. Adding
+    // folders to a single-root workspace (no .code-workspace file)
+    // transitions VS Code to multi-root mode, which restarts the
+    // extension host. This flag tells the subsequent activate() to
+    // auto-start Orbit so the user doesn't see it stop and stay
+    // stopped. The TTL is generous enough to survive the restart.
+    const RUNNING_BEFORE_RELOAD_KEY = 'orbit.runningBeforeReload';
+    const RUNNING_BEFORE_RELOAD_TTL_MS = 10 * 1000;
 
     // MCP server visibility/availability. The MCP definition provider
     // returns the orbit backend definitions only while `mcpEnabled` is
@@ -924,6 +945,17 @@ module.exports = function (vscode) {
         return out;
     }
 
+    // True when the workspace is single-root (no .code-workspace file).
+    // Adding folders via updateWorkspaceFolders in this mode causes
+    // VS Code to transition to multi-root, which restarts the
+    // extension host.
+    function isSingleRootWorkspace() {
+        // workspaceFile is undefined in single-folder mode, has a
+        // file: URI when a saved .code-workspace is open, or untitled:
+        // for an unsaved multi-root workspace.
+        return !vscode.workspace.workspaceFile;
+    }
+
     async function addWebdavWorkspaceFolders() {
         // Probe all backends and add a folder per reachable one.
         // Folders for unreachable backends are skipped, and any stale
@@ -1200,6 +1232,23 @@ module.exports = function (vscode) {
 
             const app = require(path.join(context.extensionPath, 'app'));
             currentApp = app;
+
+            // Start per-backend MCP reverse-proxy servers so each
+            // gets a unique serverInfo.name (and thus a distinct tool
+            // prefix in VS Code). Each proxy listens on its own port
+            // so OAuth discovery works independently per backend.
+            // Awaited in the server.listen callback below so that
+            // mcpProxies is populated before startServer resolves —
+            // activateReachableBackends needs proxy ports when
+            // building MCP definition URLs.
+            let startProxiesFn;
+            try {
+                startProxiesFn = require(
+                    path.join(context.extensionPath, 'src', 'mcp-proxy')).startProxies;
+            } catch (e) {
+                orbitError('[orbit] MCP proxy require failed:', e && e.message);
+            }
+
             // Hook the McpBridge so a fresh page-MCP announce can
             // refire VS Code's MCP definitions (used to expose the
             // Caffeine backend). We install the hook here because
@@ -1390,12 +1439,33 @@ module.exports = function (vscode) {
                 catch (e) { orbitError('[orbit] attachSnowglobeServer failed:', e && e.message); }
             }
 
-            server.listen(8089, () => {
+            server.listen(8089, async () => {
                 const addr = server.address();
                 setRunningContext(true);
                 vscode.window.showInformationMessage(`Orbit running on port ${addr.port}`);
                 if (openBrowser) {
                     showOrbitBrowser(orbitUrl(addr.port));
+                }
+                // Start the MCP reverse proxies and wait for them so
+                // mcpProxies is set before we resolve — callers
+                // (orbit.start, autoStart) immediately run
+                // activateReachableBackends which needs proxy ports.
+                if (startProxiesFn) {
+                    try {
+                        const proxies = await startProxiesFn(BACKENDS, {
+                            mcpHost,
+                            log: (...a) => orbitLog('[mcp-proxy]', ...a),
+                            error: (...a) => orbitError('[mcp-proxy]', ...a)
+                        });
+                        mcpProxies = proxies;
+                        orbitLog('[orbit] MCP proxies started: ' +
+                            [...proxies.entries()].map(([n, p]) => `${n}→:${p.port}`).join(', '));
+                        if (mcpDefinitionsChanged) {
+                            try { mcpDefinitionsChanged.fire(); } catch (_) {}
+                        }
+                    } catch (e) {
+                        orbitError('[orbit] MCP proxy start failed:', e && e.message);
+                    }
                 }
                 resolve();
             });
@@ -1437,14 +1507,20 @@ module.exports = function (vscode) {
             // by stale vscode.lm.tools entries cached from a
             // previous session.
             const tools = (vscode.lm && vscode.lm.tools) || [];
-            const prefix = `mcp_${name}_`.toLowerCase();
+            // VS Code names tools using the server's serverInfo.name
+            // (normalized: non-word chars → '_'), not the definition
+            // name we pass to McpHttpServerDefinition. Use the
+            // backend's toolPrefix when available.
+            const backend = backendByName(name);
+            const prefix = backend && backend.toolPrefix
+                ? `mcp_${backend.toolPrefix}_`.toLowerCase()
+                : `mcp_${name}_`.toLowerCase();
             let hasTool = false;
             for (const t of tools) {
                 const n = ((t && t.name) || '').toLowerCase();
                 if (n.startsWith(prefix)) { hasTool = true; break; }
             }
             if (!hasTool) return false;
-            const backend = backendByName(name);
             if (backend && backend.kind === 'bridge') {
                 return bridgeVscodeConnected(backend);
             }
@@ -1470,7 +1546,12 @@ module.exports = function (vscode) {
             if (backend && backend.kind === 'bridge') {
                 return isMcpServerActuallyRunning(name);
             }
-            const toolName = `mcp_${name}_echoMessage`;
+            // Use the backend's toolPrefix (derived from the server's
+            // serverInfo.name) rather than the definition name, since
+            // VS Code names tools from serverInfo.name.
+            const pfx = backend && backend.toolPrefix
+                ? backend.toolPrefix : name;
+            const toolName = `mcp_${pfx}_echoMessage`;
             const tools = (vscode.lm && vscode.lm.tools) || [];
             const tool = tools.find(t => t && t.name === toolName);
             if (!tool) return false;
@@ -1504,28 +1585,18 @@ module.exports = function (vscode) {
     async function activateReachableBackends() {
         // Reconcile cached running flags with reality, but only
         // for backends we don't already believe to be running.
-        // Once we've successfully connected an MCP server, we treat
-        // it as sticky: heartbeating a connected server can trigger
-        // VS Code's OAuth flow to re-prompt the user if the token
-        // has expired or the MCP client has dropped, which violates
-        // the contract that an MCP server stays connected until the
-        // user clicks Stop Orbit or quits VS Code. So we only probe
-        // backends whose state is currently "not running"; ones
-        // already marked running stay that way until an explicit
-        // stop (setRunning(false) or orbit.stop) clears the flag.
+        // We verify with an actual echoMessage round-trip — not
+        // just vscode.lm.tools presence (which retains stale entries
+        // after a window reload). If echoMessage succeeds, VS Code
+        // genuinely has an active MCP client connection.
         for (const b of BACKENDS) {
             if (mcpRunning[b.name]) continue;
-            // Don't reconcile bridge backends from a bare tether
-            // presence — the tether attaches before VS Code starts
-            // the server, so flipping mcpRunning here would cause
-            // the startServer step below to skip them and VS Code
-            // would never actually start the bridge backend.
             if (b.kind === 'bridge') continue;
-            const actual = await isMcpServerConnected(b.name);
-            if (actual) {
+            const connected = await isMcpServerConnected(b.name);
+            if (connected) {
                 mcpRunning[b.name] = true;
                 notifyMcpState(b.name, true);
-                orbitLog(`[orbit] activateReachableBackends: ${b.name} running=true (reconciled)`);
+                orbitLog(`[orbit] activateReachableBackends: ${b.name} running=true (reconciled via echoMessage)`);
             }
         }
         const probes = await Promise.all(BACKENDS.map(async (b) => {
@@ -1647,11 +1718,24 @@ module.exports = function (vscode) {
     let mcpDisconnectWatcher = null;
     function startMcpDisconnectWatcher() {
         if (mcpDisconnectWatcher) return;
-        mcpDisconnectWatcher = setInterval(() => {
+        mcpDisconnectWatcher = setInterval(async () => {
             try {
                 let changed = false;
                 for (const b of BACKENDS) {
                     if (!mcpRunning[b.name]) continue;
+                    // For TCP backends, combine tool-presence with a
+                    // TCP probe. Multiple backends may share the same
+                    // serverInfo.name (and tool prefix), so tool
+                    // presence alone is ambiguous.
+                    if (b.kind !== 'bridge') {
+                        const portUp = await probeTcp(mcpHost, b.mcpPort, 800);
+                        if (portUp) continue;
+                        mcpRunning[b.name] = false;
+                        notifyMcpState(b.name, false);
+                        changed = true;
+                        orbitLog(`[orbit] mcpDisconnectWatcher: ${b.name} port ${b.mcpPort} unreachable; marking not running`);
+                        continue;
+                    }
                     if (isMcpServerActuallyRunning(b.name)) continue;
                     mcpRunning[b.name] = false;
                     notifyMcpState(b.name, false);
@@ -1830,12 +1914,16 @@ module.exports = function (vscode) {
             }
             // Mount the WebDAV folders once. Smalltalk-side changes
             // are pushed via POST /fs-changed, so no polling.
-            if (webdavMountEnabled()) {
+            // Skip in single-root mode: adding folders would transition
+            // VS Code to multi-root and restart the extension host.
+            if (webdavMountEnabled() && !isSingleRootWorkspace()) {
                 try { await addWebdavWorkspaceFolders(); }
                 catch (e) {
                     orbitError('[orbit] orbit.start: addWebdavWorkspaceFolders failed:',
                         e && e.message);
                 }
+            } else if (webdavMountEnabled() && isSingleRootWorkspace()) {
+                orbitLog('[orbit] orbit.start: skipping WebDAV mount (single-root workspace; save as workspace file to enable)');
             }
             scheduleBackendActivationRetries();
             startMcpDisconnectWatcher();
@@ -1856,6 +1944,13 @@ module.exports = function (vscode) {
                 server.close();
                 server = null;
                 currentApp = null;
+                // Stop per-backend MCP proxy servers
+                if (mcpProxies) {
+                    const { stopProxies } = require(
+                        path.join(context.extensionPath, 'src', 'mcp-proxy'));
+                    stopProxies(mcpProxies);
+                    mcpProxies = null;
+                }
                 setRunningContext(false);
                 stopMcpDisconnectWatcher();
                 // Drop cached app.js and route modules so the next start
@@ -2106,10 +2201,10 @@ module.exports = function (vscode) {
                 // Stop Orbit or quits VS Code, so once mcpRunning
                 // is true we leave it true; it only flips false on
                 // explicit stop (setRunning(false) or orbit.stop).
-                // For backends not yet marked running, a heartbeat
-                // is safe (and useful: it picks up a server that
-                // VS Code connected to without going through our
-                // setRunning path, e.g. after window reload).
+                // For backends not yet marked running, use an
+                // actual echoMessage round-trip to confirm VS Code
+                // has a live MCP client connection (not stale
+                // vscode.lm.tools entries from a previous session).
                 const servers = orbitRunning
                     ? await Promise.all(mcpServers.map(async (s) => {
                         if (mcpRunning[s.name]) {
@@ -2128,6 +2223,7 @@ module.exports = function (vscode) {
                     type: 'state',
                     orbitRunning,
                     webdavEnabled: webdavMountEnabled(),
+                    singleRoot: isSingleRootWorkspace(),
                     servers
                 };
                 try { currentWebviewView.webview.postMessage(payload); } catch (_) {}
@@ -2197,6 +2293,12 @@ module.exports = function (vscode) {
     font-size: inherit;
   }
   .footer-button:hover { background: var(--vscode-button-hoverBackground); }
+  .note {
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.85em;
+    line-height: 1.35;
+    margin: 4px 0 0 22px;
+  }
 </style>
 </head>
 <body>
@@ -2206,6 +2308,9 @@ module.exports = function (vscode) {
   <div id="webdav-row" class="server">
     <input type="checkbox" id="webdav-toggle">
     <label for="webdav-toggle" class="name">mount Smalltalk folders</label>
+  </div>
+  <div id="webdav-note" class="note" style="display:none">
+    Save this folder as a workspace file (<em>File → Save Workspace As…</em>) to enable Smalltalk folder mounting.
   </div>
   <hr id="hr-top">
   <div id="mcp-section-label" class="section-label">remote systems</div>
@@ -2229,10 +2334,13 @@ module.exports = function (vscode) {
 
   function render(state) {
     toggleBtn.textContent = state.orbitRunning ? 'Stop Orbit' : 'Start Orbit';
-    webdavCb.checked = !!state.webdavEnabled;
+    webdavCb.checked = !!state.webdavEnabled && !state.singleRoot;
+    webdavCb.disabled = !!state.singleRoot;
     const showWebdav = !!state.orbitRunning;
     document.getElementById('webdav-section-label').style.display = showWebdav ? '' : 'none';
     document.getElementById('webdav-row').style.display = showWebdav ? '' : 'none';
+    const noteEl = document.getElementById('webdav-note');
+    noteEl.style.display = (showWebdav && state.singleRoot) ? '' : 'none';
     const hasServers = state.orbitRunning && state.servers && state.servers.length > 0;
     document.getElementById('hr-top').style.display = hasServers ? '' : 'none';
     document.getElementById('mcp-section-label').style.display = hasServers ? '' : 'none';
@@ -2333,9 +2441,9 @@ module.exports = function (vscode) {
                                 return;
                             }
                             try {
-                                if (desired) {
+                                if (desired && !isSingleRootWorkspace()) {
                                     await addWebdavWorkspaceFolders();
-                                } else {
+                                } else if (!desired) {
                                     removeWebdavWorkspaceFolders();
                                 }
                             } catch (e) {
@@ -2744,16 +2852,16 @@ module.exports = function (vscode) {
                     orbitLog('[orbit] MCP provider: reachable=' +
                         JSON.stringify(reachable.map(b => b.name)));
                     return reachable.map(b => {
+                        // TCP backends must go through their proxy so
+                        // serverInfo.name gets rewritten (distinct tool
+                        // prefix). Skip them until proxies are ready —
+                        // we'll re-fire mcpDefinitionsChanged once
+                        // startProxies completes.
+                        if (b.kind === 'tcp' && !(mcpProxies && mcpProxies.has(b.name))) {
+                            return null;
+                        }
                         const url = mcpUrlFor(b);
                         if (!url) return null;
-                        // Bridge-kind backends are reachable only on
-                        // loopback (the Orbit webserver), so the bridge
-                        // accepts loopback POSTs without a bearer. We
-                        // deliberately do not pass a headers argument
-                        // here — the McpHttpServerDefinition
-                        // constructor's 3rd positional arg appears to
-                        // make VS Code silently fail to issue the
-                        // initialize POST.
                         orbitLog(`[orbit] MCP def for ${b.name}: url=${url}`);
                         return new vscode.McpHttpServerDefinition(
                             b.name,
@@ -2785,7 +2893,17 @@ module.exports = function (vscode) {
                         cfg.globalValue          !== undefined ? cfg.globalValue :
                         undefined);
                     const effective = (explicit !== undefined) ? !!explicit : isDeveloperInstall(context);
-                    if (!effective) return false;
+                    if (!effective) {
+                        // Even if the normal autoStart check fails, honour
+                        // the "was running before reload" flag (set when
+                        // orbit.start added WebDAV folders to a single-root
+                        // workspace, triggering an extension host restart).
+                        const ts = +context.workspaceState.get(RUNNING_BEFORE_RELOAD_KEY, 0) || 0;
+                        if (ts > 0 && (Date.now() - ts) < RUNNING_BEFORE_RELOAD_TTL_MS) {
+                            return true;
+                        }
+                        return false;
+                    }
                     const stoppedAt = +context.workspaceState
                         .get(EXPLICIT_STOP_KEY, 0) || 0;
                     if (stoppedAt > 0
@@ -2815,12 +2933,25 @@ module.exports = function (vscode) {
         // toggles the WebDAV mount on via the webview. Any stale
         // orbit-webdav folders persisted in the workspace file from a
         // previous session are removed here so a fresh reload starts
-        // with no Smalltalk filesystems mounted.
-        try {
-            removeWebdavWorkspaceFolders();
-        } catch (e) {
-            orbitError('[orbit] webdav folder cleanup on activate failed:',
-                e && e.message);
+        // with no Smalltalk filesystems mounted — UNLESS the reload
+        // was triggered by the single-root → multi-root transition
+        // that orbit.start itself initiated (in which case the
+        // folders should stay).
+        const reloadFlagFresh = (() => {
+            try {
+                const ts = +context.workspaceState.get(RUNNING_BEFORE_RELOAD_KEY, 0) || 0;
+                return ts > 0 && (Date.now() - ts) < RUNNING_BEFORE_RELOAD_TTL_MS;
+            } catch (_) { return false; }
+        })();
+        if (reloadFlagFresh) {
+            orbitLog('[orbit] webdav folder cleanup skipped (workspace-transition reload in progress)');
+        } else {
+            try {
+                removeWebdavWorkspaceFolders();
+            } catch (e) {
+                orbitError('[orbit] webdav folder cleanup on activate failed:',
+                    e && e.message);
+            }
         }
 
         // Auto-start the web server at activation time so that browser
@@ -2858,7 +2989,23 @@ module.exports = function (vscode) {
             if (explicitlyStopped) {
                 orbitLog('[orbit] auto-start skipped: user explicitly stopped Orbit before this activation');
             }
-            if (autoStart && !explicitlyStopped) {
+            // Detect restart caused by single-root → multi-root
+            // transition (addWebdavWorkspaceFolders in orbit.start set
+            // the flag just before the extension host was restarted).
+            const wasRunningBeforeReload = (() => {
+                try {
+                    const ts = +context.workspaceState.get(RUNNING_BEFORE_RELOAD_KEY, 0) || 0;
+                    if (ts > 0 && (Date.now() - ts) < RUNNING_BEFORE_RELOAD_TTL_MS) {
+                        context.workspaceState.update(RUNNING_BEFORE_RELOAD_KEY, 0);
+                        return true;
+                    }
+                } catch (_) {}
+                return false;
+            })();
+            if (wasRunningBeforeReload) {
+                orbitLog('[orbit] auto-start: Orbit was running before workspace-transition reload; restarting');
+            }
+            if ((autoStart || wasRunningBeforeReload) && !explicitlyStopped) {
                 // On a VS Code window reload, any Orbit browser tab
                 // the user had open is restored *before* this
                 // extension activates and starts the server, so the

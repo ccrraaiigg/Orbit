@@ -359,29 +359,7 @@ class IconManager extends HTMLElement {
     });
   }
 
-  _edgeCursorForPoint(clientX, clientY) {
-    var rect = this.getBoundingClientRect();
-    var x = clientX - rect.left;
-    var y = clientY - rect.top;
-    var edgeT = 5;
-    var cornerT = 7;
 
-    var nearLeftEdge = x >= 0 && x <= edgeT;
-    var nearRightEdge = x <= rect.width && x >= (rect.width - edgeT);
-    var nearTopEdge = y >= 0 && y <= edgeT;
-    var nearBottomEdge = y <= rect.height && y >= (rect.height - edgeT);
-
-    var nearLeftCorner = x >= 0 && x <= cornerT;
-    var nearRightCorner = x <= rect.width && x >= (rect.width - cornerT);
-    var nearTopCorner = y >= 0 && y <= cornerT;
-    var nearBottomCorner = y <= rect.height && y >= (rect.height - cornerT);
-
-    if ((nearTopCorner && nearLeftCorner) || (nearBottomCorner && nearRightCorner)) return 'nwse-resize';
-    if ((nearTopCorner && nearRightCorner) || (nearBottomCorner && nearLeftCorner)) return 'nesw-resize';
-    if (nearTopEdge || nearBottomEdge) return 'ns-resize';
-    if (nearLeftEdge || nearRightEdge) return 'ew-resize';
-    return '';
-  }
 
   _setCellCursors(cursor) {
     var cells = this.shadowRoot.querySelectorAll('.cell');
@@ -489,9 +467,6 @@ class IconManager extends HTMLElement {
       this._showIconifyCursor();
       return;
     }
-    var cursor = this._edgeCursorForPoint(e.clientX, e.clientY);
-    this.style.cursor = cursor;
-    this._setCellCursors(cursor);
   }
 
   _onCursorLeave() {

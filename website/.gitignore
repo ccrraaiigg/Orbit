@@ -5,3 +5,6 @@
 secrets/*.json
 !secrets/*.example.json
 secrets/mcp-bearer.txt
+
+# Uploaded files
+public/uploads/
