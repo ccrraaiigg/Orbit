@@ -2,7 +2,7 @@
     "name": "orbit-agentic-pair-programming-for-smalltalk",
     "displayName": "Orbit: Agentic Pair Programming for Smalltalk",
     "description": "A livecoding pair-programming harness for Smalltalk.",
-    "version": "1.131.0",
+    "version": "1.173.0",
     "publisher": "BlackPageDigital",
     "icon": "public/pictures/icons/participant/orbit.jpg",
     "engines": {
@@ -35,6 +35,7 @@
         "onCommand:orbit.openSteering",
         "onCommand:orbit.addWebdavFolder",
         "onCommand:orbit.refreshWebdav",
+        "onCommand:orbit.keepSync.getPeerInfo",
         "onMcpServerDefinitionProvider:orbitBackend",
         "onChatParticipant:orbit.orbit",
         "onChatParticipant:orbit.orbit-2300-backend",
@@ -54,6 +55,26 @@
                     "type": "boolean",
                     "default": true,
                     "description": "Add a workspace folder for each reachable Smalltalk WebDAV backend (orbit-webdav://<backend>/) when Orbit starts, and remove them when Orbit stops. Served by the in-process FileSystemProvider; no host-OS WebDAV client is required."
+                },
+                "orbit.keepSync.enabled": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Enable Keep synchronization with peers. When unchecked, the Keep store is local-only and no peer replication occurs."
+                },
+                "orbit.keepSync.org": {
+                    "type": "string",
+                    "default": "",
+                    "description": "GitHub organization for org-scoped Dev Tunnel access. When set, the extension automatically applies an org ACL to the tunnel so that only org members can reach the /keep-sync endpoint."
+                },
+                "orbit.keepSync.gistId": {
+                    "type": "string",
+                    "default": "",
+                    "description": "ID of the shared GitHub Gist used as the peer registry and ops replication log. Share this ID out-of-band with collaborators. If empty, the first peer to enable sync creates the Gist and stores its ID here."
+                },
+                "orbit.keepSync.pollIntervalMs": {
+                    "type": "number",
+                    "default": 60000,
+                    "description": "How often (in milliseconds) to poll peers for new Keep operations. Default 1 minute."
                 }
             }
         },
@@ -85,6 +106,10 @@
             {
                 "command": "orbit.refreshWebdav",
                 "title": "Orbit: Refresh WebDAV Folders"
+            },
+            {
+                "command": "orbit.keepSync.getPeerInfo",
+                "title": "Orbit: Get Keep Sync Peer Info"
             }
         ],
         "keybindings": [

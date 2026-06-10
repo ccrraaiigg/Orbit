@@ -203,12 +203,224 @@ module.exports = function (vscode) {
         return results.filter(r => r.reachable).map(r => r.backend);
     }
 
+    // Resolve the devtunnel CLI binary path (cross-platform).
+    async function findDevtunnelCli() {
+        const candidates = process.platform === 'win32'
+            ? ['devtunnel.exe']
+            : ['/opt/homebrew/bin/devtunnel', '/usr/local/bin/devtunnel', 'devtunnel'];
+        for (const c of candidates) {
+            if (path.isAbsolute(c)) {
+                try { await fs.promises.access(c); return c; }
+                catch (_) {}
+            } else {
+                return c; // bare name, assume in PATH
+            }
+        }
+        return null;
+    }
+
+    // Child process hosting the devtunnel. Killed on deactivate/stop.
+    let tunnelHostProcess = null;
+    // The devtunnel ID for the currently hosted tunnel.
+    let activeTunnelId = null;
+
+    // Keep sync controller instance. Created on server start if
+    // orbit.keepSync.gistId or orbit.keepSync.org is configured.
+    let keepSync = null;
+
+    // Start (or reuse) a dedicated Orbit dev tunnel that forwards
+    // the given port to localhost. Returns the tunnel's HTTPS URI,
+    // or null if the CLI is unavailable or hosting fails.
+    //
+    // Strategy:
+    //   1. Look for an existing tunnel labeled "orbit" + hostname.
+    //   2. If none exists, create one.
+    //   3. Ensure port is registered + org ACL applied.
+    //   4. Spawn `devtunnel host <tunnelId>` as a child process.
+    //   5. Parse the "Connect via browser:" line for the URI.
+    async function startTunnelHost(port) {
+        const { execFile, spawn } = require('child_process');
+        const DEVTUNNEL = await findDevtunnelCli();
+        if (!DEVTUNNEL) return null;
+
+        let loggedIn = false;
+        const execOnce = (args) => new Promise((resolve, reject) => {
+            execFile(DEVTUNNEL, args, { timeout: 15000 }, (err, stdout, stderr) => {
+                if (err) reject(new Error(stderr || err.message));
+                else resolve(stdout);
+            });
+        });
+        const exec = async (args) => {
+            try {
+                return await execOnce(args);
+            } catch (e) {
+                if (!loggedIn && /login token expired|unauthorized|login required/i.test(e.message)) {
+                    orbitLog('[orbit] devtunnel token expired, re-authenticating...');
+                    await execOnce(['login', '--github']);
+                    loggedIn = true;
+                    return await execOnce(args);
+                }
+                throw e;
+            }
+        };
+
+        const hostname = os.hostname().split('.')[0].toLowerCase();
+        const org = vscode.workspace.getConfiguration('orbit.keepSync').get('org');
+
+        // Find or create the Orbit tunnel
+        let tunnelId = null;
+        try {
+            const out = await exec(['list', '--json']);
+            const parsed = JSON.parse(out);
+            const tunnels = parsed.tunnels || parsed;
+            const existing = tunnels.find(t =>
+                (t.labels || []).includes('orbit') &&
+                (t.labels || []).includes(hostname)
+            );
+            if (existing) {
+                tunnelId = (existing.tunnelId || '').replace(/\.\w+$/, '');
+            }
+        } catch (_) {}
+
+        if (!tunnelId) {
+            try {
+                const out = await exec(['create', '--labels', 'orbit', '--labels', hostname, '--json']);
+                const parsed = JSON.parse(out);
+                const t = parsed.tunnel || parsed;
+                tunnelId = (t.tunnelId || '').replace(/\.\w+$/, '');
+                orbitLog(`[orbit] Created tunnel ${tunnelId}`);
+            } catch (e) {
+                orbitLog(`[orbit] Failed to create tunnel: ${e.message}`);
+                return null;
+            }
+        }
+
+        // Ensure port is registered
+        try {
+            const showOut = await exec(['show', tunnelId, '--json']);
+            const info = (JSON.parse(showOut)).tunnel || JSON.parse(showOut);
+            const hasPort = (info.ports || []).some(p => p.portNumber === port);
+            if (!hasPort) {
+                await exec(['port', 'create', tunnelId, '-p', String(port)]);
+                orbitLog(`[orbit] Registered port ${port} on tunnel ${tunnelId}`);
+            }
+        } catch (e) {
+            orbitLog(`[orbit] Port setup warning: ${e.message}`);
+        }
+
+        // Ensure org-scoped access
+        if (org) {
+            try {
+                await exec(['access', 'create', tunnelId, '--org', org]);
+                orbitLog(`[orbit] Org access set for ${org} on tunnel ${tunnelId}`);
+            } catch (e) {
+                const msg = e.message || '';
+                if (!msg.includes('already') && !msg.includes('exists')) {
+                    orbitLog(`[orbit] Org access warning: ${msg}`);
+                }
+            }
+        }
+
+        // Check if devtunnel host is already running for this tunnel
+        // (e.g. surviving from a previous extension activation)
+        activeTunnelId = tunnelId;
+        try {
+            const { execSync } = require('child_process');
+            const ps = execSync(`ps aux`, { encoding: 'utf8', timeout: 5000 });
+            if (ps.includes(`devtunnel host ${tunnelId}`)) {
+                // Already hosting — derive URI from `devtunnel show`
+                try {
+                    const showOut = await exec(['show', tunnelId, '--json']);
+                    const info = (JSON.parse(showOut)).tunnel || JSON.parse(showOut);
+                    const portInfo = (info.ports || []).find(p => p.portNumber === port);
+                    if (portInfo && portInfo.portForwardingUris && portInfo.portForwardingUris.length) {
+                        const uri = portInfo.portForwardingUris[0];
+                        orbitLog(`[orbit] Reattached to existing tunnel host: ${uri}`);
+                        return uri;
+                    }
+                } catch (_) {}
+                // Fallback: construct URI from clusterId
+                try {
+                    const showOut = await exec(['show', tunnelId, '--json']);
+                    const info = (JSON.parse(showOut)).tunnel || JSON.parse(showOut);
+                    const clusterId = info.clusterId || 'usw3';
+                    const uri = `https://${tunnelId.replace(/\./g, '')}-${port}.${clusterId}.devtunnels.ms`;
+                    orbitLog(`[orbit] Reattached to existing tunnel host (constructed): ${uri}`);
+                    return uri;
+                } catch (_) {}
+            }
+        } catch (_) {}
+
+        // Spawn `devtunnel host` and wait for the URI line
+        return new Promise((resolve) => {
+            const child = spawn(DEVTUNNEL, ['host', tunnelId], {
+                stdio: ['ignore', 'pipe', 'pipe'],
+                detached: false
+            });
+            let resolved = false;
+            let output = '';
+
+            const onData = (chunk) => {
+                output += chunk.toString();
+                // Look for: "Connect via browser: https://..., https://ID-PORT.REGION.devtunnels.ms"
+                const match = output.match(/https:\/\/([a-z0-9]+-\d+\.[a-z0-9]+\.devtunnels\.ms)/);
+                if (match && !resolved) {
+                    resolved = true;
+                    tunnelHostProcess = child;
+                    resolve('https://' + match[1]);
+                }
+            };
+            child.stdout.on('data', onData);
+            child.stderr.on('data', onData);
+
+            child.on('error', (err) => {
+                if (!resolved) {
+                    resolved = true;
+                    orbitLog(`[orbit] devtunnel host failed: ${err.message}`);
+                    resolve(null);
+                }
+            });
+            child.on('exit', (code) => {
+                tunnelHostProcess = null;
+                if (!resolved) {
+                    resolved = true;
+                    orbitLog(`[orbit] devtunnel host exited (code ${code})`);
+                    resolve(null);
+                }
+            });
+
+            // Timeout after 20s
+            setTimeout(() => {
+                if (!resolved) {
+                    resolved = true;
+                    orbitLog('[orbit] devtunnel host timed out waiting for URI');
+                    child.kill();
+                    resolve(null);
+                }
+            }, 20000);
+        });
+    }
+
+    // Stop the devtunnel host child process if running.
+    function stopTunnelHost() {
+        if (tunnelHostProcess) {
+            try { tunnelHostProcess.kill(); } catch (_) {}
+            tunnelHostProcess = null;
+        }
+    }
+
     function orbitUrl(port) {
         const base = `http://localhost:${port}/orbit.html`;
         return isDevHost ? `${base}?backend=192.168.1.140` : base;
     }
 
     let server = null;
+    // The tunnel URI for this instance's HTTP server, discovered via
+    // the devtunnel CLI. null when no tunnel is active. Other Orbit
+    // instances can reach this instance at this URI — access is
+    // restricted to members of the configured GitHub org by the
+    // Dev Tunnels relay (org-scoped ACL).
+    let tunnelUri = null;
     // Per-backend MCP proxy servers (Map<name, {port, server}>),
     // started in startServer(). Each proxy gives a TCP backend its
     // own origin so OAuth discovery is isolated.
@@ -1304,6 +1516,316 @@ module.exports = function (vscode) {
                 });
             });
 
+            // GET /keep-sync/status
+            //
+            // Peer discovery endpoint. Returns this instance's
+            // identity and tunnel information so other Orbit peers
+            // can verify reachability and negotiate sync.
+            // Access control is handled by the Dev Tunnels relay
+            // (org-scoped ACL) — no application-layer auth needed.
+            (app.extensionRoutes || app).get('/keep-sync/status', (req, res) => {
+                res.setHeader('Content-Type', 'application/json');
+                res.end(JSON.stringify({
+                    orbit: true,
+                    machineId: vscode.env.machineId,
+                    sessionId: vscode.env.sessionId,
+                    tunnelUri: tunnelUri || null,
+                    hostname: shortHostname,
+                    port: ORBIT_WEB_PORT
+                }));
+            });
+
+            // GET /keep-sync/ops?since=N
+            //
+            // Returns local Keep ops from the audit trail starting
+            // after line index N. Used by remote peers to pull ops
+            // directly via the tunnel.
+            (app.extensionRoutes || app).get('/keep-sync/ops', (req, res) => {
+                const since = parseInt(req.query.since, 10) || 0;
+                const ops = keepSync ? keepSync.readLocalOps(since) : [];
+                res.setHeader('Content-Type', 'application/json');
+                res.end(JSON.stringify({
+                    ops,
+                    total: keepSync ? keepSync.countLocalLines() : 0,
+                    hostname: shortHostname
+                }));
+            });
+
+            // POST /keep-sync/apply
+            //
+            // Applies a remote Keep op to the local image. Called by
+            // the sync module when consuming remote ops from the Gist
+            // or from a peer's tunnel. Body is a single op object.
+            (app.extensionRoutes || app).post('/keep-sync/apply', async (req, res) => {
+                const op = req.body;
+                if (!op || !op.op || !op.id) {
+                    res.statusCode = 400;
+                    res.end(JSON.stringify({ error: 'invalid op' }));
+                    return;
+                }
+
+                // Deduplicate: check if this op ID already exists in ANY audit file
+                const auditDir = path.join(
+                    vscode.workspace.workspaceFolders
+                        && vscode.workspace.workspaceFolders[0]
+                        && vscode.workspace.workspaceFolders[0].uri.fsPath
+                        || context.extensionPath,
+                    'audit');
+                try { fs.mkdirSync(auditDir, { recursive: true }); } catch (_) {}
+                const today = new Date().toISOString().slice(0, 10);
+                const auditFile = path.join(auditDir, `${today}-keep-ops.jsonl`);
+                try {
+                    const allAuditFiles = fs.readdirSync(auditDir)
+                        .filter(f => f.endsWith('-keep-ops.jsonl'));
+                    for (const af of allAuditFiles) {
+                        const content = fs.readFileSync(path.join(auditDir, af), 'utf8');
+                        if (content.includes(`"id":"${op.id}"`)) {
+                            res.setHeader('Content-Type', 'application/json');
+                            res.end(JSON.stringify({ applied: false, id: op.id, reason: 'duplicate' }));
+                            return;
+                        }
+                    }
+                } catch (_) {}
+
+                // Replay the op into the local Keep store via Caffeine MCP
+                try {
+                    const bridgeEp = bridgeEndpointFor(backendByName('Caffeine'));
+                    if (bridgeEp) {
+                        let toolName, toolArgs;
+                        if (op.op === 'put') {
+                            toolName = 'keepPut';
+                            toolArgs = {
+                                id: op.id,
+                                agent: op.agent || 'sync',
+                                content: op.content || '',
+                                summary: op.summary || '',
+                                tags: op.tags ? JSON.stringify(op.tags) : undefined
+                            };
+                        } else if (op.op === 'tag') {
+                            toolName = 'keepTag';
+                            toolArgs = {
+                                id: op.id,
+                                tags: op.tags ? JSON.stringify(op.tags) : '{}'
+                            };
+                        } else if (op.op === 'remove') {
+                            toolName = 'keepRemove';
+                            toolArgs = { id: op.id };
+                        }
+                        if (toolName) {
+                            const rpcBody = JSON.stringify({
+                                jsonrpc: '2.0',
+                                id: Date.now(),
+                                method: 'tools/call',
+                                params: { name: toolName, arguments: toolArgs }
+                            });
+                            await new Promise((resolve, reject) => {
+                                const r = require('http').request({
+                                    hostname: 'localhost',
+                                    port: ORBIT_WEB_PORT,
+                                    path: bridgeEp,
+                                    method: 'POST',
+                                    headers: {
+                                        'Content-Type': 'application/json',
+                                        'Content-Length': Buffer.byteLength(rpcBody)
+                                    }
+                                }, (resp) => {
+                                    let d = '';
+                                    resp.on('data', c => { d += c; });
+                                    resp.on('end', () => {
+                                        if (resp.statusCode >= 200 && resp.statusCode < 300) resolve(d);
+                                        else reject(new Error(`bridge ${resp.statusCode}: ${d.slice(0, 200)}`));
+                                    });
+                                });
+                                r.on('error', reject);
+                                r.write(rpcBody);
+                                r.end();
+                            });
+                            orbitLog(`[keep-sync] Replayed ${op.op} ${op.id} into local Keep`);
+                        }
+                    }
+                } catch (e) {
+                    orbitLog(`[keep-sync] Failed to replay op ${op.id}: ${e.message}`);
+                }
+
+                // Write to local audit trail with remote origin marker
+                const entry = JSON.stringify({ ...op, synced: true }) + '\n';
+                fs.appendFileSync(auditFile, entry);
+                res.setHeader('Content-Type', 'application/json');
+                res.end(JSON.stringify({ applied: true, id: op.id }));
+            });
+
+            // POST /keep-sync/exchange-token
+            //
+            // Token exchange endpoint for peer handshake. The caller
+            // sends their machineId and connectToken; we respond with
+            // ours. Both sides cache the received token locally.
+            (app.extensionRoutes || app).post('/keep-sync/exchange-token', async (req, res) => {
+                const { machineId, hostname, connectToken } = req.body || {};
+                if (!machineId || !connectToken) {
+                    res.statusCode = 400;
+                    res.end(JSON.stringify({ error: 'machineId and connectToken required' }));
+                    return;
+                }
+                // Store the peer's token locally
+                if (keepSync && keepSync.storePeerToken) {
+                    keepSync.storePeerToken(machineId, connectToken);
+                    orbitLog(`[keep-sync] Received token from ${hostname || machineId}`);
+                }
+                // Generate our own token to send back
+                let ourToken = null;
+                if (keepSync && keepSync.getLocalToken) {
+                    ourToken = await keepSync.getLocalToken();
+                }
+                res.setHeader('Content-Type', 'application/json');
+                res.end(JSON.stringify({
+                    machineId: vscode.env.machineId,
+                    hostname: shortHostname,
+                    connectToken: ourToken
+                }));
+            });
+
+            // POST /extension/install-vsix
+            //
+            // Accepts either:
+            //   (a) JSON body { url, token } — fetches the VSIX from
+            //       the given tunnel URL using the provided connect token
+            //   (b) Binary body (application/octet-stream) — raw VSIX
+            // Installs it into the local VS Code instance.
+            (app.extensionRoutes || app).post('/extension/install-vsix', (req, res) => {
+                const contentType = (req.headers['content-type'] || '').toLowerCase();
+
+                // If Express already parsed the JSON body, handle immediately
+                if (contentType.includes('application/json') && req.body && req.body.url) {
+                    (async () => {
+                        try {
+                            const body = req.body;
+                            let fetchToken = body.token;
+                            if (!fetchToken && keepSync && keepSync.getPeerTokenForUrl) {
+                                fetchToken = keepSync.getPeerTokenForUrl(body.url);
+                            }
+                            orbitLog(`[extension] Fetching VSIX from ${body.url}${fetchToken ? '' : ' (no token)'}`);
+                            const vsixBuf = await fetchVsixFromUrl(body.url, fetchToken);
+                            await installVsixBuffer(vsixBuf, res);
+                        } catch (e) {
+                            orbitLog(`[extension] VSIX install failed: ${e.message}`);
+                            res.statusCode = 500;
+                            res.end(JSON.stringify({ error: e.message }));
+                        }
+                    })();
+                    return;
+                }
+
+                // Fallback: read raw body (binary VSIX or unparsed JSON)
+                const chunks = [];
+                req.on('data', chunk => chunks.push(chunk));
+                req.on('end', async () => {
+                    try {
+                        let vsixBuf;
+
+                        if (contentType.includes('application/json')) {
+                            const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+                            if (!body.url) {
+                                res.statusCode = 400;
+                                res.end(JSON.stringify({ error: 'url required' }));
+                                return;
+                            }
+                            let fetchToken = body.token;
+                            if (!fetchToken && keepSync && keepSync.getPeerTokenForUrl) {
+                                fetchToken = keepSync.getPeerTokenForUrl(body.url);
+                            }
+                            orbitLog(`[extension] Fetching VSIX from ${body.url}${fetchToken ? '' : ' (no token)'}`);
+                            vsixBuf = await fetchVsixFromUrl(body.url, fetchToken);
+                        } else {
+                            vsixBuf = Buffer.concat(chunks);
+                        }
+
+                        await installVsixBuffer(vsixBuf, res);
+                    } catch (e) {
+                        orbitLog(`[extension] VSIX install failed: ${e.message}`);
+                        res.statusCode = 500;
+                        res.end(JSON.stringify({ error: e.message }));
+                    }
+                });
+            });
+
+            // Helper: install a VSIX buffer and respond
+            async function installVsixBuffer(vsixBuf, res) {
+                if (!vsixBuf || vsixBuf.length < 100) {
+                    res.statusCode = 400;
+                    res.end(JSON.stringify({ error: 'empty or too small' }));
+                    return;
+                }
+
+                const tmpDir = require('os').tmpdir();
+                const vsixPath = require('path').join(tmpDir, `orbit-pushed-${Date.now()}.vsix`);
+                fs.writeFileSync(vsixPath, vsixBuf);
+                orbitLog(`[extension] Received VSIX (${(vsixBuf.length / 1024).toFixed(0)} KB), installing from ${vsixPath}`);
+
+                const { execSync } = require('child_process');
+                let codeBin = 'code';
+                if (process.platform === 'win32') {
+                    const winPath = process.env.VSCODE_CWD
+                        ? require('path').join(process.env.VSCODE_CWD, 'bin', 'code.cmd')
+                        : 'code';
+                    codeBin = winPath;
+                }
+
+                const publisher = require(require('path').join(__dirname, '..', 'package.json')).publisher.toLowerCase();
+                const name = require(require('path').join(__dirname, '..', 'package.json')).name;
+                try { execSync(`"${codeBin}" --uninstall-extension ${publisher}.${name}`, { timeout: 30000 }); } catch (_) {}
+                execSync(`"${codeBin}" --install-extension "${vsixPath}" --force`, { timeout: 60000 });
+
+                orbitLog(`[extension] VSIX installed successfully. Reload window to activate.`);
+                try { fs.unlinkSync(vsixPath); } catch (_) {}
+
+                vscode.window.showInformationMessage(
+                    'Orbit extension updated by remote peer. Reload to activate?',
+                    'Reload'
+                ).then(choice => {
+                    if (choice === 'Reload') {
+                        vscode.commands.executeCommand('workbench.action.reloadWindow');
+                    }
+                });
+
+                res.setHeader('Content-Type', 'application/json');
+                res.end(JSON.stringify({ installed: true, size: vsixBuf.length }));
+            }
+
+            // Helper: fetch a VSIX from a tunnel URL (120s timeout)
+            function fetchVsixFromUrl(url, connectToken) {
+                const https = require('https');
+                const parsed = new URL(url);
+                const headers = {};
+                if (connectToken) {
+                    headers['X-Tunnel-Authorization'] = `tunnel ${connectToken}`;
+                }
+                return new Promise((resolve, reject) => {
+                    const req = https.get({
+                        hostname: parsed.hostname,
+                        port: 443,
+                        path: parsed.pathname + parsed.search,
+                        headers,
+                        timeout: 120000
+                    }, (response) => {
+                        if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+                            // Follow redirect
+                            fetchVsixFromUrl(response.headers.location, null).then(resolve).catch(reject);
+                            return;
+                        }
+                        if (response.statusCode !== 200) {
+                            reject(new Error(`HTTP ${response.statusCode} fetching VSIX`));
+                            return;
+                        }
+                        const chunks = [];
+                        response.on('data', chunk => chunks.push(chunk));
+                        response.on('end', () => resolve(Buffer.concat(chunks)));
+                        response.on('error', reject);
+                    });
+                    req.on('timeout', () => { req.destroy(); reject(new Error('VSIX fetch timed out (120s)')); });
+                    req.on('error', reject);
+                });
+            }
+
             // POST /fs-changed
             //
             // Server-side change notification from the Smalltalk image,
@@ -1467,12 +1989,57 @@ module.exports = function (vscode) {
                         orbitError('[orbit] MCP proxy start failed:', e && e.message);
                     }
                 }
+                // Start a dedicated Orbit dev tunnel that forwards
+                // port 8089 to localhost. Creates or reuses a tunnel
+                // labeled "orbit,<hostname>", applies org ACL, and
+                // spawns `devtunnel host` as a child process.
+                try {
+                    tunnelUri = await startTunnelHost(addr.port);
+                    if (tunnelUri) {
+                        orbitLog(`[orbit] Tunnel hosting: ${tunnelUri}`);
+                    } else {
+                        orbitLog('[orbit] No tunnel available; peer sync via Gist only');
+                    }
+                } catch (e) {
+                    tunnelUri = null;
+                    orbitLog(`[orbit] Tunnel start failed (non-fatal): ${e && e.message}`);
+                }
+                // Start Keep sync if configured and enabled
+                const syncCfg = vscode.workspace.getConfiguration('orbit.keepSync');
+                if (syncCfg.get('enabled', true) && (syncCfg.get('org') || syncCfg.get('gistId'))) {
+                    try {
+                        const createKeepSync = require(
+                            path.join(__dirname, 'keep-sync'));
+                        const auditDir = path.join(
+                            vscode.workspace.workspaceFolders
+                                && vscode.workspace.workspaceFolders[0]
+                                && vscode.workspace.workspaceFolders[0].uri.fsPath
+                                || context.extensionPath,
+                            'audit');
+                        keepSync = createKeepSync(vscode, {
+                            getPort: () => ORBIT_WEB_PORT,
+                            getTunnelUri: () => tunnelUri,
+                            getTunnelId: () => activeTunnelId,
+                            getHostname: () => shortHostname,
+                            getAuditDir: () => auditDir,
+                            orbitLog,
+                            findDevtunnelCli
+                        });
+                        await keepSync.start();
+                    } catch (e) {
+                        orbitLog(`[keep-sync] Start failed: ${e && e.message}`);
+                        keepSync = null;
+                    }
+                }
                 resolve();
             });
 
             server.on('error', (err) => {
                 vscode.window.showErrorMessage(`Orbit server error: ${err.message}`);
                 server = null;
+                tunnelUri = null;
+                stopTunnelHost();
+                if (keepSync) { keepSync.stop(); keepSync = null; }
                 setRunningContext(false);
                 resolve();
             });
@@ -1667,7 +2234,100 @@ module.exports = function (vscode) {
     // backend, etc.) still gets its MCP server started and WebDAV
     // folder mounted once it comes up. Backs off to a slow poll once
     // every backend is activated.
+
+    // Replay all ops from the local audit trail into the Keep store.
+    // Called once on startup after the Caffeine MCP bridge is available,
+    // to recover state lost by an un-snapshotted image reload.
+    async function replayAuditTrailIntoKeep() {
+        const bridgeEp = bridgeEndpointFor(backendByName('Caffeine'));
+        if (!bridgeEp) {
+            orbitLog('[keep-sync] Audit replay: Caffeine bridge not available');
+            return;
+        }
+        const auditDir = path.join(
+            vscode.workspace.workspaceFolders
+                && vscode.workspace.workspaceFolders[0]
+                && vscode.workspace.workspaceFolders[0].uri.fsPath
+                || context.extensionPath,
+            'audit');
+        let allOps = [];
+        try {
+            const files = fs.readdirSync(auditDir)
+                .filter(f => f.endsWith('-keep-ops.jsonl'))
+                .sort();
+            for (const f of files) {
+                const content = fs.readFileSync(path.join(auditDir, f), 'utf8');
+                for (const line of content.split('\n')) {
+                    if (!line.trim()) continue;
+                    try { allOps.push(JSON.parse(line)); }
+                    catch (_) {}
+                }
+            }
+        } catch (_) { return; }
+
+        if (allOps.length === 0) return;
+        orbitLog(`[keep-sync] Replaying ${allOps.length} ops from audit trail into Keep...`);
+
+        let replayed = 0;
+        for (const op of allOps) {
+            if (!op.op || !op.id) continue;
+            let toolName, toolArgs;
+            if (op.op === 'put') {
+                toolName = 'keepPut';
+                toolArgs = {
+                    id: op.id,
+                    agent: op.agent || 'sync',
+                    content: op.content || '',
+                    summary: op.summary || '',
+                    tags: op.tags ? JSON.stringify(op.tags) : undefined
+                };
+            } else if (op.op === 'tag') {
+                toolName = 'keepTag';
+                toolArgs = { id: op.id, tags: op.tags ? JSON.stringify(op.tags) : '{}' };
+            } else if (op.op === 'remove') {
+                toolName = 'keepRemove';
+                toolArgs = { id: op.id };
+            }
+            if (!toolName) continue;
+            const rpcBody = JSON.stringify({
+                jsonrpc: '2.0',
+                id: Date.now() + replayed,
+                method: 'tools/call',
+                params: { name: toolName, arguments: toolArgs }
+            });
+            try {
+                await new Promise((resolve, reject) => {
+                    const r = require('http').request({
+                        hostname: 'localhost',
+                        port: ORBIT_WEB_PORT,
+                        path: bridgeEp,
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Content-Length': Buffer.byteLength(rpcBody)
+                        }
+                    }, (resp) => {
+                        let d = '';
+                        resp.on('data', c => { d += c; });
+                        resp.on('end', () => {
+                            if (resp.statusCode >= 200 && resp.statusCode < 300) resolve(d);
+                            else reject(new Error(`bridge ${resp.statusCode}: ${d.slice(0, 200)}`));
+                        });
+                    });
+                    r.on('error', reject);
+                    r.write(rpcBody);
+                    r.end();
+                });
+                replayed++;
+            } catch (e) {
+                orbitLog(`[keep-sync] Replay failed for ${op.op} ${op.id}: ${e.message}`);
+            }
+        }
+        orbitLog(`[keep-sync] Audit replay complete: ${replayed}/${allOps.length} ops replayed`);
+    }
+
     let activateBackendsTimer = null;
+    let auditReplayFired = false;
     function scheduleBackendActivationRetries() {
         if (activateBackendsTimer) return;
         let attempt = 0;
@@ -1676,13 +2336,14 @@ module.exports = function (vscode) {
             let allUp = false;
             try { allUp = await activateReachableBackends(); }
             catch (e) { orbitError('[orbit] activation retry failed:', e && e.message); }
+            // Replay audit trail as soon as Caffeine is available
+            // (don't wait for TCP backends which may never come up).
+            if (!auditReplayFired && mcpRunning['Caffeine']) {
+                auditReplayFired = true;
+                replayAuditTrailIntoKeep().catch(e =>
+                    orbitLog(`[keep-sync] Audit replay failed: ${e && e.message}`));
+            }
             if (allUp) {
-                // All MCP backends are connected. Stop polling: any
-                // further activateReachableBackends call risks
-                // re-issuing workbench.mcp.startServer (which can
-                // trigger VS Code's OAuth re-prompt) if a heartbeat
-                // ever flaked. The user explicitly stops via the
-                // Stop Orbit button or by quitting VS Code.
                 activateBackendsTimer = null;
                 orbitLog('[orbit] activation retry: all backends up; stopping retry loop');
                 return;
@@ -1880,6 +2541,23 @@ module.exports = function (vscode) {
         );
         context.subscriptions.push(refreshWebdavCmd);
 
+        // Command: return peer sync info (tunnel URI + identity).
+        // Used by the Gist-based peer registry to publish this
+        // instance's connection details. No secrets returned —
+        // access control is enforced by the tunnel relay (org ACL).
+        const peerInfoCmd = vscode.commands.registerCommand(
+            'orbit.keepSync.getPeerInfo', () => {
+                return {
+                    tunnelUri: tunnelUri || null,
+                    machineId: vscode.env.machineId,
+                    sessionId: vscode.env.sessionId,
+                    hostname: shortHostname,
+                    port: ORBIT_WEB_PORT
+                };
+            }
+        );
+        context.subscriptions.push(peerInfoCmd);
+
         const startCmd = vscode.commands.registerCommand('orbit.start', async () => {
             orbitLog('[orbit] orbit.start: invoked');
             try { context.workspaceState.update(EXPLICIT_STOP_KEY, 0); } catch (_) {}
@@ -1943,6 +2621,9 @@ module.exports = function (vscode) {
             if (server) {
                 server.close();
                 server = null;
+                tunnelUri = null;
+                stopTunnelHost();
+                if (keepSync) { keepSync.stop(); keepSync = null; }
                 currentApp = null;
                 // Stop per-backend MCP proxy servers
                 if (mcpProxies) {
@@ -2224,6 +2905,7 @@ module.exports = function (vscode) {
                     orbitRunning,
                     webdavEnabled: webdavMountEnabled(),
                     singleRoot: isSingleRootWorkspace(),
+                    keepSyncEnabled: vscode.workspace.getConfiguration('orbit.keepSync').get('enabled', true),
                     servers
                 };
                 try { currentWebviewView.webview.postMessage(payload); } catch (_) {}
@@ -2312,6 +2994,12 @@ module.exports = function (vscode) {
   <div id="webdav-note" class="note" style="display:none">
     Save this folder as a workspace file (<em>File → Save Workspace As…</em>) to enable Smalltalk folder mounting.
   </div>
+  <hr id="hr-memory">
+  <div id="memory-section-label" class="section-label">memory</div>
+  <div id="memory-row" class="server">
+    <input type="checkbox" id="memory-toggle">
+    <label for="memory-toggle" class="name">share memory with other Orbits</label>
+  </div>
   <hr id="hr-top">
   <div id="mcp-section-label" class="section-label">remote systems</div>
   <div id="servers"></div>
@@ -2323,6 +3011,7 @@ module.exports = function (vscode) {
   const serversEl = document.getElementById('servers');
   const toggleBtn = document.getElementById('orbit-toggle');
   const webdavCb = document.getElementById('webdav-toggle');
+  const memoryCb = document.getElementById('memory-toggle');
 
   toggleBtn.addEventListener('click', () => {
     vscode.postMessage({ type: 'toggleOrbit' });
@@ -2330,6 +3019,10 @@ module.exports = function (vscode) {
 
   webdavCb.addEventListener('change', () => {
     vscode.postMessage({ type: 'toggleWebdav', desired: webdavCb.checked });
+  });
+
+  memoryCb.addEventListener('change', () => {
+    vscode.postMessage({ type: 'toggleKeepSync', desired: memoryCb.checked });
   });
 
   function render(state) {
@@ -2341,6 +3034,11 @@ module.exports = function (vscode) {
     document.getElementById('webdav-row').style.display = showWebdav ? '' : 'none';
     const noteEl = document.getElementById('webdav-note');
     noteEl.style.display = (showWebdav && state.singleRoot) ? '' : 'none';
+    const showMemory = !!state.orbitRunning;
+    document.getElementById('hr-memory').style.display = showMemory ? '' : 'none';
+    document.getElementById('memory-section-label').style.display = showMemory ? '' : 'none';
+    document.getElementById('memory-row').style.display = showMemory ? '' : 'none';
+    memoryCb.checked = !!state.keepSyncEnabled;
     const hasServers = state.orbitRunning && state.servers && state.servers.length > 0;
     document.getElementById('hr-top').style.display = hasServers ? '' : 'none';
     document.getElementById('mcp-section-label').style.display = hasServers ? '' : 'none';
@@ -2452,6 +3150,55 @@ module.exports = function (vscode) {
                             postState();
                             return;
                         }
+                        if (msg.type === 'toggleKeepSync') {
+                            const desired = !!msg.desired;
+                            try {
+                                await vscode.workspace
+                                    .getConfiguration('orbit')
+                                    .update(
+                                        'keepSync.enabled',
+                                        desired,
+                                        vscode.ConfigurationTarget.Global
+                                    );
+                            } catch (e) {
+                                orbitError('[orbit] keepSync.enabled update failed:', e && e.message);
+                                postState();
+                                return;
+                            }
+                            try {
+                                if (desired && !keepSync) {
+                                    const syncCfg = vscode.workspace.getConfiguration('orbit.keepSync');
+                                    if (syncCfg.get('org') || syncCfg.get('gistId')) {
+                                        const createKeepSync = require(
+                                            path.join(__dirname, 'keep-sync'));
+                                        const auditDir = path.join(
+                                            vscode.workspace.workspaceFolders
+                                                && vscode.workspace.workspaceFolders[0]
+                                                && vscode.workspace.workspaceFolders[0].uri.fsPath
+                                                || context.extensionPath,
+                                            'audit');
+                                        keepSync = createKeepSync(vscode, {
+                                            getPort: () => ORBIT_WEB_PORT,
+                                            getTunnelUri: () => tunnelUri,
+                                            getTunnelId: () => activeTunnelId,
+                                            getHostname: () => shortHostname,
+                                            getAuditDir: () => auditDir,
+                                            orbitLog,
+                                            findDevtunnelCli
+                                        });
+                                        await keepSync.start();
+                                    }
+                                } else if (!desired && keepSync) {
+                                    keepSync.stop();
+                                    keepSync = null;
+                                }
+                            } catch (e) {
+                                orbitError('[orbit] toggleKeepSync apply failed:', e && e.message);
+                                keepSync = null;
+                            }
+                            postState();
+                            return;
+                        }
                     });
 
                     webviewView.onDidDispose(() => {
@@ -2471,7 +3218,7 @@ module.exports = function (vscode) {
             mcpStateSubscribers.add(mcpRefresher);
 
             const cfgSub = vscode.workspace.onDidChangeConfiguration((e) => {
-                if (e.affectsConfiguration('orbit.mountWebdav')) postState();
+                if (e.affectsConfiguration('orbit.mountWebdav') || e.affectsConfiguration('orbit.keepSync.enabled')) postState();
             });
 
             const viewReg = vscode.window.registerWebviewViewProvider(
@@ -3045,6 +3792,8 @@ module.exports = function (vscode) {
         stopWorkspaceFsBridge();
         stopBackendActivationRetries();
         stopMcpDisconnectWatcher();
+        stopTunnelHost();
+        if (keepSync) { keepSync.stop(); keepSync = null; }
         if (server) {
             server.close();
             server = null;

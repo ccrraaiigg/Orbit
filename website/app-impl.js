@@ -320,6 +320,19 @@ app.put('/caffeine-bounds.json', (req, res) => {
 // (loopback or bearer). The filename is sanitized to prevent path
 // traversal.
 const UPLOADS_DIR = path.join(__dirname, 'public', 'uploads');
+
+// Permalink: /uploads/orbit-latest.vsix → latest versioned VSIX in uploads/
+app.get('/uploads/orbit-latest.vsix', (req, res) => {
+  try {
+    const files = fsmod.readdirSync(UPLOADS_DIR).filter(f => f.startsWith('orbit-') && f.endsWith('.vsix'));
+    if (files.length === 0) return res.status(404).json({ error: 'no VSIX staged' });
+    files.sort(); // lexicographic; version numbers ensure latest is last
+    res.redirect('/uploads/' + files[files.length - 1]);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.put('/upload/:filename', (req, res) => {
   if (!allowBridgeAccess(req, res)) return;
   const basename = path.basename(req.params.filename);

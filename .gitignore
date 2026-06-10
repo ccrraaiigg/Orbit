@@ -17,3 +17,8 @@ logs/
 
 commentary/
 audit/
+
+# Keep sync local state
+.keep-sync-peer-tokens.json
+.keep-sync-machine-id
+.keep-sync-gist-id

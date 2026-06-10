@@ -429,15 +429,16 @@ the status of all three sync targets:
 
 If you change anything under ./website/src/ (or anything else that
 ships inside the VSIX), the extension needs a rebuild. Do not stop at
-"the change is on disk" or tell the user "rebuild when you're ready"
-— always rebuild it yourself in the same turn, so the live VSCode
-extension matches the source. Run ./scripts/build-extension.sh,
-which bumps the version, packages a fresh VSIX, installs it, and
-re-establishes the livecoding symlinks.
+"the change is on disk" or tell the user "rebuild when you're ready" —
+always rebuild it yourself in the same turn, so the live VSCode
+extension matches the source. Run ./scripts/js/build-extension.js,
+which bumps the version, packages a fresh VSIX, installs it,
+re-establishes the livecoding symlinks, and pushes the VSIX to live
+Keep sync peers.
 
 If you only need to repair the livecoding symlinks against the
 already-installed VSIX (e.g. after a manual reinstall overwrote them),
-run ./scripts/install-extension.sh instead. It does no build and no
+run ./scripts/js/install-extension.js instead. It does no build and no
 version bump.
 
 ## the Keep store
