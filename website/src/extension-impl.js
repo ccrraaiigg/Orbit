@@ -2235,6 +2235,48 @@ module.exports = function (vscode) {
     // folder mounted once it comes up. Backs off to a slow poll once
     // every backend is activated.
 
+    // Open the Keep viewer on the Orbit page via the Caffeine MCP bridge.
+    async function openKeepViewerOnStartup() {
+        const bridgeEp = bridgeEndpointFor(backendByName('Caffeine'));
+        if (!bridgeEp) {
+            orbitLog('[keep-viewer] Caffeine bridge not available; skipping');
+            return;
+        }
+        const rpcBody = JSON.stringify({
+            jsonrpc: '2.0',
+            id: Date.now(),
+            method: 'tools/call',
+            params: { name: 'openKeepViewer', arguments: {} }
+        });
+        try {
+            await new Promise((resolve, reject) => {
+                const r = require('http').request({
+                    hostname: 'localhost',
+                    port: ORBIT_WEB_PORT,
+                    path: bridgeEp,
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Content-Length': Buffer.byteLength(rpcBody)
+                    }
+                }, (resp) => {
+                    let d = '';
+                    resp.on('data', c => { d += c; });
+                    resp.on('end', () => {
+                        if (resp.statusCode >= 200 && resp.statusCode < 300) resolve(d);
+                        else reject(new Error(`bridge ${resp.statusCode}: ${d.slice(0, 200)}`));
+                    });
+                });
+                r.on('error', reject);
+                r.write(rpcBody);
+                r.end();
+            });
+            orbitLog('[keep-viewer] Keep viewer opened on startup');
+        } catch (e) {
+            orbitLog(`[keep-viewer] Failed to open Keep viewer: ${e && e.message}`);
+        }
+    }
+
     // Replay all ops from the local audit trail into the Keep store.
     // Called once on startup after the Caffeine MCP bridge is available,
     // to recover state lost by an un-snapshotted image reload.
@@ -2336,12 +2378,15 @@ module.exports = function (vscode) {
             let allUp = false;
             try { allUp = await activateReachableBackends(); }
             catch (e) { orbitError('[orbit] activation retry failed:', e && e.message); }
-            // Replay audit trail as soon as Caffeine is available
-            // (don't wait for TCP backends which may never come up).
+            // Replay audit trail and open Keep viewer as soon as
+            // Caffeine is available (don't wait for TCP backends
+            // which may never come up).
             if (!auditReplayFired && mcpRunning['Caffeine']) {
                 auditReplayFired = true;
                 replayAuditTrailIntoKeep().catch(e =>
                     orbitLog(`[keep-sync] Audit replay failed: ${e && e.message}`));
+                openKeepViewerOnStartup().catch(e =>
+                    orbitLog(`[keep-viewer] Startup open failed: ${e && e.message}`));
             }
             if (allUp) {
                 activateBackendsTimer = null;
@@ -2962,6 +3007,20 @@ module.exports = function (vscode) {
     color: var(--vscode-descriptionForeground);
     font-size: 0.9em;
   }
+  .view-btn {
+    margin-left: auto;
+    cursor: pointer;
+    padding: 1px 6px;
+    border: 1px solid var(--vscode-button-border, transparent);
+    color: var(--vscode-button-foreground);
+    background: var(--vscode-button-background);
+    border-radius: 2px;
+    font-family: inherit;
+    font-size: 0.9em;
+  }
+  .view-btn:hover {
+    background: var(--vscode-button-hoverBackground);
+  }
   .footer-button {
     width: 100%;
     text-align: center;
@@ -2999,6 +3058,7 @@ module.exports = function (vscode) {
   <div id="memory-row" class="server">
     <input type="checkbox" id="memory-toggle">
     <label for="memory-toggle" class="name">share memory with other Orbits</label>
+    <button id="keep-view-btn" class="view-btn">view</button>
   </div>
   <hr id="hr-top">
   <div id="mcp-section-label" class="section-label">remote systems</div>
@@ -3023,6 +3083,10 @@ module.exports = function (vscode) {
 
   memoryCb.addEventListener('change', () => {
     vscode.postMessage({ type: 'toggleKeepSync', desired: memoryCb.checked });
+  });
+
+  document.getElementById('keep-view-btn').addEventListener('click', () => {
+    vscode.postMessage({ type: 'openKeepViewer' });
   });
 
   function render(state) {
@@ -3197,6 +3261,11 @@ module.exports = function (vscode) {
                                 keepSync = null;
                             }
                             postState();
+                            return;
+                        }
+                        if (msg.type === 'openKeepViewer') {
+                            openKeepViewerOnStartup().catch(e =>
+                                orbitLog(`[keep-viewer] Panel open failed: ${e && e.message}`));
                             return;
                         }
                     });

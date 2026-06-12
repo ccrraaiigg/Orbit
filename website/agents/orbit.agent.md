@@ -288,6 +288,23 @@ Ensure that every class you create is commented.
 
 Keep all your VisualWorks code in the "Snowglobe" package.
 
+### You can use a graph memory
+
+There is a reflective-memory store ("Keep") living in the local
+Smalltalk image as `KStore current`. It is exposed via the
+`mcp_caffeine_keep*` family of deferred MCP tools (`keepOrient`,
+`keepGet`, `keepPut`, `keepTag`, `keepRemove`, `keepQuery`,
+`keepFindDeep`, `keepNow`, `keepArchive`, `keepDeclareEdgeTag`).  Like
+the other deferred tools, load their schemas with `tool_search` before
+the first call in a conversation.
+
+Currently, the Keep store contains information about how to navigate
+the ControlWORKS documentation, synthesized insights about the
+documentation, design sketches, and critiques. It complements what you
+can learn by reading the running system sources, and you should
+augment it after learning something from the running system that
+required substantial reading.
+
 ## development of Orbit itself
 
 ### You have MCP access to SqueakJS also
@@ -442,14 +459,6 @@ run ./scripts/js/install-extension.js instead. It does no build and no
 version bump.
 
 ## the Keep store
-
-There is a reflective-memory store ("Keep") living in the local
-Smalltalk image as `KStore current`. It is exposed via the
-`mcp_caffeine_keep*` family of deferred MCP tools (`keepOrient`,
-`keepGet`, `keepPut`, `keepTag`, `keepRemove`, `keepQuery`,
-`keepFindDeep`, `keepNow`, `keepArchive`, `keepDeclareEdgeTag`).  Like
-the other deferred tools, load their schemas with `tool_search` before
-the first call in a conversation.
 
 If the user asks you to coordinate a multi-agent task through the
 store, or to dispatch subagents that share state, read

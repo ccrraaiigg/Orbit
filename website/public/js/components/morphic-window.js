@@ -188,6 +188,27 @@ class MorphicWindow extends HTMLElement {
     MorphicWindow._updateOcclusionShields();
   }
 
+  // Clamp position so the window is fully visible within the viewport.
+  // Adjusts left/top (and shrinks width/height if needed) so no edge
+  // extends beyond the viewport boundaries.
+  _clampToViewport() {
+    var vw = window.innerWidth;
+    var vh = window.innerHeight;
+    var w = this.offsetWidth;
+    var h = this.offsetHeight;
+    // Shrink to fit if larger than viewport
+    if (w > vw) { this.style.width = vw + 'px'; w = vw; }
+    if (h > vh) { this.style.height = vh + 'px'; h = vh; }
+    var left = parseFloat(this.style.left) || 0;
+    var top = parseFloat(this.style.top) || 0;
+    if (left < 0) left = 0;
+    if (top < 0) top = 0;
+    if (left + w > vw) left = vw - w;
+    if (top + h > vh) top = vh - h;
+    this.style.left = left + 'px';
+    this.style.top = top + 'px';
+  }
+
   // True iff this window is not visually occluded (no higher-z window
   // overlaps its rect). Used by occlusion guards to decide whether
   // clicks should pass through without raising.
@@ -1020,8 +1041,7 @@ class MorphicWindow extends HTMLElement {
           background: transparent;
         }
         ::slotted(*) {
-          border-bottom-left-radius: 7px;
-          border-bottom-right-radius: 7px;
+          border-radius: 7px;
           overflow: hidden;
           user-select: none;
           -webkit-user-select: none;
@@ -1453,6 +1473,7 @@ class MorphicWindow extends HTMLElement {
     this._didDrag = true;
     this.style.left = (e.clientX - this._offsetX) + 'px';
     this.style.top = (e.clientY - this._offsetY) + 'px';
+    this._clampToViewport();
     MorphicWindow._syncFrozenOverlayPosition(this);
   }
 
@@ -2229,3 +2250,26 @@ class MorphicWindow extends HTMLElement {
 }
 
 customElements.define('morphic-window', MorphicWindow);
+
+// Clamp newly-added morphic-windows to the viewport.
+// connectedCallback isn't patchable via hot-reload, so we use a
+// MutationObserver to catch any morphic-window insertion.
+(function() {
+  if (window.__morphicWindowClampObserver) return;
+  window.__morphicWindowClampObserver = new MutationObserver(function(mutations) {
+    for (var i = 0; i < mutations.length; i++) {
+      var nodes = mutations[i].addedNodes;
+      for (var j = 0; j < nodes.length; j++) {
+        var node = nodes[j];
+        if (node.nodeType === 1 && node.tagName &&
+            node.tagName.toLowerCase() === 'morphic-window' &&
+            node.id !== 'embeddedSqueak') {
+          requestAnimationFrame(function() {
+            if (node._clampToViewport) node._clampToViewport();
+          });
+        }
+      }
+    }
+  });
+  window.__morphicWindowClampObserver.observe(document.body, { childList: true });
+})();

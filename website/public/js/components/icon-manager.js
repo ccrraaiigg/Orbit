@@ -410,7 +410,7 @@ class IconManager extends HTMLElement {
   }
 
   _setShadowCursorHidden(hidden) {
-    var wins = document.querySelectorAll('morphic-window, transient-window, workbook-window');
+    var wins = document.querySelectorAll('morphic-window, transient-window, workbook-window, keep-viewer');
     var styleId = '__iconManagerShadowCursorHide';
     wins.forEach(function(win) {
       var root = win.shadowRoot;

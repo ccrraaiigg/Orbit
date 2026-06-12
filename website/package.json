@@ -2,7 +2,7 @@
     "name": "orbit-agentic-pair-programming-for-smalltalk",
     "displayName": "Orbit: Agentic Pair Programming for Smalltalk",
     "description": "A livecoding pair-programming harness for Smalltalk.",
-    "version": "1.173.0",
+    "version": "1.176.0",
     "publisher": "BlackPageDigital",
     "icon": "public/pictures/icons/participant/orbit.jpg",
     "engines": {
