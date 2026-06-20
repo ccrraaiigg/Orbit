@@ -214,19 +214,33 @@ The user wants the Integrated Browser tab shared on every startup. Outcome:
    evidently don't reach the VS Code webview iframe's dedicated Worker thread.
    The switches have been removed from `argv.json`.
 
-2. **Squeak-initiated sharing elicitation — the accepted workaround**:
+2. **Squeak-initiated sharing elicitation + page read — the accepted workaround**:
    `Lam2300>>connect` calls
-   `Top orbitChat: '…please make sure the Integrated Browser tab is shared…'`
+   `Top orbitChat: '…if not shared, elicit sharing… Then read the page…'`
    after `tether provideSmalltalkMCPService`, guarded by
    `(Top at: #orbitChat) isNil ifFalse: [...]`. This initiates a Copilot chat
    turn via `window.orbitChat` (`website/public/js/orbit-chat.js`), which POSTs
    `{query,mode,newSession}` to the extension's `/chat` bridge
    (`app-impl.js` proxy → private loopback → `workbench.action.chat.open`).
-   The agent receiving that turn elicits tab sharing if not already shared.
+
+   **The decisive ingredient is the agent READING the page, not the share.**
+   "Shared" in the VS Code picker is passive — it only makes the page available.
+   What actually un-throttles the webview renderer is an **active CDP client**:
+   when the agent calls `read_page` (or any browser tool), Chromium attaches a
+   DevTools client to the renderer and stops backgrounding it, so the frozen
+   Snowglobe display **Worker** gets scheduled, drains its queued `MapWindow`
+   postMessages, and `mapWindow:` creates the `morphic-window` DOM. Observed
+   directly: windows popped in the instant a `read_page` ran, even though the
+   tab had been "shared" for a while with no windows. So the earlier "sharing
+   makes windows appear" was really "the agent's attach makes them appear."
+   The worker deliberately stays off the main thread (speed / unburden main),
+   so the fix is to guarantee the CDP attach happens at startup — hence the
+   prompt now tells the agent to read the page.
+
    `connect` runs on the **main thread** (never frozen — rAF stays continuous),
-   so `orbitChat` fires fine while unshared; once the user shares, the frozen
-   worker drains and the windows map. It's a workaround, not a true fix, but the
-   user chose to go with it.
+   so `orbitChat` fires fine while unshared. It's a workaround (it opens the
+   windows *by involving the agent*), not a true headless fix, but the user
+   chose to go with it.
 
    Key facts:
    - Caffeine/SqueakJS runs in the `#embeddedSqueak` iframe; `window.orbitChat`
@@ -240,3 +254,27 @@ The user wants the Integrated Browser tab shared on every startup. Outcome:
    - This is an **image-only** change (Caffeine `Lam2300`, package
      `Hex-HTML5-apps-Rosebud`). It persists across reload only via a snapshot
      (the user snapshotted after recompile). Do not snapshot yourself.
+
+## Keep viewer didn't reopen on page reload (2026-06-19)
+
+Sibling local windows survive a bare page reload because they're **static /
+self-mounting in `orbit.html`**: Getting Started is a `<markdown-viewer>`
+element in the markup; the evaluate-ledger (`evaluations`) self-mounts from its
+component script. The **Keep viewer ("Keep Store") is NOT** — it's injected
+dynamically by the extension's one-time startup hook
+`openKeepViewerOnStartup()` (`website/src/extension-impl.js`, gated by
+`auditReplayFired`, fired when Caffeine MCP first becomes available at extension
+activation). That hook calls the Caffeine MCP tool `openKeepViewer`
+(`SmalltalkMCPServer>>openKeepViewer`), which builds the `keep-viewer` web
+component into `window.parent.document` with KStore notes/edges. A bare page
+reload restarts the SqueakJS image and the outer document, destroying the
+viewer, and the extension hook does NOT re-fire — so it's gone.
+
+FIX: `Lam2300>>connect` now forks a bounded wait for the MCP server instance
+(`SmalltalkMCPServer registeredInstance`, which is `Tether serverAt: self
+endpoint` — non-nil once the server registers over the tether after reload) and
+then calls `server openKeepViewer`, recreating the viewer on every page load
+like the other local windows. To open it manually for the current session:
+`SmalltalkMCPServer registeredInstance openKeepViewer`. Image-only change \u2014
+needs a snapshot to persist.
+

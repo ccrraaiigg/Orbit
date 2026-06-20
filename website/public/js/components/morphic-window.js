@@ -842,6 +842,16 @@ class MorphicWindow extends HTMLElement {
     this._render();
     this._attachBehavior();
     window.addEventListener('resize', this._onViewportResize);
+    // Ensure the window comes up entirely onscreen, wherever it was
+    // inserted. Deferred a frame so content (canvas/iframe) has laid out
+    // before we measure. (The MutationObserver below is the hot-reload-safe
+    // path; this covers the freshly-defined class on a clean page load.)
+    var self = this;
+    requestAnimationFrame(function() {
+      if (self.isConnected && typeof self._clampToViewport === 'function') {
+        self._clampToViewport();
+      }
+    });
   }
 
   disconnectedCallback() {
@@ -2373,22 +2383,49 @@ customElements.define('morphic-window', MorphicWindow);
 // Clamp newly-added morphic-windows to the viewport.
 // connectedCallback isn't patchable via hot-reload, so we use a
 // MutationObserver to catch any morphic-window insertion.
+//
+// The observer watches the WHOLE subtree of document.body, not just its
+// direct children: windows are frequently inserted *nested* inside host
+// components (e.g. <orbit-task-mirror>, <evaluate-ledger>) rather than
+// appended straight to body, and those would otherwise never be clamped.
+// Each candidate window is passed by value into clampOne() so the rAF
+// closure captures the right element (a prior `var node` loop closure bug
+// clamped only the last added node).
 (function() {
-  if (window.__morphicWindowClampObserver) return;
+  function clampOne(win) {
+    if (!win || win.id === 'embeddedSqueak') return;
+    if (typeof win._clampToViewport !== 'function') return;
+    // Defer one frame so the window has laid out (sized its content/
+    // canvas/iframe) before we measure and clamp it.
+    requestAnimationFrame(function() {
+      if (win.isConnected && typeof win._clampToViewport === 'function') {
+        win._clampToViewport();
+      }
+    });
+  }
+
+  function clampInSubtree(node) {
+    if (!node || node.nodeType !== 1) return;
+    var tag = node.tagName && node.tagName.toLowerCase();
+    if (tag === 'morphic-window') clampOne(node);
+    if (node.querySelectorAll) {
+      node.querySelectorAll('morphic-window').forEach(clampOne);
+    }
+  }
+
+  // Re-installable across hot-reloads: tear down a prior observer first.
+  if (window.__morphicWindowClampObserver) {
+    try { window.__morphicWindowClampObserver.disconnect(); } catch (_) {}
+  }
   window.__morphicWindowClampObserver = new MutationObserver(function(mutations) {
     for (var i = 0; i < mutations.length; i++) {
       var nodes = mutations[i].addedNodes;
       for (var j = 0; j < nodes.length; j++) {
-        var node = nodes[j];
-        if (node.nodeType === 1 && node.tagName &&
-            node.tagName.toLowerCase() === 'morphic-window' &&
-            node.id !== 'embeddedSqueak') {
-          requestAnimationFrame(function() {
-            if (node._clampToViewport) node._clampToViewport();
-          });
-        }
+        clampInSubtree(nodes[j]);
       }
     }
   });
-  window.__morphicWindowClampObserver.observe(document.body, { childList: true });
+  window.__morphicWindowClampObserver.observe(document.body, {
+    childList: true, subtree: true
+  });
 })();

@@ -100,6 +100,13 @@ class CaffeineBridge {
         // definition provider.
         this.onProvidersChanged = opts.onProvidersChanged || (() => {});
 
+        // Called for every `evaluate` tools/call that flows through
+        // the bridge, with the call's params ({ name, arguments }).
+        // Hook used by extension-impl to record an evaluate-ledger
+        // marker so Caffeine evaluations show up in the Evaluate
+        // ledger window just like the VisualWorks backends' do.
+        this.onEvaluateCall = opts.onEvaluateCall || (() => {});
+
         // sessionId -> { stream: res, lastEventId }
         this.postSessions = new Map();
         this.getSessions  = new Map();
@@ -326,6 +333,20 @@ class CaffeineBridge {
         return tether.sendMessage(lam2300, 'undo:', [payload], { timeoutMs: 30000 });
     }
 
+    // Ask the page-side SqueakJS image to snapshot its object memory
+    // by sending the unary message `snapshot` to the page tether
+    // itself (the peer addressed by `forwardCall`). Returns a promise
+    // that resolves once the snapshot send completes. This is the one
+    // sanctioned way for the agent to snapshot Caffeine, used just
+    // before exporting caffeine.image/caffeine.changes during an
+    // extension rebuild (see the steering file). Throws if no page
+    // tether is connected.
+    snapshot() {
+        const tether = this.pageTether();
+        if (!tether) throw new Error('no page tether; cannot snapshot');
+        return this.forwardCall(tether, 'snapshot', []);
+    }
+
     // ---- SSE plumbing -------------------------------------------------------
 
     _startEventStream(registry, sessionId, res) {
@@ -430,6 +451,14 @@ class CaffeineBridge {
             return result(id, objectFromTetherEncodedJSON(r));
         }
         case 'tools/call': {
+            // Record an evaluate-ledger marker for evaluate calls so
+            // they appear in the Evaluate ledger window (the
+            // VisualWorks backends are recorded by the agent; Caffeine
+            // flows through this bridge, so we record it here).
+            if (params && params.name === 'evaluate') {
+                try { this.onEvaluateCall(params); }
+                catch (e) { this.error('onEvaluateCall failed:', e && e.message); }
+            }
             const r = await this._forwardRequest(tether,
                 { endpoint, action: 'tools/call', data: params });
             return output(id, objectFromTetherEncodedJSON(r));

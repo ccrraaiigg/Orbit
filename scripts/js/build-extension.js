@@ -12,6 +12,30 @@ const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const WEBSITE = path.join(PROJECT_ROOT, 'website');
 const { symlinkExtension } = require('./symlink-extension.js');
 
+// ─── Repack caffeine image ──────────────────────────────────────────────────
+
+// If a fresh caffeine.image and caffeine.changes have been dropped into
+// website/public/memories, rebuild caffeine.zip from them and remove the loose
+// files so the new memory ships inside the VSIX.
+function repackCaffeineImage() {
+    const memoriesDir = path.join(WEBSITE, 'public', 'memories');
+    const imagePath = path.join(memoriesDir, 'caffeine.image');
+    const changesPath = path.join(memoriesDir, 'caffeine.changes');
+    const zipPath = path.join(memoriesDir, 'caffeine.zip');
+
+    if (!fs.existsSync(imagePath) || !fs.existsSync(changesPath)) return;
+
+    console.log('=== Repacking caffeine.zip from caffeine.image + caffeine.changes ===');
+    fs.rmSync(zipPath, { force: true });
+    execSync('zip -X "caffeine.zip" "caffeine.image" "caffeine.changes"', {
+        cwd: memoriesDir,
+        stdio: 'inherit'
+    });
+    fs.rmSync(imagePath, { force: true });
+    fs.rmSync(changesPath, { force: true });
+    console.log('Repacked caffeine.zip and removed loose image/changes files');
+}
+
 // ─── Version bump ───────────────────────────────────────────────────────────
 
 function bumpVersion() {
@@ -83,6 +107,7 @@ function installFor(label, codeBin, extRoot, pkg, vsixPath) {
     symlinkExtension(extDir, WEBSITE);
 
     // Remove older installed versions
+    repackCaffeineImage();
     for (const d of fs.readdirSync(extRoot)) {
         const full = path.join(extRoot, d);
         if (d.startsWith(`${pkg.extensionId}-`) && full !== extDir) {

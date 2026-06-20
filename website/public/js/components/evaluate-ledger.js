@@ -408,11 +408,20 @@
   function open() {
     var existing = document.querySelector('morphic-window[data-evaluate-ledger]');
     if (existing) {
+      // Restore the window if the icon-manager has collapsed it
+      // (visibility:hidden + iconManagerPendingHidden), then raise it.
+      if (existing.dataset) delete existing.dataset.iconManagerPendingHidden;
+      if (existing.style && existing.style.visibility === 'hidden') {
+        existing.style.visibility = 'visible';
+        existing.style.opacity = '1';
+      }
       if (typeof existing._bringToFront === 'function') {
         existing.__allowRaise = true;
         try { existing._bringToFront(); } catch (_) {}
         existing.__allowRaise = false;
       }
+      var im = document.querySelector('icon-manager');
+      if (im && typeof im.refresh === 'function') im.refresh();
       return existing.querySelector('evaluate-ledger');
     }
     var mw = document.createElement('morphic-window');

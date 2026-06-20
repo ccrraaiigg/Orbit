@@ -124,7 +124,7 @@ module.exports = function (vscode) {
         'new entries are inserted directly below it (newest first)';
     const APPEND_EVAL_COMMAND = 'orbit.appendEvaluateMarker';
     const CLEAR_EVAL_COMMAND = 'orbit.clearEvaluateMarkers';
-
+    const CAFFEINE_SNAPSHOT_COMMAND = 'orbit.caffeineSnapshot';
     function localWorkspaceFsPath() {
         const folders = vscode.workspace.workspaceFolders || [];
         const local = folders.find(f => f.uri && f.uri.scheme === 'file');
@@ -309,6 +309,20 @@ module.exports = function (vscode) {
         return result.cleared;
     }
 
+    // Command: snapshot the page-side SqueakJS (Caffeine) object
+    // memory. The agent invokes this via run_vscode_command just
+    // before exporting caffeine.image/caffeine.changes during an
+    // extension rebuild (see the steering file). Delegates to
+    // CaffeineBridge.snapshot, which sends `snapshot` to the page
+    // tether. Returns true on success; throws if no bridge/page tether.
+    async function caffeineSnapshotCommand() {
+        const bridge = currentApp && currentApp.mcpBridge;
+        if (!bridge) throw new Error('no Caffeine bridge available');
+        await bridge.snapshot();
+        orbitLog('[orbit] Caffeine snapshot requested');
+        return true;
+    }
+
     // Core rollback: signal the tether and stamp the matching marker
     // "undoneAt". Driven by the eval bridge (the web component's ↩ Undo).
     // Returns { ok, record, alreadyUndone?, reason? } — never throws for
@@ -362,8 +376,10 @@ module.exports = function (vscode) {
             APPEND_EVAL_COMMAND, appendEvaluateMarkerCommand);
         const clearCmd = vscode.commands.registerCommand(
             CLEAR_EVAL_COMMAND, clearEvaluateMarkersCommand);
+        const snapshotCmd = vscode.commands.registerCommand(
+            CAFFEINE_SNAPSHOT_COMMAND, caffeineSnapshotCommand);
         if (context && context.subscriptions) {
-            context.subscriptions.push(appendCmd, clearCmd);
+            context.subscriptions.push(appendCmd, clearCmd, snapshotCmd);
         }
         orbitLog('[orbit] evaluate marker commands armed' + (file ? ' on ' + file : ''));
     }
@@ -1875,6 +1891,29 @@ module.exports = function (vscode) {
                     // as "all up" before Caffeine showed up).
                     scheduleBackendActivationRetries();
                 };
+                // Record an evaluate-ledger marker for every Caffeine
+                // `evaluate` tools/call so it shows up in the Evaluate
+                // ledger window, just like the VisualWorks backends'
+                // evaluations (those are recorded by the agent; the
+                // Caffeine MCP traffic flows through this bridge, so we
+                // record it automatically here). We invoke the same
+                // orbit.appendEvaluateMarker command the agent uses, so
+                // the marker is written without any chat edit tool and
+                // no Keep/Undo buttons attach.
+                app.mcpBridge.onEvaluateCall = (params) => {
+                    const args = (params && params.arguments) || {};
+                    const record = {
+                        tool: 'evaluate',
+                        backend: 'caffeine',
+                        source: typeof args.source === 'string' ? args.source : ''
+                    };
+                    Promise.resolve(
+                        vscode.commands.executeCommand(
+                            APPEND_EVAL_COMMAND, JSON.stringify(record)))
+                        .catch((e) => orbitError(
+                            '[orbit] recording Caffeine evaluate marker failed:',
+                            e && e.message));
+                };
             }
             // Server-Sent Events endpoint that streams MCP server
             // state changes to the Orbit webapp. The page subscribes
@@ -2676,6 +2715,96 @@ module.exports = function (vscode) {
         }
     }
 
+    // Open (or focus) the Lam 2300 digital twin window on the Orbit
+    // page by invoking the Caffeine MCP tool `openDigitalTwin`, which
+    // mounts a <lam2300-vr> window in the outer orbit.html document
+    // (mirroring openKeepViewerOnStartup).
+    async function openDigitalTwinOnPage() {
+        const bridgeEp = bridgeEndpointFor(backendByName('Caffeine'));
+        if (!bridgeEp) {
+            orbitLog('[digital-twin] Caffeine bridge not available; skipping');
+            return;
+        }
+        const rpcBody = JSON.stringify({
+            jsonrpc: '2.0',
+            id: Date.now(),
+            method: 'tools/call',
+            params: { name: 'openDigitalTwin', arguments: {} }
+        });
+        try {
+            await new Promise((resolve, reject) => {
+                const r = require('http').request({
+                    hostname: 'localhost',
+                    port: ORBIT_WEB_PORT,
+                    path: bridgeEp,
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Content-Length': Buffer.byteLength(rpcBody)
+                    }
+                }, (resp) => {
+                    let d = '';
+                    resp.on('data', c => { d += c; });
+                    resp.on('end', () => {
+                        if (resp.statusCode >= 200 && resp.statusCode < 300) resolve(d);
+                        else reject(new Error(`bridge ${resp.statusCode}: ${d.slice(0, 200)}`));
+                    });
+                });
+                r.on('error', reject);
+                r.write(rpcBody);
+                r.end();
+            });
+            orbitLog('[digital-twin] Digital twin opened');
+        } catch (e) {
+            orbitLog(`[digital-twin] Failed to open digital twin: ${e && e.message}`);
+        }
+    }
+
+    // Open (or focus) the evaluate-undo ledger window on the Orbit
+    // page by invoking the Caffeine MCP tool `openEvaluations`, which
+    // calls the page-side OrbitEvaluateLedger.open() (single-instance,
+    // restores a collapsed window) (mirroring openDigitalTwinOnPage).
+    async function openEvaluationsOnPage() {
+        const bridgeEp = bridgeEndpointFor(backendByName('Caffeine'));
+        if (!bridgeEp) {
+            orbitLog('[evaluations] Caffeine bridge not available; skipping');
+            return;
+        }
+        const rpcBody = JSON.stringify({
+            jsonrpc: '2.0',
+            id: Date.now(),
+            method: 'tools/call',
+            params: { name: 'openEvaluations', arguments: {} }
+        });
+        try {
+            await new Promise((resolve, reject) => {
+                const r = require('http').request({
+                    hostname: 'localhost',
+                    port: ORBIT_WEB_PORT,
+                    path: bridgeEp,
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Content-Length': Buffer.byteLength(rpcBody)
+                    }
+                }, (resp) => {
+                    let d = '';
+                    resp.on('data', c => { d += c; });
+                    resp.on('end', () => {
+                        if (resp.statusCode >= 200 && resp.statusCode < 300) resolve(d);
+                        else reject(new Error(`bridge ${resp.statusCode}: ${d.slice(0, 200)}`));
+                    });
+                });
+                r.on('error', reject);
+                r.write(rpcBody);
+                r.end();
+            });
+            orbitLog('[evaluations] Evaluations ledger opened');
+        } catch (e) {
+            orbitLog(`[evaluations] Failed to open evaluations ledger: ${e && e.message}`);
+        }
+    }
+
     // Replay Keep state from the Caffeine-managed IndexedDB audit log.
     // Called once on startup after the Caffeine MCP bridge is available.
     // The Caffeine image handles its own persistence via the keepReplayAudit
@@ -3375,6 +3504,8 @@ module.exports = function (vscode) {
   }
   .view-btn {
     cursor: pointer;
+    min-width: 3em;
+    text-align: center;
     padding: 1px 6px;
     border: 1px solid var(--vscode-button-border, transparent);
     color: var(--vscode-button-foreground);
@@ -3427,6 +3558,18 @@ module.exports = function (vscode) {
     <input type="checkbox" id="memory-toggle">
     <label for="memory-toggle" class="name">share memory with other Orbits</label>
   </div>
+  <hr id="hr-twin">
+  <div id="twin-section-label" class="section-label">digital twin</div>
+  <div id="twin-view-row" class="server">
+    <button id="twin-open-btn" class="view-btn">open</button>
+    <span class="name">Lam 2300 cluster tool</span>
+  </div>
+  <hr id="hr-eval">
+  <div id="eval-section-label" class="section-label">evaluations</div>
+  <div id="eval-view-row" class="server">
+    <button id="eval-open-btn" class="view-btn">open</button>
+    <span class="name">evaluate-undo ledger</span>
+  </div>
   <hr id="hr-top">
   <div id="mcp-section-label" class="section-label">remote systems</div>
   <div id="servers"></div>
@@ -3456,6 +3599,14 @@ module.exports = function (vscode) {
     vscode.postMessage({ type: 'openKeepViewer' });
   });
 
+  document.getElementById('twin-open-btn').addEventListener('click', () => {
+    vscode.postMessage({ type: 'openDigitalTwin' });
+  });
+
+  document.getElementById('eval-open-btn').addEventListener('click', () => {
+    vscode.postMessage({ type: 'openEvaluations' });
+  });
+
   function render(state) {
     toggleBtn.textContent = state.orbitRunning ? 'Stop Orbit' : 'Start Orbit';
     webdavCb.checked = !!state.webdavEnabled && !state.singleRoot;
@@ -3471,6 +3622,14 @@ module.exports = function (vscode) {
     document.getElementById('memory-row').style.display = showMemory ? '' : 'none';
     document.getElementById('memory-view-row').style.display = showMemory ? '' : 'none';
     memoryCb.checked = !!state.keepSyncEnabled;
+    const showTwin = !!state.orbitRunning;
+    document.getElementById('hr-twin').style.display = showTwin ? '' : 'none';
+    document.getElementById('twin-section-label').style.display = showTwin ? '' : 'none';
+    document.getElementById('twin-view-row').style.display = showTwin ? '' : 'none';
+    const showEval = !!state.orbitRunning;
+    document.getElementById('hr-eval').style.display = showEval ? '' : 'none';
+    document.getElementById('eval-section-label').style.display = showEval ? '' : 'none';
+    document.getElementById('eval-view-row').style.display = showEval ? '' : 'none';
     const hasServers = state.orbitRunning && state.servers && state.servers.length > 0;
     document.getElementById('hr-top').style.display = hasServers ? '' : 'none';
     document.getElementById('mcp-section-label').style.display = hasServers ? '' : 'none';
@@ -3634,6 +3793,16 @@ module.exports = function (vscode) {
                         if (msg.type === 'openKeepViewer') {
                             openKeepViewerOnStartup().catch(e =>
                                 orbitLog(`[keep-viewer] Panel open failed: ${e && e.message}`));
+                            return;
+                        }
+                        if (msg.type === 'openDigitalTwin') {
+                            openDigitalTwinOnPage().catch(e =>
+                                orbitLog(`[digital-twin] Panel open failed: ${e && e.message}`));
+                            return;
+                        }
+                        if (msg.type === 'openEvaluations') {
+                            openEvaluationsOnPage().catch(e =>
+                                orbitLog(`[evaluations] Panel open failed: ${e && e.message}`));
                             return;
                         }
                     });

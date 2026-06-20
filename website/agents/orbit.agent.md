@@ -2,17 +2,22 @@
 
 ### NEVER reload the webpage, and NEVER snapshot the Squeak object memory yourself
 
-NEVER.
+NEVER — with one exception. When the user asks you to rebuild the
+extension, make exactly one snapshot just before exporting
+`caffeine.image` and `caffeine.changes` from the SqueakJS IndexedDB,
+via the `orbit.caffeineSnapshot` VSCode command (see "always refresh
+the Caffeine memory before building"). That is the only snapshot you
+may ever make, and only on an explicit rebuild request — never when
+rebuilding for any other reason. Outside that one step, NEVER.
 
 ### NEVER stop the Orbit server or the page without consent
 
-Do not run `orbit.stop`, `orbit.restart`, or any other VSCode command,
-terminal command, or tool call whose effect is to stop, restart, kill,
-or otherwise interrupt the Orbit server, the Orbit extension host, or
-the shared page. Nothing you do should stop the page without the
-user's explicit consent. If you believe the server needs to be
-restarted to recover from a fault, ASK first and wait for the user to
-agree (or to do it themselves).
+Do not run `orbit.stop`, `orbit.restart`, or any other command or tool
+call that would stop, restart, kill, or interrupt the Orbit server, the
+Orbit extension host, or the shared page. Nothing you do should stop the
+page without the user's explicit consent. If you believe the server
+needs restarting to recover from a fault, ASK first and wait for the
+user to agree (or do it themselves).
 
 ### NEVER remove the Caffeine host element when cleaning up remote windows
 
@@ -107,8 +112,8 @@ not just the first time in a conversation.
 
 ### MCP tools are deferred; load their schemas first
 
-The Smalltalk MCP tools (e.g. `capabilities`, `role`, `runCode`,
-`evaluate`, `echo`, `send`, `compileMethod`, and the `mcp_2300-ui_*`
+The Smalltalk MCP tools (e.g. `capabilities`, `role`, `evaluate`,
+`echo`, `send`, `compileMethod`, and the `mcp_2300-ui_*`
 family) are deferred: only their names appear in
 `<availableDeferredTools>`, not their input schemas. Before the first
 call to any of them in a conversation, use `tool_search` to load their
@@ -148,10 +153,9 @@ agents who have access to it.
 
 #### You can get and change information about remote Smalltalk classes and methods
 
-You can invoke some remote Smalltalk actions and information access by
-reading and writing WebDAV filesystems. A WebDAV filesystem maps
-remote Smalltalk class information to a hierarchy of directories and
-files. Here's a sampling of the top of the filesystem:
+A WebDAV filesystem maps remote Smalltalk class information to a
+hierarchy of directories and files. Here's a sampling of the top of the
+filesystem:
 
 ```
 /
@@ -232,34 +236,35 @@ your context window for the benefit of:
 - yourself in future conversation turns
 - humans
 
-You should use the session memory to persist anything you learned
-during a session, to save having to go through the learning process
-again in another session.
+Use the session memory to persist anything you learned during a
+session, so you needn't learn it again in another.
 
 I'm very interested in any thoughts you may develop about this.
 
 ### You can run remote Smalltalk methods
 
-With VisualWorks, if you don't need to pass parameters or debug
-potential unhandled exceptions, use the "runCode" MCP tool rather than
-the "evaluate" MCP tool.
-
-If you do need to pass parameters or debug potential unhandled
-exceptions, use the "evaluate" MCP tool. You specify Smalltalk source
-code to run, and a set of variable bindings that the Smalltalk
-compiler should use when compiling that source. Note that the source
-code you're compiling is not a complete method: it doesn't have a
-method selector, only expressions. It's what a Smalltalk user would
-evaluate in a workspace.
+With VisualWorks, use the "evaluate" MCP tool to run Smalltalk source
+code, together with a set of variable bindings the compiler should use.
+The source isn't a complete method — no selector, only expressions —
+it's what a Smalltalk user would evaluate in a workspace.
 
 Before you can use that tool, you need Smalltalk to grant capabilities
 to you. Smalltalk uses a capabilities system, in which "roles"
 comprised of capabilities are granted to remote clients. Some
-capabilities pertain to source code evaluation. The first tool you
-will call is "capabilities"; it provides a list of the names of
-available capabilities. Next, you'll call the "role" tool, specifying
-the capabilities you want for that role. Finally, you can use the
-"evaluate" tool to evaluate source code.
+capabilities pertain to source code evaluation.
+
+ALWAYS call the "capabilities" tool first, before "role", every time
+you establish a role in a conversation. Do not call "role" with no
+arguments and do not guess capability names from memory: the set is
+backend-specific and can change, and on at least one backend the
+"role" tool's handler requires an explicit `capabilities` argument and
+raises a `KeyNotFoundError` (`#capabilities`) when it's omitted. So the
+fixed order is: (1) call "capabilities" to read the current set of
+available capability names; (2) call "role" passing an explicit
+`capabilities` array drawn from that set (request exactly the ones the
+task needs — e.g. `MethodCompilation` to compile/evaluate,
+`SharedVariableAccess` to read/write shared variables); (3) call
+"evaluate" to evaluate source code.
 
 When the output of the "evaluate" tool is a literal value that can be
 represented in JSON, you get that JSON representation. When it isn't,
@@ -330,9 +335,15 @@ the extension signals the image to roll back the effect recorded for
 that marker (over the tether, to `Lam2300 class>>undo:`) and stamps the
 row `"undoneAt"` so it can't be undone twice. The rows are independent
 and the ledger is durable, so evaluations can be undone out of order
-and long after the fact. Record one marker per call. This does not
-apply to `runCode`, or to the Caffeine (`mcp_caffeine_evaluate`)
-backend.
+and long after the fact. Record one marker per call.
+
+Caffeine `evaluate` calls (`mcp_caffeine_evaluate`) show up in the
+ledger too, but you do **not** record them yourself: that backend's MCP
+traffic flows through the Orbit extension's bridge
+(`CaffeineBridge`), which automatically records a
+`{"tool":"evaluate","backend":"caffeine",…}` marker for every such
+call. Do not invoke `orbit.appendEvaluateMarker` for Caffeine — doing
+so would double-record.
 
 #### You can detect and manipulate unhandled exceptions
 
@@ -363,17 +374,14 @@ inline. Instead you get a result whose status is `running`, carrying a
    task). Keep polling until it reports `finished` (or `failed`); it
    returns the result alongside that status.
 
-`getTaskStatus` is the tool that actually delivers the result to you:
-keep polling it until it reports `finished` (or `failed`) and capture
-the result then. A task is only forgotten once **both** pollers have
-observed completion: the agent (via `getTaskStatus`) and the progress
-card (via its self-polls to `createTaskProgressApp`). Because removal
-can't precede either side's own observation, neither loses the result
-— the card always shows completion, and your `getTaskStatus` poll
-always returns the result. (If the progress card never renders — e.g.
-MCP Apps are disabled — only the agent ever observes completion, so
-the task is retained rather than removed; this is harmless but means
-finished tasks can linger in that case.)
+`getTaskStatus` is what actually delivers the result, so keep polling
+it until it reports `finished` (or `failed`). A task is only forgotten
+once **both** pollers have observed completion — the agent (via
+`getTaskStatus`) and the progress card (via its self-polls to
+`createTaskProgressApp`) — so neither side can lose the result. (If the
+progress card never renders — e.g. MCP Apps are disabled — only the
+agent observes completion, so the task is retained rather than removed:
+harmless, but finished tasks can linger.)
 
 ### You can use Smalltalk MCP tools
 
@@ -416,12 +424,11 @@ not MCP tools.
 
 ### use Playwright to instrument console output
 
-When asked to manipulate the page for the first time in a
-conversation, use Playwright to ensure that console.log(),
-console.warn(), console.error(), console.info(), console.debug(),
-console.dir(), console.table(), and console.trace() are instrumented
-so that you have access to the outputs of calls to those functions. I
-may ask you to comment on those outputs.
+The first time you manipulate the page in a conversation, use
+Playwright to instrument console.log(), console.warn(),
+console.error(), console.info(), console.debug(), console.dir(),
+console.table(), and console.trace() so you have access to their
+outputs. I may ask you to comment on those outputs.
 
 ### always show your mouse position with the purple dot
 
@@ -537,8 +544,7 @@ rather than the class name directly.
 ### livecoding sync
 
 We are livecoding; keep the live page behavior and source files in
-sync on every change. We're trying to avoid page reloads as much as
-possible.
+sync on every change, and avoid page reloads as much as possible.
 
 After script-related changes, update both source files and the active
 page state (head script and live DOM effects), and explicitly report
@@ -562,6 +568,76 @@ If you only need to repair the livecoding symlinks against the
 already-installed VSIX (e.g. after a manual reinstall overwrote them),
 run ./scripts/js/install-extension.js instead. It does no build and no
 version bump.
+
+#### always refresh the Caffeine memory before building
+
+Every time you are asked to run the build script
+(./scripts/js/build-extension.js), first export the live Caffeine
+`caffeine.image` and `caffeine.changes` from the SqueakJS IndexedDB
+into ./website/public/memories, so the build packages the current
+image. The build script repackages `caffeine.zip` from those two files
+(and deletes them) when they're present, so they must be on disk
+*before* you invoke it.
+
+Do this export through a shared page at the `localhost:8089` origin
+(any such page works — `orbit.html`, `files.html`, etc.; you do not
+need `files.html` specifically). The bytes live in the Integrated
+Browser's IndexedDB (`squeak` database, `files` object store, keys
+`/caffeine.image` and `/caffeine.changes`, each value a raw
+`ArrayBuffer`), reachable only via JS at that origin.
+
+Before you export those bytes, make a snapshot so the exported image
+is current: invoke the `orbit.caffeineSnapshot` command via
+`run_vscode_command` (with `skipCheck: true`, no arguments). The
+extension owns this command; it sends `snapshot` to the page tether in
+the Caffeine bridge (`CaffeineBridge.snapshot`), which writes the live
+image to the IndexedDB the export reads. This is the one sanctioned
+exception to the prohibition on snapshotting the Squeak object memory
+yourself (see "NEVER reload the webpage, and NEVER snapshot the Squeak
+object memory yourself"), and it applies only when a user has asked
+you to rebuild the extension — not when you are rebuilding it for any
+other reason. Do this snapshot first, before reading the IndexedDB
+bytes. (If you are bootstrapping a rebuild on an installed extension
+that predates the `orbit.caffeineSnapshot` command, snapshot instead
+with a one-off `mcp_caffeine_evaluate` of
+`Smalltalk snapshot: true andQuit: false`.)
+
+The Playwright script sandbox is locked down (no `require`, `fs`,
+`fetch`, or dynamic `import` — only `page`), and the Integrated
+Browser's download `saveAs` hangs because it never reports completion
+over CDP. So don't try to write the files from the sandbox or via a
+browser download. Instead:
+
+1. Start the committed loopback sink
+   ./scripts/js/caffeine-export-sink.js (`node
+   scripts/js/caffeine-export-sink.js`). Reuse this script — do NOT
+   recreate a throwaway sink inline. It listens on `127.0.0.1:8791`,
+   is CORS-open, accepts `POST /upload?name=caffeine.image|caffeine.changes`
+   (allowlisted) and writes the body to ./website/public/memories/, and
+   also exposes `POST /diag` (it logs the body to stdout) as an
+   out-of-band diagnostics channel — handy because the page snapshot /
+   `read_page` does NOT reliably surface `console.*` output.
+2. In the page context (`page.evaluate`), open the `squeak` IndexedDB,
+   read each `ArrayBuffer`, and `fetch`-POST it to the sink (the page
+   *does* have `fetch`, unlike the sandbox).
+3. Verify the on-disk byte counts match the source `ArrayBuffer`
+   lengths, then kill the sink and remove any temporary DOM/blob
+   elements you injected. Leave the sink *script* on disk for next
+   time; only stop the running process.
+
+When you drive the page with `run_playwright_code`, pass the code as
+**direct statements** with `page` and top-level `await` already in
+scope (e.g. `const r = await page.evaluate(async () => { … return out; });
+return r;`). Do NOT wrap it in `async () => { … }`: a bare arrow
+function literal is merely defined and never invoked, so the call is a
+silent no-op — injected DOM never renders, page `fetch` never reaches
+the sink, and the tool still returns the standard
+`Snapshot: <unchanged>` template with no error. If in doubt, confirm
+execution by injecting a high-z-index magenta div and capturing
+`screenshot_page` before relying on the page logic.
+
+Only after both files are present and verified do you run the build
+script.
 
 ## 2300 simulation interaction
 

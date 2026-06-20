@@ -37,6 +37,23 @@ Undo is driven entirely by the eval bridge → `performEvaluateUndo`.
   `3 halt`) AND stamps `undoneAt` on disk via `persistMarker`
   (buffer-authoritative WorkspaceEdit when the logfile is open, else fs).
 
+## Marker sources
+
+- **VisualWorks backends** (`mcp_2300-*_evaluate`): the agent records
+  each marker by invoking `orbit.appendEvaluateMarker` just before the
+  call (steered in copilot-instructions.md). Those backends are remote
+  MCP servers that don't pass through the extension, so there's no
+  auto-interception point.
+- **Caffeine** (`mcp_caffeine_evaluate`): recorded **automatically** by
+  the extension. Caffeine MCP traffic is proxied through
+  `CaffeineBridge` (`website/src/caffeine-bridge.js`). Its
+  `_handleHttpRpc` `tools/call` case calls `this.onEvaluateCall(params)`
+  for `params.name === 'evaluate'`; `extension-impl.js` wires that hook
+  (right after `onProvidersChanged`) to run the `orbit.appendEvaluateMarker`
+  command with `{tool:'evaluate',backend:'caffeine',source}`. The agent
+  must NOT also record Caffeine markers (double-record). Changing either
+  file needs a window reload / rebuild via build-extension.js.
+
 ## Livecoding note
 
 `website/public/` is served live by `express.static` from SOURCE, so
