@@ -93,6 +93,7 @@ app.mcpBearer  = mcpBearer;
 const CLIPBOARD_PORT_FILE = path.join(os.tmpdir(), 'orbit-clipboard.port');
 const WORKSPACE_FS_PORT_FILE = path.join(os.tmpdir(), 'orbit-workspace-fs.port');
 const CHAT_PORT_FILE = path.join(os.tmpdir(), 'orbit-chat.port');
+const EVAL_PORT_FILE = path.join(os.tmpdir(), 'orbit-eval.port');
 
 function readPortFile(file) {
   try {
@@ -269,14 +270,56 @@ app.get('/workspace-fs/*', (req, res) => {
   upstream.end();
 });
 
+// Evaluate-ledger bridge: lets the <evaluate-ledger> web component
+// list evaluate-undo markers and trigger rollbacks. Proxied to the
+// private loopback eval bridge started by the extension.
+//   GET  /evaluate-ledger        → { ok, markers: [...] }
+//   POST /evaluate-ledger/undo   → { id } → { ok, record } | { ok:false, … }
+//   POST /evaluate-ledger/clear  → { ok, cleared:N }
+function proxyEvalBridge(req, res, method, path, body) {
+  const port = readPortFile(EVAL_PORT_FILE);
+  if (!port) {
+    return res.status(503).json({ error: 'eval bridge unavailable (VS Code not running?)' });
+  }
+  const headers = body
+    ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) }
+    : {};
+  const upstream = httpmod.request({
+    method, host: '127.0.0.1', port, path, headers
+  }, (upRes) => {
+    let chunks = '';
+    upRes.setEncoding('utf8');
+    upRes.on('data', (c) => { chunks += c; });
+    upRes.on('end', () => {
+      res.status(upRes.statusCode).type('application/json').send(chunks);
+    });
+  });
+  upstream.on('error', (err) => { res.status(502).json({ error: err.message }); });
+  if (body) upstream.write(body);
+  upstream.end();
+}
+app.get('/evaluate-ledger', (req, res) => {
+  if (!allowBridgeAccess(req, res)) return;
+  proxyEvalBridge(req, res, 'GET', '/eval/markers');
+});
+app.post('/evaluate-ledger/undo', (req, res) => {
+  if (!allowBridgeAccess(req, res)) return;
+  const id = (req.body && req.body.id != null) ? String(req.body.id) : '';
+  proxyEvalBridge(req, res, 'POST', '/eval/undo', JSON.stringify({ id }));
+});
+app.post('/evaluate-ledger/clear', (req, res) => {
+  if (!allowBridgeAccess(req, res)) return;
+  proxyEvalBridge(req, res, 'POST', '/eval/clear', JSON.stringify({}));
+});
+
 // MCP bridge: proxies HTTP MCP JSON-RPC traffic to an MCP server
 // hosted in the Orbit webapp page. The page registers itself by
 // connecting a WebSocket to /orbit-tether and announcing its
-// endpoint over the Tether protocol; see src/mcp-bridge.js.
+// endpoint over the Tether protocol; see src/caffeine-bridge.js.
 // bin/www calls app.attachMcpBridge(server) after the http.Server is
 // created so the bridge can install its `upgrade` listener.
-const { McpBridge } = require('./src/mcp-bridge');
-const mcpBridge = new McpBridge({ extensionPath: __dirname });
+const { CaffeineBridge } = require('./src/caffeine-bridge');
+const mcpBridge = new CaffeineBridge({ extensionPath: __dirname });
 app.use(mcpBridge.middleware());
 app.attachMcpBridge = function (server) {
   mcpBridge.attachToHttpServer(server);

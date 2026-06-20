@@ -70,15 +70,27 @@ function objectFromTetherEncodedJSON(bytes) {
     return JSON.parse(s);
 }
 
+function objectRefFromTetherAnswer(bytes) {
+    // An object-reference answer is a single tether-encoded word:
+    // (exposureHash + otherMarkerBase), big-endian. Wrap the bare
+    // hash in an OtherMarker so it can be used as a message-send
+    // receiver. Returns null if the answer isn't an object reference.
+    if (!bytes || bytes.length < 4) return null;
+    const word = ((bytes[0] << 24) | (bytes[1] << 16)
+                  | (bytes[2] << 8) | bytes[3]) >>> 0;
+    if (word < caffeine.otherMarkerBase) return null;
+    return new caffeine.OtherMarker(word - caffeine.otherMarkerBase);
+}
+
 // --- the bridge --------------------------------------------------------------
 
-class McpBridge {
+class CaffeineBridge {
     constructor(opts) {
         opts = opts || {};
         this.wsPath        = opts.wsPath || '/orbit-tether';
         this.bearer        = opts.bearer || readBearer(opts.extensionPath);
-        this.log           = opts.log   || ((...a) => console.log('[mcp-bridge]', ...a));
-        this.error         = opts.error || ((...a) => console.error('[mcp-bridge]', ...a));
+        this.log           = opts.log   || ((...a) => console.log('[caffeine-bridge]', ...a));
+        this.error         = opts.error || ((...a) => console.error('[caffeine-bridge]', ...a));
 
         // endpoint -> tether
         this.mcpServers = new Map();
@@ -276,41 +288,42 @@ class McpBridge {
     }
 
     // Fire-and-forget message-send to the page-side Tether (selector
-    // with a JSON-string arg). Mirrors _forwardRequest but for
-    // sibling bridges. Resolves with the raw answer bytes (we ignore
-    // them on most call sites). Throws synchronously if the peer's
-    // exposureHash hasn't been announced yet.
+    // with a JSON-string arg). Resolves with the raw answer bytes (we
+    // ignore them on most call sites). Rejects synchronously if the
+    // peer's exposureHash hasn't been announced yet.
+    //
+    // The page's tether is a PEER (not in our local registry), so we
+    // address it with an OtherMarker wrapping its announced exposure
+    // hash. Tether.sendMessage encodes the receiver as the bare hash
+    // the protocol expects and supplies the timeout + rejectability
+    // (__reject) that _onClose relies on.
     forwardCall(tether, selector, args) {
         if (typeof tether.peerExposureHash !== 'number') {
             return Promise.reject(new Error(
                 'peer exposureHash unknown; page has not announced yet'));
         }
-        const FORWARD_TIMEOUT_MS = 30000;
-        return new Promise((resolve, reject) => {
-            const uuid = new caffeine.UUID();
-            let settled = false;
-            const cleanup = () => {
-                if (settled) return;
-                settled = true;
-                try { clearTimeout(timer); } catch (_) {}
-                tether.outgoingMessages.delete(uuid);
-            };
-            const wrapped = (value) => { if (settled) return; cleanup(); resolve(value); };
-            wrapped.__reject = (err) => { if (settled) return; cleanup(); reject(err); };
-            const timer = setTimeout(() => {
-                wrapped.__reject(new Error(
-                    'forwarded call timed out after ' + FORWARD_TIMEOUT_MS + 'ms'));
-            }, FORWARD_TIMEOUT_MS);
-            tether.outgoingMessages.set(uuid, wrapped);
-            tether.send(() => {
-                tether.nextBytesPut([32, 0, 0, 7]);
-                tether.store(uuid);
-                tether.nextWordPut(tether.peerExposureHash);
-                tether.nextBytesPut([32, 0, 0, 33]);
-                tether.storeSymbol(selector);
-                tether.storeArray(args);
-            });
-        });
+        return tether.sendMessage(
+            new caffeine.OtherMarker(tether.peerExposureHash),
+            selector, args, { timeoutMs: 30000 });
+    }
+
+    // Tell the page's SqueakJS image to roll back the effect recorded
+    // for an evaluate call. VisualWorks and MCP are NOT involved: we
+    // send classNamed: 'Lam2300' to the page-side Tether to obtain a
+    // reference to the (SqueakJS) class, then send undo: <json> to
+    // that class, where <json> is the stringified record that was
+    // written to the evaluate marker file. Fire-and-forget: any error
+    // handling is Squeak's responsibility.
+    async signalUndo(payload) {
+        const tether = this.pageTether();
+        if (!tether) throw new Error('no page tether; cannot signal undo');
+        const classAnswer = await this.forwardCall(
+            tether, 'classNamed:', ['Lam2300']);
+        const lam2300 = objectRefFromTetherAnswer(classAnswer);
+        if (!lam2300) {
+            throw new Error("classNamed: 'Lam2300' did not answer an object reference");
+        }
+        return tether.sendMessage(lam2300, 'undo:', [payload], { timeoutMs: 30000 });
     }
 
     // ---- SSE plumbing -------------------------------------------------------
@@ -357,55 +370,19 @@ class McpBridge {
 
     _forwardRequest(tether, request) {
         // The bridge's tether and the page's tether are DISTINCT
-        // identities with distinct exposureHashes. To target a method
-        // on the page's tether we must write the page's hash (bare)
-        // as the receiver, not our own. We compose the message-send
-        // frame directly rather than going through Tether.sendMessage
-        // (which encodes the receiver via storeOnTether-self and
-        // would emit our own hash).
+        // identities with distinct exposureHashes. We address the
+        // page's tether with an OtherMarker wrapping its announced
+        // (bare) exposure hash; Tether.sendMessage encodes the
+        // receiver correctly and supplies the timeout + rejectability
+        // (__reject) that _onClose relies on.
         if (typeof tether.peerExposureHash !== 'number') {
             return Promise.reject(new Error(
                 'peer exposureHash unknown; page has not announced yet'));
         }
-        const FORWARD_TIMEOUT_MS = 30000;
-        return new Promise((resolve, reject) => {
-            const uuid = new caffeine.UUID();
-            let settled = false;
-            const cleanup = () => {
-                if (settled) return;
-                settled = true;
-                try { clearTimeout(timer); } catch (_) {}
-                tether.outgoingMessages.delete(uuid);
-            };
-            const wrapped = (value) => {
-                if (settled) return;
-                cleanup();
-                resolve(value);
-            };
-            // Make the rejection path discoverable from _onClose so
-            // it can fail in-flight RPCs without changing the
-            // resolver-only contract used everywhere else in
-            // caffeine.Tether.
-            wrapped.__reject = (err) => {
-                if (settled) return;
-                cleanup();
-                reject(err);
-            };
-            const timer = setTimeout(() => {
-                wrapped.__reject(new Error(
-                    'forwarded MCP request timed out after '
-                    + FORWARD_TIMEOUT_MS + 'ms'));
-            }, FORWARD_TIMEOUT_MS);
-            tether.outgoingMessages.set(uuid, wrapped);
-            tether.send(() => {
-                tether.nextBytesPut([32, 0, 0, 7]);   // a message-send
-                tether.store(uuid);                   // exchange UUID
-                tether.nextWordPut(tether.peerExposureHash); // receiver
-                tether.nextBytesPut([32, 0, 0, 33]);  // a Message
-                tether.storeSymbol('serviceExternalMessage:');
-                tether.storeArray([JSON.stringify(request)]);
-            });
-        });
+        return tether.sendMessage(
+            new caffeine.OtherMarker(tether.peerExposureHash),
+            'serviceExternalMessage:', [JSON.stringify(request)],
+            { timeoutMs: 30000 });
     }
 
     async _handleHttpRpc(endpoint, msg) {
@@ -547,4 +524,4 @@ class McpBridge {
     }
 }
 
-module.exports = { McpBridge, objectFromTetherEncodedJSON };
+module.exports = { CaffeineBridge, objectFromTetherEncodedJSON };

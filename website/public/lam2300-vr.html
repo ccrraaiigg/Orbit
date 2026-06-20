@@ -1,0 +1,935 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Lam 2300 — VR</title>
+
+    <!--
+        VR simulation of a Lam Research 2300 cluster etch tool, rendered
+        with A-Frame (WebXR). Hosted inside a <lam2300-vr> Orbit window
+        via an iframe, mirroring how the Caffeine SqueakJS canvas is
+        embedded in #embeddedSqueak.
+
+        The scene is a recognizable cluster-tool topology:
+          - EFEM (atmospheric front end) with three load ports / FOUPs
+          - two load locks bridging atmosphere and vacuum
+          - a central Vacuum Transfer Module (VTM) with a rotating
+            transfer robot that carries a wafer
+          - four radial Process Modules (PM1-PM4) etch reactors, each
+            with a flickering plasma glow
+
+        Live 2300 simulator state drives this twin: it polls a computed
+        WebDAV snapshot (orbit-webdav://2300-ui/tool-state.json, produced
+        by SnowglobeToolState) and reflects per-module online/processing
+        status, FOUP carrier presence, and the vacuum transfer robot's
+        end-effector wafer state. The arm rests when idle and only moves
+        toward a destination module during an actual wafer transfer, so
+        motion mirrors the tool rather than being decorative. The global
+        `window.Lam2300VR` API still exposes setModuleState/routeWafer.
+
+        Craig Latta / Black Page Digital
+    -->
+
+    <script src="https://aframe.io/releases/1.7.0/aframe.min.js"></script>
+    <script src="https://unpkg.com/aframe-orbit-controls@1.3.2/dist/aframe-orbit-controls.min.js"></script>
+
+    <style>
+      html, body { margin: 0; padding: 0; width: 100%; height: 100%;
+                   overflow: hidden; background: #05070a; }
+      a-scene { width: 100%; height: 100%; }
+
+      #hud {
+        position: absolute; top: 8px; left: 10px; z-index: 10;
+        font: 12px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI",
+              Helvetica, Arial, sans-serif;
+        color: #cfe6ff; pointer-events: none;
+        text-shadow: 0 1px 2px rgba(0,0,0,0.8);
+      }
+      #hud b { color: #ffffff; font-size: 13px; }
+      #hud .legend { margin-top: 4px; opacity: 0.85; }
+      #hud .swatch { display: inline-block; width: 9px; height: 9px;
+                     border-radius: 2px; margin: 0 3px 0 8px;
+                     vertical-align: middle; }
+      #viewbtns { margin-top: 6px; pointer-events: auto; }
+      #viewbtns button {
+        font: 11px/1.2 -apple-system, BlinkMacSystemFont, "Segoe UI",
+              Helvetica, Arial, sans-serif;
+        color: #cfe6ff; background: rgba(20,40,58,0.72);
+        border: 1px solid #2f5570; border-radius: 5px;
+        padding: 3px 9px; margin-right: 5px; cursor: pointer;
+        backdrop-filter: blur(2px);
+      }
+      #viewbtns button:hover { background: rgba(34,66,90,0.9);
+                               border-color: #4f87ac; }
+    </style>
+  </head>
+
+  <body>
+    <div id="hud">
+      <b>Lam Research 2300</b> &mdash; cluster etch tool (VR)
+      <div class="legend">
+        drag to orbit &middot; scroll to zoom
+        <span class="swatch" style="background:#39d98a"></span>idle
+        <span class="swatch" style="background:#ffb454"></span>wafer
+        <span class="swatch" style="background:#ff5a5f"></span>processing
+        <span class="swatch" style="background:#5a6472"></span>offline
+      </div>
+      <div class="legend" id="livestate" style="color:#9fb6c8">&#9679; connecting&hellip;</div>
+      <div id="viewbtns">
+        <button id="btn-top" title="Look straight down with the whole tool in view">overhead view</button>
+        <button id="btn-orbit" title="Return to the angled orbit view">orbit view</button>
+      </div>
+    </div>
+
+    <a-scene embedded
+             renderer="colorManagement: true; antialias: true"
+             background="color: #05070a"
+             vr-mode-ui="enabled: true"
+             tool>
+
+      <!-- ===== assets ===== -->
+      <a-assets>
+        <a-mixin id="wafer"
+                 geometry="primitive: cylinder; radius: 0.45; height: 0.02"
+                 material="color: #9fb6c8; metalness: 0.9; roughness: 0.25"></a-mixin>
+      </a-assets>
+
+      <!-- ===== lighting ===== -->
+      <a-entity light="type: ambient; color: #354a63; intensity: 0.7"></a-entity>
+      <a-entity light="type: directional; color: #cfe6ff; intensity: 0.7"
+                position="6 10 4"></a-entity>
+      <a-entity light="type: point; color: #6ab7ff; intensity: 0.4; distance: 30"
+                position="0 6 0"></a-entity>
+      <!-- key spotlight shining straight down onto the tool -->
+      <a-entity id="downlight"
+                light="type: spot; color: #eaf4ff; intensity: 1.6;
+                       distance: 40; angle: 70; penumbra: 0.6;
+                       decay: 1.0; castShadow: false"
+                position="0 14 0"
+                rotation="-90 0 0"></a-entity>
+
+      <!-- ===== floor (fab cleanroom grid, softly glowing) ===== -->
+      <a-plane rotation="-90 0 0" width="40" height="40"
+               material="color: #16202c; emissive: #16344a; emissiveIntensity: 0.45;
+                         metalness: 0.2; roughness: 0.85"></a-plane>
+      <!-- a soft radial pool of light under the tool to lift the scene -->
+      <a-circle rotation="-90 0 0" radius="9" position="0 0.01 0"
+                material="shader: flat; color: #1d4a66; transparent: true;
+                          opacity: 0.35; side: double"></a-circle>
+      <a-entity id="grid"></a-entity>
+
+      <!-- ===== the tool is built procedurally below ===== -->
+      <a-entity id="tool-root" position="0 0 0"></a-entity>
+
+      <!-- ===== camera with orbit controls, targeting the VTM ===== -->
+      <a-entity id="rig"
+                camera
+                orbit-controls="target: 0 1.2 0;
+                                initialPosition: 9 7 11;
+                                minDistance: 4;
+                                maxDistance: 30;
+                                rotateSpeed: 0.5;
+                                zoomSpeed: 1.0;
+                                enableDamping: true;
+                                dampingFactor: 0.12"></a-entity>
+    </a-scene>
+
+    <script>
+      //
+      // Build the cluster tool procedurally and animate it.
+      //
+
+      const NS = 'http://www.w3.org/1999/xhtml';
+
+      // ----- helpers --------------------------------------------------
+      function el(tag, attrs) {
+        const e = document.createElement(tag);
+        if (attrs) for (const k in attrs) e.setAttribute(k, attrs[k]);
+        return e;
+      }
+
+      function deg2rad(d) { return d * Math.PI / 180; }
+
+      // Flat floor label, lying in the XZ plane (readable looking straight
+      // down in the overhead view). `yaw` orients the text so its top
+      // points toward the overhead camera's up direction.
+      function flatLabel(text, x, z, opts) {
+        opts = opts || {};
+        const t = el('a-text', {
+          value: text, align: 'center',
+          baseline: opts.baseline || 'center',
+          color: opts.color || '#eaf4ff',
+          width: opts.width || 7,
+          position: `${x} ${opts.y || 0.06} ${z}`,
+          rotation: `-90 ${opts.yaw || 0} 0`
+        });
+        t.setAttribute('class', 'overhead-label');
+        if (opts.id) t.setAttribute('data-module', opts.id);
+        return t;
+      }
+
+      // ----- cleanroom grid lines ------------------------------------
+      (function buildGrid() {
+        const grid = document.getElementById('grid');
+        const n = 20, step = 2, half = (n * step) / 2;
+        for (let i = 0; i <= n; i++) {
+          const p = -half + i * step;
+          grid.appendChild(el('a-entity', {
+            line: `start: ${-half} 0.01 ${p}; end: ${half} 0.01 ${p}; color: #14304a; opacity: 0.5`
+          }));
+          grid.appendChild(el('a-entity', {
+            line: `start: ${p} 0.01 ${-half}; end: ${p} 0.01 ${half}; color: #14304a; opacity: 0.5`
+          }));
+        }
+      })();
+
+      // ----- the tool ------------------------------------------------
+      const root = document.getElementById('tool-root');
+
+      // Module layout: four process modules at the "back" hemisphere,
+      // load locks at the "front" hemisphere, all radial about the VTM.
+      const VTM_RADIUS = 2.2;
+      const MODULE_DIST = 3.6;
+
+      // angle (deg, 0 = +Z toward camera-front) for each station
+      // PMs are numbered left-to-right as seen in the overhead view
+      // (screen -x to +x). With the overhead camera looking straight
+      // down, world -x is screen-left, so ascending angle->x places
+      // PM1 (angle 250, x=-3.38) leftmost ... PM4 (angle 110, x=+3.38)
+      // rightmost. The four physical chambers are unchanged; only the
+      // id labels are assigned in left-to-right order.
+      const PROCESS_MODULES = [
+        { id: 'PM1', angle: 250 },
+        { id: 'PM2', angle: 210 },
+        { id: 'PM3', angle: 150 },
+        { id: 'PM4', angle: 110 }
+      ];
+      const LOAD_LOCKS = [
+        { id: 'LLA', angle: 25 },
+        { id: 'LLB', angle: -25 }
+      ];
+
+      // --- Vacuum Transfer Module (central octagonal chamber) ---
+      const vtm = el('a-entity', { position: '0 0 0' });
+      // chamber body
+      vtm.appendChild(el('a-cylinder', {
+        radius: VTM_RADIUS, height: 1.4, 'segments-radial': 8,
+        position: '0 0.7 0',
+        material: 'color: #5a6b7d; metalness: 0.85; roughness: 0.35'
+      }));
+      // chamber lid
+      vtm.appendChild(el('a-cylinder', {
+        radius: VTM_RADIUS + 0.08, height: 0.16, 'segments-radial': 8,
+        position: '0 1.45 0',
+        material: 'color: #7d8ea0; metalness: 0.9; roughness: 0.3'
+      }));
+      root.appendChild(vtm);
+
+      // --- transfer robot (rotating hub + arm + end effector) ---
+      // The vacuum transfer robot moves wafers between the load locks and
+      // the process modules. It carries a soft cyan emissive glow (matching
+      // the EFEM atmospheric arm) so it stays legible inside the tool.
+      const VTM_GLOW = 'emissive: #2aa9d6; emissiveIntensity: 0.55';
+      const robot = el('a-entity', { id: 'robot', position: '0 1.0 0' });
+      // hub
+      robot.appendChild(el('a-cylinder', {
+        radius: 0.45, height: 0.3, position: '0 0 0',
+        material: `color: #2b3440; metalness: 0.8; roughness: 0.4; ${VTM_GLOW}`
+      }));
+      // a point light on the hub so the glow casts onto the arm and chamber
+      robot.appendChild(el('a-entity', {
+        light: 'type: point; color: #43c6f0; intensity: 0.5; distance: 3.5',
+        position: '0 0.3 0'
+      }));
+      // upper arm
+      const arm = el('a-entity', { id: 'robot-arm' });
+      arm.appendChild(el('a-box', {
+        width: 1.6, height: 0.12, depth: 0.3, position: '0.8 0.1 0',
+        material: `color: #3f4b59; metalness: 0.7; roughness: 0.4; ${VTM_GLOW}`
+      }));
+      // forearm + end effector blade with a wafer
+      const blade = el('a-entity', { position: '1.6 0.1 0' });
+      blade.appendChild(el('a-box', {
+        width: 1.0, height: 0.06, depth: 0.5, position: '0.5 0 0',
+        material: `color: #8fb3c8; metalness: 0.7; roughness: 0.4; emissive: #43c6f0; emissiveIntensity: 0.7`
+      }));
+      const carriedWafer = el('a-cylinder', {
+        id: 'carried-wafer', radius: 0.42, height: 0.02,
+        position: '0.95 0.05 0',
+        material: 'color: #d8c08a; metalness: 0.9; roughness: 0.2; emissive: #ffc24d; emissiveIntensity: 0.55'
+      });
+      blade.appendChild(carriedWafer);
+      arm.appendChild(blade);
+      robot.appendChild(arm);
+      vtm.appendChild(robot);
+
+      // --- process modules ---
+      function buildModule(spec, kind) {
+        const a = deg2rad(spec.angle);
+        const x = Math.sin(a) * MODULE_DIST;
+        const z = Math.cos(a) * MODULE_DIST;
+        const yawDeg = spec.angle; // face inward
+
+        const mod = el('a-entity', {
+          id: 'mod-' + spec.id,
+          position: `${x.toFixed(3)} 0 ${z.toFixed(3)}`,
+          rotation: `0 ${yawDeg} 0`
+        });
+
+        const isPM = kind === 'process';
+        const bodyColor = '#46535f';
+
+        // connecting throat from VTM to module
+        mod.appendChild(el('a-box', {
+          width: 0.7, height: 0.6, depth: 1.4, position: '0 0.7 -1.0',
+          material: `color: #3a4651; metalness: 0.8; roughness: 0.4`
+        }));
+
+        // module chamber
+        const chamber = el('a-cylinder', {
+          radius: isPM ? 1.1 : 0.85, height: isPM ? 1.5 : 1.1,
+          position: `0 ${isPM ? 0.75 : 0.55} 0`,
+          material: `color: ${bodyColor}; metalness: 0.85; roughness: 0.35`
+        });
+        chamber.setAttribute('class', 'module-shell');
+        chamber.setAttribute('data-module', spec.id);
+        chamber.setAttribute('data-base', bodyColor);
+        mod.appendChild(chamber);
+
+        if (isPM) {
+          // dome lid
+          const dome = el('a-sphere', {
+            radius: 1.1, 'theta-length': 90, position: '0 1.5 0',
+            material: 'color: #6c7b8a; metalness: 0.6; roughness: 0.3'
+          });
+          dome.setAttribute('class', 'module-shell');
+          dome.setAttribute('data-module', spec.id);
+          dome.setAttribute('data-base', '#6c7b8a');
+          mod.appendChild(dome);
+          // plasma glow inside (flickers when "processing")
+          const glow = el('a-sphere', {
+            class: 'plasma', radius: 0.85, position: '0 0.9 0',
+            material: 'color: #ff5a5f; emissive: #ff5a5f; emissiveIntensity: 1.4; transparent: true; opacity: 0.0; side: double'
+          });
+          glow.setAttribute('data-module', spec.id);
+          mod.appendChild(glow);
+          // status point light
+          const statusLight = el('a-entity', {
+            class: 'plasma-light',
+            light: 'type: point; color: #ff5a5f; intensity: 0.0; distance: 6',
+            position: '0 1.0 0'
+          });
+          statusLight.setAttribute('data-module', spec.id);
+          mod.appendChild(statusLight);
+        } else {
+          // load-lock has a slit-valve door look
+          mod.appendChild(el('a-box', {
+            width: 0.9, height: 0.7, depth: 0.06, position: '0 0.6 0.86',
+            material: 'color: #2b3440; metalness: 0.8; roughness: 0.4'
+          }));
+          // wafer parked inside the load lock (shown when a wafer is
+          // present in this lock, per live state)
+          const llWafer = el('a-cylinder', {
+            radius: 0.55, height: 0.02, position: '0 0.62 0',
+            visible: false,
+            material: 'color: #d8c08a; metalness: 0.9; roughness: 0.2; emissive: #ffc24d; emissiveIntensity: 0.55'
+          });
+          llWafer.setAttribute('class', 'lock-wafer');
+          llWafer.setAttribute('data-module', spec.id);
+          mod.appendChild(llWafer);
+        }
+
+        // status indicator ring (green idle / red processing)
+        const ring = el('a-torus', {
+          class: 'status-ring', radius: isPM ? 1.15 : 0.9,
+          'radius-tubular': 0.04, position: `0 ${isPM ? 1.52 : 1.12} 0`,
+          rotation: '90 0 0',
+          material: 'color: #39d98a; emissive: #39d98a; emissiveIntensity: 0.8'
+        });
+        ring.setAttribute('data-module', spec.id);
+        mod.appendChild(ring);
+
+        // vertical billboard label. This is the perpendicular companion
+        // to the flat overhead label (added below); together they read
+        // like the LL units' label pair. The label is anchored at its
+        // baseline (bottom) so the pair joins at the foot of this upper
+        // label, not at its midline. PMs raise it clear above the dome.
+        const label = el('a-text', {
+          value: spec.id, align: 'center', baseline: 'bottom', color: '#cfe6ff',
+          width: 6, position: `0 ${isPM ? 3.1 : 1.9} 0`,
+          rotation: `0 ${-yawDeg} 0`
+        });
+        label.setAttribute('class', 'module-label');
+        label.setAttribute('data-module', spec.id);
+        mod.appendChild(label);
+
+        root.appendChild(mod);
+        return mod;
+      }
+
+      PROCESS_MODULES.forEach(m => buildModule(m, 'process'));
+      LOAD_LOCKS.forEach(m => buildModule(m, 'lock'));
+
+      // --- flat overhead labels for PM / LL units ---------------------
+      // Floated directly above each unit (centered over the chamber/dome)
+      // and lying flat so they read straight down in the overhead view.
+      // yaw=0 orients the text upright for the overhead camera.
+      PROCESS_MODULES.forEach(spec => {
+        const a = deg2rad(spec.angle);
+        const r = MODULE_DIST;
+        root.appendChild(flatLabel(spec.id, Math.sin(a) * r, Math.cos(a) * r,
+          { id: spec.id, yaw: 0, y: 3.35, width: 9, color: '#cfe6ff', baseline: 'bottom' }));
+      });
+      LOAD_LOCKS.forEach(spec => {
+        const a = deg2rad(spec.angle);
+        const r = MODULE_DIST;
+        root.appendChild(flatLabel(spec.id, Math.sin(a) * r, Math.cos(a) * r,
+          { id: spec.id, yaw: 0, y: 2.15, width: 8, color: '#9fe6c8', baseline: 'bottom' }));
+      });
+
+      // --- EFEM (atmospheric front end) with load ports ---
+      const efem = el('a-entity', { position: '0 0 7.5' });
+      // EFEM body
+      efem.appendChild(el('a-box', {
+        width: 7, height: 2.2, depth: 1.4, position: '0 1.1 0',
+        material: 'color: #c9d3dc; metalness: 0.3; roughness: 0.7'
+      }));
+      // three load ports with FOUP pods
+      [-2.2, 0, 2.2].forEach((px, i) => {
+        const port = el('a-entity', { position: `${px} 0 0.9` });
+        // load port shelf
+        port.appendChild(el('a-box', {
+          width: 1.4, height: 0.1, depth: 1.0, position: '0 1.0 0.3',
+          material: 'color: #8c97a1; metalness: 0.5; roughness: 0.6'
+        }));
+        // FOUP carrier (pod + wafers) wrapped so it can be shown/hidden
+        // per the live carrierStatus (Port1/Port2/Port3 present/absent).
+        const foup = el('a-entity', {});
+        foup.setAttribute('class', 'foup');
+        foup.setAttribute('data-port', 'Port' + (i + 1));
+        // FOUP (wafer carrier pod)
+        foup.appendChild(el('a-box', {
+          width: 1.2, height: 1.0, depth: 0.9, position: '0 1.55 0.35',
+          material: 'color: #2e6f8e; metalness: 0.2; roughness: 0.5; transparent: true; opacity: 0.85'
+        }));
+        // a couple of wafers visible in the pod
+        for (let w = 0; w < 3; w++) {
+          foup.appendChild(el('a-cylinder', {
+            radius: 0.4, height: 0.015, position: `0 ${1.25 + w * 0.18} 0.35`,
+            material: 'color: #d8c08a; metalness: 0.9; roughness: 0.2; emissive: #ffc24d; emissiveIntensity: 0.5'
+          }));
+        }
+        port.appendChild(foup);
+        // vertical billboard label, the perpendicular companion to the
+        // flat overhead label below (matching the LL units' label pair).
+        // Anchored at its baseline so the pair joins at the foot of this
+        // upper label. Light-colored and raised to clear the FOUP pod.
+        port.appendChild(el('a-text', {
+          value: 'LP' + (i + 1), align: 'center', baseline: 'bottom', color: '#ffd9a0',
+          width: 6, position: '0 2.35 0.35'
+        }));
+        // flat overhead label floating above the load port; raised so
+        // its baseline meets the top of the vertical orbit label
+        port.appendChild(flatLabel('LP' + (i + 1), 0, 0.35,
+          { yaw: 0, y: 2.6, width: 8, color: '#ffd9a0', baseline: 'bottom' }));
+        efem.appendChild(port);
+      });
+
+      // --- EFEM atmospheric transfer robot -------------------------
+      //     This is the arm that moves wafers between the load ports
+      //     (LP, at the front of the EFEM) and the load locks (LL, at
+      //     the boundary with the vacuum transfer module). It rides a
+      //     linear rail in X to align with a port column or a load-lock
+      //     column, then telescopes its blade in Z: forward (+z) to pick
+      //     a wafer from a FOUP, backward (-z) to place it in a load
+      //     lock. The rail sits midway between the load ports (z~+1.25
+      //     EFEM-local) and the load locks (z~-3.3 EFEM-local) so the
+      //     blade can reach either end.
+      const ATM_Z = -1.1;       // EFEM-local z of the rail (between LP & LL)
+      const ATM_Y = 0.9;        // working height of the arm
+      // translucent transfer deck spanning the LP<->LL travel space, so
+      // the path reads as an enclosed atmospheric front end.
+      efem.appendChild(el('a-box', {
+        width: 5.8, height: 0.05, depth: 5.4, position: `0 0.16 ${ATM_Z - 0.95}`,
+        material: 'color: #2c3540; metalness: 0.4; roughness: 0.8; transparent: true; opacity: 0.5'
+      }));
+      // guide rail (runs in X)
+      efem.appendChild(el('a-box', {
+        width: 5.4, height: 0.08, depth: 0.18, position: `0 ${ATM_Y - 0.05} ${ATM_Z}`,
+        material: 'color: #3a4651; metalness: 0.8; roughness: 0.4'
+      }));
+      // robot carriage (slides in X). The whole arm carries a soft cyan
+      // emissive glow so it stays legible against the dark transfer deck.
+      const ATM_GLOW = 'emissive: #2aa9d6; emissiveIntensity: 0.55';
+      const atm = el('a-entity', { id: 'atm-robot', position: `0 ${ATM_Y} ${ATM_Z}` });
+      atm.appendChild(el('a-cylinder', {
+        radius: 0.26, height: 0.22, position: '0 0 0',
+        material: `color: #2b3440; metalness: 0.8; roughness: 0.4; ${ATM_GLOW}`
+      }));
+      // shoulder post
+      atm.appendChild(el('a-cylinder', {
+        radius: 0.11, height: 0.46, position: '0 0.27 0',
+        material: `color: #3f4b59; metalness: 0.7; roughness: 0.4; ${ATM_GLOW}`
+      }));
+      // a small point light on the carriage so the glow casts onto the deck
+      atm.appendChild(el('a-entity', {
+        light: 'type: point; color: #43c6f0; intensity: 0.5; distance: 3.2',
+        position: '0 0.4 0'
+      }));
+      // articulated arm group (telescopes in Z, driven by the 'tool' component)
+      const atmArm = el('a-entity', { id: 'atm-arm', position: '0 0.46 0' });
+      // telescoping link: its depth + z are set live to span shoulder -> blade
+      atmArm.appendChild(el('a-box', {
+        id: 'atm-link', width: 0.2, height: 0.08, depth: 0.3, position: '0 0 0.15',
+        material: `color: #59697a; metalness: 0.7; roughness: 0.4; ${ATM_GLOW}`
+      }));
+      // blade carriage at the reach tip
+      const atmBlade = el('a-entity', { id: 'atm-blade', position: '0 0 0.3' });
+      atmBlade.appendChild(el('a-box', {
+        width: 0.7, height: 0.05, depth: 0.5, position: '0 0 0.15',
+        material: `color: #8fb3c8; metalness: 0.7; roughness: 0.4; emissive: #43c6f0; emissiveIntensity: 0.7`
+      }));
+      const atmWafer = el('a-cylinder', {
+        id: 'atm-carried-wafer', radius: 0.4, height: 0.018,
+        position: '0 0.05 0.2', visible: false,
+        material: 'color: #d8c08a; metalness: 0.9; roughness: 0.2; emissive: #ffc24d; emissiveIntensity: 0.55'
+      });
+      atmBlade.appendChild(atmWafer);
+      atmArm.appendChild(atmBlade);
+      atm.appendChild(atmArm);
+      efem.appendChild(atm);
+
+      root.appendChild(efem);
+
+      //
+      // ===== animation / sequencing component =====
+      //
+      AFRAME.registerComponent('tool', {
+        init: function () {
+          this.t = 0;
+          this.robotEl = document.getElementById('robot');
+          this.armEl = document.getElementById('robot-arm');
+          this.carriedWaferEl = document.getElementById('carried-wafer');
+          this.atmEl = document.getElementById('atm-robot');
+          this.atmWaferEl = document.getElementById('atm-carried-wafer');
+          this.atmLinkEl = document.getElementById('atm-link');
+          this.atmBladeEl = document.getElementById('atm-blade');
+          this.plasmas = Array.from(document.querySelectorAll('.plasma'));
+          this.plasmaLights = Array.from(document.querySelectorAll('.plasma-light'));
+          this.rings = Array.from(document.querySelectorAll('.status-ring'));
+          this.foups = Array.from(document.querySelectorAll('.foup'));
+          this.lockWafers = Array.from(document.querySelectorAll('.lock-wafer'));
+          this.shells = Array.from(document.querySelectorAll('.module-shell'));
+          this.labels = Array.from(document.querySelectorAll('.module-label'));
+          // per-module live state keyed by id
+          this.state = {};   // processing (drives plasma + red ring)
+          this.online = {};  // exported & online (false => grey ring)
+          this.wafer = {};   // a wafer is present in the chamber
+          ['PM1','PM2','PM3','PM4'].forEach(id => {
+            this.state[id] = false; this.online[id] = false; this.wafer[id] = false;
+          });
+          // Map a destination name (PMn / load lock) to the transfer
+          // robot's arm yaw, from the same angles the modules are built
+          // with (armYaw = moduleAngle - 90).
+          this.destYaw = {};
+          PROCESS_MODULES.concat(LOAD_LOCKS).forEach(m => {
+            this.destYaw[m.id] = m.angle - 90;
+          });
+          // arm motion state: when no wafer is in transit, the arm rests
+          // at its home yaw; the real tool's arm is stationary when idle.
+          // Home corresponds to a load lock (LLB), not an arbitrary 0 --
+          // the idle arm sits facing a load lock rather than dead ahead.
+          this.HOME_YAW = (this.destYaw['LLB'] != null)
+            ? this.destYaw['LLB'] : 0;
+          this.armYaw = this.HOME_YAW;
+          this.armTargetYaw = this.HOME_YAW;
+          this.vtmActive = false;
+          // EFEM atmospheric robot: a carriage that slides in X to a
+          // port/load-lock column and telescopes its blade in Z. atmX is
+          // the carriage X; atmReach is the signed Z reach of the blade
+          // (+ forward to a load port, - backward to a load lock).
+          this.atmX = 0;
+          this.atmTargetX = 0;
+          this.atmReach = 0;
+          this.atmTargetReach = 0;
+          this.atmActive = false;
+          this.ATM_Z = ATM_Z;
+          this.ATM_Y = ATM_Y;
+          this.ATM_REACH_LP = 2.35;   // reach forward into a load-port FOUP
+          this.ATM_REACH_LL = -2.2;   // reach back into a load lock
+          this.portX = { Port1: -2.2, Port2: 0, Port3: 2.2 };
+          this.lockX = { LLA: 1.522, LLB: -1.522 };
+          // poll the live 2300 tool-state snapshot served by the
+          // 2300-ui image as a computed WebDAV file, via the Orbit
+          // workspace-fs read endpoint (same origin as this iframe).
+          this.snapshotUrl = '/workspace-fs/read?uri=' +
+            encodeURIComponent('orbit-webdav://2300-ui/tool-state.json');
+          this._startPolling();
+
+          // camera view presets (overhead / orbit)
+          this.rig = document.getElementById('rig');
+          const self = this;
+          const bt = document.getElementById('btn-top');
+          const bo = document.getElementById('btn-orbit');
+          if (bt) bt.addEventListener('click', function () { self.setView('top'); });
+          if (bo) bo.addEventListener('click', function () { self.setView('orbit'); });
+        },
+
+        // Move the orbit camera to a preset. 'top' looks straight down
+        // with the whole tool filling the view; 'orbit' restores the
+        // default angled view.
+        setView: function (which) {
+          const oc = this.rig && this.rig.components['orbit-controls'];
+          const c = oc && oc.controls;
+          if (!c) return;
+          if (which === 'top') {
+            c.target.set(0, 0, 2);
+            // tiny z offset avoids straight-down gimbal lock
+            c.object.position.set(0, 11, 2.01);
+          } else {
+            c.target.set(0, 1.2, 0);
+            c.object.position.set(9, 7, 11);
+          }
+          c.update();
+        },
+
+        _startPolling: function () {
+          const self = this;
+          const poll = function () {
+            fetch(self.snapshotUrl, { cache: 'no-store' })
+              .then(r => r.ok ? r.json() : Promise.reject(r.status))
+              .then(data => self.applySnapshot(data))
+              .catch(err => self._setLive(false, err));
+          };
+          poll();
+          this._timer = setInterval(poll, 1500);
+        },
+
+        _stopPolling: function () {
+          if (this._timer) { clearInterval(this._timer); this._timer = null; }
+        },
+
+        applySnapshot: function (data) {
+          (data.modules || []).forEach(m => this.applyModule(m));
+          this.applyCarriers(data.carriers || {});
+          this.applyLocks(data.locks || []);
+          this.applyRobot(data.vtmRobot || { effectors: [], active: false });
+          this.applyAtmRobot(data.atmRobot || { effectors: [], active: false });
+          this._updateHud(data);
+        },
+
+        applyModule: function (m) {
+          const id = m.id;
+          if (!(id in this.state)) return;
+          // online is true only when the module is CTROC-exported and online;
+          // null (e.g. PM3/PM4, not exported) is treated as offline/unknown.
+          this.online[id] = (m.online === true);
+          const wasLoaded = this.wafer[id];
+          const nowLoaded = !!m.waferPresent;
+          // remember the PM that most recently received a wafer, so the
+          // idle transfer arm can stay parked there (see applyRobot).
+          if (nowLoaded && !wasLoaded) this.lastLoadedPM = id;
+          this.wafer[id] = nowLoaded;
+          this.state[id] = !!m.processing;
+          this._refreshRing(id);
+          this._refreshShell(id);
+        },
+
+        // Reflect live FOUP presence: show a carrier pod only where the
+        // load port reports a carrier present (Port1/Port2/Port3).
+        applyCarriers: function (carriers) {
+          this.foups.forEach(f => {
+            const port = f.getAttribute('data-port');
+            const present = carriers[port];
+            // default to visible when the port isn't reported, so we
+            // never hide a carrier we simply have no datum for.
+            f.setAttribute('visible', present === undefined ? true : !!present);
+          });
+        },
+
+        // Show a wafer parked inside a load lock when that lock reports a
+        // wafer present (from its inbound/outbound slot WaferIDs).
+        applyLocks: function (locks) {
+          const byId = {};
+          locks.forEach(l => { if (l && l.id) byId[l.id] = l; });
+          if (!this.lockHasWafer) this.lockHasWafer = {};
+          this.lockWafers.forEach(w => {
+            const id = w.getAttribute('data-module');
+            const l = byId[id];
+            const has = !!(l && l.hasWafer);
+            // remember the lock that most recently received a wafer, so the
+            // idle vacuum arm can stay parked there after an outbound move.
+            if (has && !this.lockHasWafer[id]) this.lastFilledLock = id;
+            this.lockHasWafer[id] = has;
+            w.setAttribute('visible', has);
+          });
+        },
+
+        // Drive the EFEM atmospheric robot from its end-effector state.
+        // This is the LP<->LL transfer arm. When it holds a wafer bound
+        // for a load lock, it slides to that lock's column and reaches
+        // back (-z) to place it; right after a pick (holding, no lock yet)
+        // it reaches forward (+z) at the source port; empty/idle it
+        // retracts and parks at center.
+        applyAtmRobot: function (robot) {
+          const effs = robot.effectors || [];
+          const eff = effs.find(e => e && e.hasWafer) || effs[0] || {};
+          this.atmActive = !!robot.active;
+          const holding = !!eff.hasWafer;
+          if (this.atmWaferEl) this.atmWaferEl.setAttribute('visible', holding);
+          if (holding) {
+            const ll = this._normAtmLock(eff.airLock);
+            if (ll && ll in this.lockX) {
+              // delivering LP -> LL: align to the load-lock column, reach back
+              this.atmTargetX = this.lockX[ll];
+              this.atmTargetReach = this.ATM_REACH_LL;
+            } else {
+              // just picked from a load port: reach forward at the port column
+              const port = this._normAtmPort(eff.slot);
+              if (port && port in this.portX) {
+                this.atmTargetX = this.portX[port];
+                // remember the load port we are servicing, so we can park
+                // there when idle instead of returning to center.
+                this.lastServicedPort = port;
+              }
+              this.atmTargetReach = this.ATM_REACH_LP;
+            }
+          } else if (robot.active) {
+            // moving empty (returning between port and lock): retract,
+            // hold the current column.
+            this.atmTargetReach = 0;
+          } else {
+            // idle: retract but stay at the load port it is servicing --
+            // it only leaves when another load port needs it (a new pick
+            // updates lastServicedPort above). Don't drift back to center.
+            const port = (this.lastServicedPort && this.lastServicedPort in this.portX)
+              ? this.lastServicedPort : null;
+            this.atmTargetX = port ? this.portX[port] : 0;
+            this.atmTargetReach = 0;
+          }
+        },
+
+        // AirLock1 -> LLA, AirLock2 -> LLB (also accept bare LLA/LLB).
+        _normAtmLock: function (s) {
+          if (s == null) return '';
+          const m = String(s).match(/AirLock\s*([12])/i);
+          if (m) return m[1] === '1' ? 'LLA' : 'LLB';
+          const d = String(s).match(/LL\s*([AB])/i);
+          if (d) return 'LL' + d[1].toUpperCase();
+          return '';
+        },
+
+        // Best-effort source-port column from a slot/port datum.
+        _normAtmPort: function (s) {
+          if (s == null) return '';
+          const m = String(s).match(/(?:Port|LP)\s*([1-3])/i);
+          if (m) return 'Port' + m[1];
+          return '';
+        },
+
+        // Drive the vacuum transfer robot from live end-effector state.
+        // The real arm only moves while it is carrying/placing a wafer;
+        // when both end effectors are empty it is parked at home.
+        applyRobot: function (robot) {
+          const effs = robot.effectors || [];
+          const carrier = effs.find(e => e && e.hasWafer && e.destPM);
+          this.vtmActive = !!robot.active;
+          if (carrier) {
+            const dest = this._normDest(carrier.destPM);
+            if (dest in this.destYaw) this.armTargetYaw = this.destYaw[dest];
+            this._setCarriedWafer(true);
+          } else if (robot.active) {
+            // holding a wafer but no resolved destination: keep last target
+            this._setCarriedWafer(true);
+          } else {
+            // Idle and empty-handed: the arm NEVER moves unless it is
+            // needed somewhere. Resolve a park target from where the wafer
+            // it last handled now rests:
+            //  - inbound just delivered (or still processing): a PM holds
+            //    the wafer -> stay at that PM.
+            //  - outbound just delivered: a load lock holds the wafer ->
+            //    stay at that lock (e.g. PM1 -> LLB, then park at LLB).
+            // If neither yields a target (e.g. the ATM arm has since
+            // emptied that lock), HOLD the last park position -- don't drift
+            // back to home. It only leaves when it must carry again
+            // (handled by the carrying branches above).
+            let target = null;
+            let pm = (this.lastLoadedPM && this.wafer[this.lastLoadedPM])
+              ? this.lastLoadedPM : null;
+            if (!pm) pm = ['PM1','PM2','PM3','PM4'].find(id => this.wafer[id]) || null;
+            if (pm) {
+              target = this.destYaw[pm];
+            } else {
+              const lh = this.lockHasWafer || {};
+              let lock = (this.lastFilledLock && lh[this.lastFilledLock])
+                ? this.lastFilledLock : null;
+              if (!lock) lock = ['LLB', 'LLA'].find(id => lh[id]) || null;
+              if (lock && lock in this.destYaw) target = this.destYaw[lock];
+            }
+            if (target == null) {
+              // no live signal: stay put (sticky), never spring home
+              target = (this.lastParkYaw != null) ? this.lastParkYaw : this.HOME_YAW;
+            }
+            this.lastParkYaw = target;
+            this.armTargetYaw = target;
+            this._setCarriedWafer(false);
+          }
+        },
+
+        _normDest: function (s) {
+          if (s == null) return '';
+          const m = String(s).match(/PM\s*([1-6])/i);
+          if (m) return 'PM' + m[1];
+          const a = String(s).match(/AirLock\s*([12])/i);
+          if (a) return a[1] === '1' ? 'LLA' : 'LLB';
+          return String(s).replace(/[^A-Za-z0-9]/g, '');
+        },
+
+        _setCarriedWafer: function (visible) {
+          if (this.carriedWaferEl) this.carriedWaferEl.setAttribute('visible', !!visible);
+        },
+
+        // public boolean API compatibility (window.Lam2300VR.setModuleState)
+        setModuleState: function (id, processing) {
+          if (!(id in this.state)) return;
+          this.state[id] = !!processing;
+          this._refreshRing(id);
+        },
+
+        _refreshRing: function (id) {
+          let color;
+          if (!this.online[id]) color = '#5a6472';        // offline / unknown
+          else if (this.state[id]) color = '#ff5a5f';     // processing
+          else if (this.wafer[id]) color = '#ffb454';     // wafer parked, idle
+          else color = '#39d98a';                         // idle
+          this.rings.forEach(r => {
+            if (r.getAttribute('data-module') === id) {
+              r.setAttribute('material', 'color', color);
+              r.setAttribute('material', 'emissive', color);
+            }
+          });
+        },
+
+        // Dim a module's chamber/dome/label when it is offline so the
+        // offline state reads clearly (PM3/PM4 are not CTROC-exported).
+        _refreshShell: function (id) {
+          const off = !this.online[id];
+          this.shells.forEach(s => {
+            if (s.getAttribute('data-module') !== id) return;
+            const base = s.getAttribute('data-base') || '#46535f';
+            s.setAttribute('material', 'color', off ? '#222a31' : base);
+            s.setAttribute('material', 'metalness', off ? 0.2 : 0.85);
+          });
+        },
+
+        _setLive: function (isLive, err) {
+          const el = document.getElementById('livestate');
+          if (!el) return;
+          if (isLive) { el.innerHTML = '&#9679; live'; el.style.color = '#39d98a'; }
+          else {
+            el.innerHTML = '&#9679; offline' + (err != null ? ' (' + err + ')' : '');
+            el.style.color = '#ff5a5f';
+          }
+        },
+
+        _updateHud: function (data) {
+          const el = document.getElementById('livestate');
+          if (!el) return;
+          const active = (data.modules || []).filter(m => m.processing).map(m => m.id);
+          const ports = data.carriers || {};
+          const present = Object.keys(ports).filter(k => ports[k]).length;
+          el.textContent = '\u25CF live \u00B7 ' +
+            (active.length ? ('processing ' + active.join(',')) : 'all idle') +
+            ' \u00B7 transfer ' + (this.vtmActive ? 'active' : 'idle') +
+            ' \u00B7 carriers ' + present;
+          el.style.color = '#39d98a';
+        },
+
+        tick: function (time, dt) {
+          dt = dt || 16;
+          this.t += dt / 1000;
+
+          // Move the transfer arm toward its live target yaw. When idle
+          // the target is HOME_YAW, so the arm comes to rest instead of
+          // sweeping cosmetically.
+          if (this.armEl) {
+            let diff = this.armTargetYaw - this.armYaw;
+            // shortest angular path
+            while (diff > 180) diff -= 360;
+            while (diff < -180) diff += 360;
+            const step = diff * Math.min(1, (dt / 1000) * 3.0);
+            if (Math.abs(diff) < 0.1) this.armYaw = this.armTargetYaw;
+            else this.armYaw += step;
+            this.armEl.setAttribute('rotation', `0 ${this.armYaw.toFixed(2)} 0`);
+          }
+
+          // Drive the EFEM atmospheric robot: slide the carriage toward
+          // its target X column and telescope the blade toward its target
+          // Z reach, so it visibly moves a wafer between a load port and
+          // a load lock.
+          if (this.atmEl) {
+            const dx = this.atmTargetX - this.atmX;
+            if (Math.abs(dx) < 0.005) this.atmX = this.atmTargetX;
+            else this.atmX += dx * Math.min(1, (dt / 1000) * 3.0);
+            this.atmEl.setAttribute('position',
+              `${this.atmX.toFixed(3)} ${this.ATM_Y} ${this.ATM_Z}`);
+
+            const dr = this.atmTargetReach - this.atmReach;
+            if (Math.abs(dr) < 0.005) this.atmReach = this.atmTargetReach;
+            else this.atmReach += dr * Math.min(1, (dt / 1000) * 3.0);
+            if (this.atmLinkEl) {
+              const len = Math.max(0.08, Math.abs(this.atmReach));
+              this.atmLinkEl.setAttribute('depth', len.toFixed(3));
+              this.atmLinkEl.setAttribute('position', `0 0 ${(this.atmReach / 2).toFixed(3)}`);
+            }
+            if (this.atmBladeEl) {
+              this.atmBladeEl.setAttribute('position', `0 0 ${this.atmReach.toFixed(3)}`);
+            }
+          }
+
+          // plasma flicker for processing modules
+          const flick = 0.6 + 0.4 * Math.abs(Math.sin(this.t * 9.0));
+          this.plasmas.forEach(p => {
+            const id = p.getAttribute('data-module');
+            const on = this.state[id];
+            p.setAttribute('material', 'opacity', on ? (0.35 * flick).toFixed(3) : '0');
+          });
+          this.plasmaLights.forEach(l => {
+            const id = l.getAttribute('data-module');
+            const on = this.state[id];
+            l.setAttribute('light', 'intensity', on ? (1.2 * flick).toFixed(3) : '0');
+          });
+        }
+      });
+
+      //
+      // ===== external API for live 2300 wiring =====
+      //
+      window.Lam2300VR = {
+        // set a process module's status: true = processing, false = idle
+        setModuleState: function (id, processing) {
+          const scene = document.querySelector('a-scene');
+          const comp = scene && scene.components.tool;
+          if (comp) comp.setModuleState(id, !!processing);
+        },
+        // placeholder for routing a wafer LP -> LL -> PM (future)
+        routeWafer: function (from, to) {
+          console.log('[Lam2300VR] routeWafer', from, '->', to);
+        },
+        // camera presets
+        topView: function () {
+          const c = document.querySelector('a-scene');
+          c && c.components.tool && c.components.tool.setView('top');
+        },
+        orbitView: function () {
+          const c = document.querySelector('a-scene');
+          c && c.components.tool && c.components.tool.setView('orbit');
+        }
+      };
+
+      console.log('[Lam2300VR] scene built:',
+                  PROCESS_MODULES.length, 'process modules,',
+                  LOAD_LOCKS.length, 'load locks');
+    </script>
+  </body>
+</html>

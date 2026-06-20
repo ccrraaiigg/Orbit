@@ -73,7 +73,7 @@ module.exports = function (vscode) {
     //
     // The "Caffeine" backend is different: it's hosted by the Orbit
     // webapp page (the SqueakJS image in the browser) and proxied by
-    // the Orbit webserver's McpBridge (see website/src/mcp-bridge.js).
+    // the Orbit webserver's CaffeineBridge (see website/src/caffeine-bridge.js).
     // Reachability is "is there a tether currently registered with
     // the bridge?", and the MCP URL is the bridge's HTTP endpoint on
     // the local Orbit webserver port (8089).
@@ -81,6 +81,7 @@ module.exports = function (vscode) {
     const BACKENDS = [
         { name: '2300-backend', kind: 'tcp',    mcpPort: 15072, webdavPort: 19072, toolPrefix: '2300-backend', proxyPort: 15172 },
         { name: '2300-ui',      kind: 'tcp',    mcpPort: 15070, webdavPort: 19070, toolPrefix: '2300-ui',      proxyPort: 15170 },
+        { name: '2300-tmc',     kind: 'tcp',    mcpPort: 15200, webdavPort: 19200, toolPrefix: '2300-tmc',     proxyPort: 15300 },
         { name: 'Caffeine',     kind: 'bridge' }
     ];
 
@@ -90,6 +91,281 @@ module.exports = function (vscode) {
 
     function backendByName(name) {
         return BACKENDS.find(b => b.name === name);
+    }
+
+    // --- evaluate-call markers + undo --------------------------------
+    //
+    // To roll back the effect of an `evaluate` MCP tool call, the agent
+    // is steered (see .github/copilot-instructions.md) to append one
+    // JSON record line to a single persistent ledger, just before each
+    // evaluate call:
+    //
+    //     .orbit/toolLogs/evaluate-markers.jsonl
+    //
+    // The user rolls calls back from the in-webapp Evaluate ledger
+    // window (the <evaluate-ledger> web component), whose ↩ Undo button
+    // POSTs to this extension's eval bridge → performEvaluateUndo. On
+    // undo we signal the rollback over the tether and stamp the line
+    // `"undoneAt"` (audit trail + idempotency). Because the records are
+    // independent and the ledger is durable, evaluations can be undone
+    // out of order and long after the fact.
+    //
+    // (An earlier iteration rendered a per-line editor CodeLens here
+    // instead; it has been retired in favor of the web component. We
+    // also deliberately avoid VS Code's chat Keep/Undo controls: undoing
+    // any agent edit goes through the platform UndoRedoService with a
+    // source mismatch that forces a blocking "Would you like to undo
+    // 'X'?" modal with no setting to suppress — which is why the ledger
+    // is written via the orbit.appendEvaluateMarker command, never an
+    // agent edit tool.)
+    const EVAL_LOG_REL = path.join('.orbit', 'toolLogs', 'evaluate-markers.jsonl');
+    const EVAL_MARKERS_HEADER =
+        '// evaluate undo markers — do not delete this header line; ' +
+        'new entries are inserted directly below it (newest first)';
+    const APPEND_EVAL_COMMAND = 'orbit.appendEvaluateMarker';
+    const CLEAR_EVAL_COMMAND = 'orbit.clearEvaluateMarkers';
+
+    function localWorkspaceFsPath() {
+        const folders = vscode.workspace.workspaceFolders || [];
+        const local = folders.find(f => f.uri && f.uri.scheme === 'file');
+        return local ? local.uri.fsPath : null;
+    }
+
+    function evalMarkersFsPath() {
+        const root = localWorkspaceFsPath();
+        return root ? path.join(root, EVAL_LOG_REL) : null;
+    }
+
+    // Parse a marker document's text into line descriptors
+    // ({ lineIndex, record }) for each JSON record line. The header and
+    // any other non-JSON lines are ignored.
+    function parseMarkerLines(text) {
+        const lines = (text || '').split(/\r?\n/);
+        const out = [];
+        for (let i = 0; i < lines.length; i++) {
+            const trimmed = lines[i].trim();
+            if (!trimmed || trimmed[0] !== '{') continue;
+            let rec;
+            try { rec = JSON.parse(trimmed); } catch (_) { continue; }
+            if (rec && typeof rec === 'object' && rec.id != null) {
+                out.push({ lineIndex: i, record: rec });
+            }
+        }
+        return out;
+    }
+
+    function signalEvaluateUndo(record) {
+        // The user clicked this marker's ↩ Undo button in the Evaluate
+        // ledger window. Tell the page's SqueakJS image to roll back the
+        // call's effect by
+        // sending Lam2300 class >> undo: <json> over the tether, where
+        // <json> is the stringified record originally written to the
+        // marker file (tool, backend, id, at, source, ...). No
+        // VisualWorks, no MCP — a fire-and-forget direct message-send
+        // to a SqueakJS class (see CaffeineBridge.signalUndo). Any
+        // error handling is Squeak's responsibility; we only log.
+        const bridge = currentApp && currentApp.mcpBridge;
+        const id = record && record.id;
+        if (!bridge) {
+            orbitError(`[orbit] evaluate UNDO for ${id || '?'}: no bridge available`);
+            return;
+        }
+        const payload = JSON.stringify(record || {});
+        orbitLog(`[orbit] evaluate UNDO detected for call ${id || '?'} ` +
+            `(backend ${(record && record.backend) || '?'}); signaling page`);
+        Promise.resolve(bridge.signalUndo(payload))
+            .then(() => orbitLog(`[orbit] undo signal delivered for ${id || '?'}`))
+            .catch((e) => orbitError(
+                `[orbit] undo signal failed for ${id || '?'}: ` + (e && e.message)));
+    }
+
+    // Ensure the single persistent marker document exists with its
+    // stable header line, so the agent always has an anchor to insert
+    // below and our watcher has a file to follow.
+    function ensureEvalMarkersFile(file) {
+        try {
+            if (!fs.existsSync(file)) {
+                fs.mkdirSync(path.dirname(file), { recursive: true });
+                fs.writeFileSync(file, EVAL_MARKERS_HEADER + '\n', 'utf8');
+            }
+        } catch (e) {
+            orbitError('[orbit] could not create evaluate markers file: ' +
+                (e && e.message));
+        }
+    }
+
+    // The ledger must never be touched by an agent edit tool (that
+    // attaches chat Keep/Undo controls) and we also want to avoid
+    // buffer/disk divergence: when the file happens to be open in an
+    // editor, the buffer and disk must agree. When the file is open in
+    // an editor we therefore write *through the document* with a
+    // WorkspaceEdit and save it (buffer is authoritative, no chat
+    // controls); when it is closed we write directly with fs. Either
+    // way the chat editing session never sees the change.
+    function currentMarkerText() {
+        const file = evalMarkersFsPath();
+        if (!file) return null;
+        const open = vscode.workspace.textDocuments.find(
+            d => d.uri.scheme === 'file' && d.uri.fsPath === file);
+        if (open) return open.getText();
+        try { return fs.readFileSync(file, 'utf8'); }
+        catch (_) { return EVAL_MARKERS_HEADER + '\n'; }
+    }
+
+    // Apply `transform(oldText) -> newText` to the ledger, preferring
+    // the open document so buffer and disk stay in lock-step.
+    async function persistMarker(transform) {
+        const file = evalMarkersFsPath();
+        if (!file) return false;
+        ensureEvalMarkersFile(file);
+        const uri = vscode.Uri.file(file);
+        const open = vscode.workspace.textDocuments.find(
+            d => d.uri.scheme === 'file' && d.uri.fsPath === file);
+        if (open) {
+            const oldText = open.getText();
+            const newText = transform(oldText);
+            if (newText === oldText) return true;
+            const edit = new vscode.WorkspaceEdit();
+            const fullRange = new vscode.Range(
+                open.positionAt(0), open.positionAt(oldText.length));
+            edit.replace(uri, fullRange, newText);
+            const ok = await vscode.workspace.applyEdit(edit);
+            if (ok) { try { await open.save(); } catch (_) { /* best effort */ } }
+            return ok;
+        }
+        let oldText;
+        try { oldText = fs.readFileSync(file, 'utf8'); }
+        catch (_) { oldText = EVAL_MARKERS_HEADER + '\n'; }
+        try { fs.writeFileSync(file, transform(oldText), 'utf8'); return true; }
+        catch (e) {
+            orbitError('[orbit] could not write evaluate markers file: ' +
+                (e && e.message));
+            return false;
+        }
+    }
+
+    // Command: append a marker line for an evaluate call. The agent
+    // invokes this via run_vscode_command (NOT its edit tools), so the
+    // chat editing session never sees the change — no Keep/Undo buttons
+    // appear on the logfile. The single string arg is the JSON record.
+    async function appendEvaluateMarkerCommand(recordArg) {
+        const file = evalMarkersFsPath();
+        if (file) ensureEvalMarkersFile(file);
+        let record;
+        try { record = typeof recordArg === 'string' ? JSON.parse(recordArg) : recordArg; }
+        catch (e) { orbitError('[orbit] appendEvaluateMarker: bad JSON arg'); return null; }
+        if (!record || typeof record !== 'object') record = {};
+        if (record.tool == null) record.tool = 'evaluate';
+        // Fill in id + at from a single instant when the caller omits
+        // them, so the agent doesn't have to compute anything.
+        const nowIso = new Date().toISOString();
+        if (record.at == null) record.at = nowIso;
+        if (record.id == null) {
+            record.id = record.at.replace(/[:.]/g, '-').replace('Z', '') +
+                '-' + Math.random().toString(36).slice(2, 8);
+        }
+        const line = JSON.stringify(record);
+        await persistMarker((text) => {
+            // Insert directly below the header (first line); newest first.
+            const nl = text.indexOf('\n');
+            return nl >= 0
+                ? text.slice(0, nl + 1) + line + '\n' + text.slice(nl + 1)
+                : text + (text.endsWith('\n') || text === '' ? '' : '\n') + line + '\n';
+        });
+        orbitLog(`[orbit] evaluate marker appended: ${record.id} ` +
+            `(backend ${record.backend || '?'})`);
+        return record.id;
+    }
+
+    // The current ledger as an array of records (newest first), for the
+    // eval bridge and anything else that needs to list evaluations.
+    // Reads the open buffer when present, else disk.
+    function listEvaluateMarkers() {
+        return parseMarkerLines(currentMarkerText()).map((m) => m.record);
+    }
+
+    // Reset the ledger to header-only, dropping every marker. Driven by
+    // the eval bridge (the web component's Clear button). Uses
+    // persistMarker so an open editor buffer stays authoritative and no
+    // chat Keep/Undo buttons attach. Returns { ok, cleared:N }.
+    async function performEvaluateClear() {
+        let removed = 0;
+        await persistMarker((text) => {
+            for (const line of text.split(/\r?\n/)) {
+                const t = line.trim();
+                if (t && t[0] === '{') removed++;
+            }
+            return EVAL_MARKERS_HEADER + '\n';
+        });
+        orbitLog(`[orbit] evaluate ledger cleared (${removed} marker` +
+            `${removed === 1 ? '' : 's'})`);
+        return { ok: true, cleared: removed };
+    }
+
+    async function clearEvaluateMarkersCommand() {
+        const file = evalMarkersFsPath();
+        if (file) ensureEvalMarkersFile(file);
+        const result = await performEvaluateClear();
+        return result.cleared;
+    }
+
+    // Core rollback: signal the tether and stamp the matching marker
+    // "undoneAt". Driven by the eval bridge (the web component's ↩ Undo).
+    // Returns { ok, record, alreadyUndone?, reason? } — never throws for
+    // the expected not-found / already-undone cases.
+    async function performEvaluateUndo(id) {
+        const wantId = String(id);
+        const text = currentMarkerText();
+        if (text == null) {
+            return { ok: false, reason: 'no-ledger' };
+        }
+        let live = null;
+        for (const line of text.split(/\r?\n/)) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed[0] !== '{') continue;
+            let rec; try { rec = JSON.parse(trimmed); } catch (_) { continue; }
+            if (rec && String(rec.id) === wantId) { live = rec; break; }
+        }
+        if (!live) {
+            return { ok: false, reason: 'not-found' };
+        }
+        if (live.undoneAt) {
+            return { ok: false, alreadyUndone: true, record: live };
+        }
+        // 1. Signal the rollback over the tether (fire-and-forget).
+        signalEvaluateUndo(live);
+        // 2. Stamp the matching line undone — audit trail + idempotency
+        //    guard. Re-find by id inside the transform so we stamp the
+        //    correct line even if the ledger shifted.
+        const undoneAt = new Date().toISOString();
+        await persistMarker((t) => {
+            const lines = t.split(/\r?\n/);
+            for (let i = 0; i < lines.length; i++) {
+                const trimmed = lines[i].trim();
+                if (!trimmed || trimmed[0] !== '{') continue;
+                let rec; try { rec = JSON.parse(trimmed); } catch (_) { continue; }
+                if (rec && String(rec.id) === wantId && !rec.undoneAt) {
+                    rec.undoneAt = undoneAt;
+                    lines[i] = JSON.stringify(rec);
+                    break;
+                }
+            }
+            return lines.join('\n');
+        });
+        return { ok: true, record: Object.assign({}, live, { undoneAt }) };
+    }
+
+    function setupEvalMarkers(context) {
+        const file = evalMarkersFsPath();
+        if (file) ensureEvalMarkersFile(file);
+        const appendCmd = vscode.commands.registerCommand(
+            APPEND_EVAL_COMMAND, appendEvaluateMarkerCommand);
+        const clearCmd = vscode.commands.registerCommand(
+            CLEAR_EVAL_COMMAND, clearEvaluateMarkersCommand);
+        if (context && context.subscriptions) {
+            context.subscriptions.push(appendCmd, clearCmd);
+        }
+        orbitLog('[orbit] evaluate marker commands armed' + (file ? ' on ' + file : ''));
     }
 
     // Pick the bridge endpoint that backs the Caffeine MCP server.
@@ -141,7 +417,7 @@ module.exports = function (vscode) {
         return `http://${backendHost}:${backend.webdavPort}/webdav`;
     }
 
-    // Headers to send to the Orbit McpBridge so it accepts the
+    // Headers to send to the Orbit CaffeineBridge so it accepts the
     // proxied JSON-RPC POST. The bridge gates POSTs on the same
     // Orbit MCP bearer that the 2300 backends accept via OAuth; we
     // bypass OAuth here because the bridge endpoint is local-only.
@@ -180,7 +456,7 @@ module.exports = function (vscode) {
     // Probe all backends in parallel for either 'mcp' or 'webdav'
     // service. Returns an array of {backend, reachable}. Bridge-kind
     // backends only support 'mcp' (their reachability is "is there a
-    // tether registered with the Orbit McpBridge?"); they are always
+    // tether registered with the Orbit CaffeineBridge?"); they are always
     // unreachable for 'webdav'.
     async function probeBackends(kind) {
         const probes = BACKENDS.map(async (b) => {
@@ -537,12 +813,23 @@ module.exports = function (vscode) {
     const mcpRunning = {};
     for (const b of BACKENDS) mcpRunning[b.name] = false;
 
+    // Servers the user has explicitly stopped via the Orbit view
+    // checkbox. While a name is in this set, the auto-reconnect
+    // machinery (postState's reconcile-to-true probe and
+    // activateReachableBackends' restart loop) leaves it alone, so a
+    // manual stop sticks instead of being instantly reverted. Cleared
+    // when the user starts the server again (or on orbit.start/stop).
+    const mcpUserStopped = new Set();
+
     const mcpServers = BACKENDS.map((b) => ({
         name: b.name,
         getRunning: () => !!mcpRunning[b.name],
         setRunning: async (running) => {
             const id = mcpServerIdFor(b.name);
             if (running) {
+                // User intent: keep this server running. Re-enable the
+                // auto-reconnect machinery for it.
+                mcpUserStopped.delete(b.name);
                 try {
                     await vscode.commands.executeCommand(
                         'workbench.mcp.startServer',
@@ -577,6 +864,9 @@ module.exports = function (vscode) {
                         id
                     );
                     mcpRunning[b.name] = false;
+                    // User intent: keep this server stopped. Suppress
+                    // auto-reconnect until the user starts it again.
+                    mcpUserStopped.add(b.name);
                 } catch (e) {
                     orbitError(`[orbit] MCP stopServer ${b.name} failed:`, e && e.message);
                 }
@@ -1118,6 +1408,93 @@ module.exports = function (vscode) {
         } catch (_) {}
     }
 
+    // ---- Evaluate-ledger bridge ------------------------------------------
+    // Expose the evaluate-undo ledger to the Orbit page so the
+    // <evaluate-ledger> web component can list markers and trigger
+    // rollbacks — the in-page equivalent of the editor CodeLenses. Same
+    // loopback-server + tmp-port-file + app-impl proxy pattern as the
+    // chat and workspace-fs bridges.
+    //
+    //   GET  /eval/markers       → { ok, markers: [record, …] } (newest first)
+    //   POST /eval/undo {id}     → { ok, record } | { ok:false, … }
+    //   POST /eval/clear         → { ok, cleared:N } (resets to header-only)
+    const EVAL_PORT_FILE = path.join(os.tmpdir(), 'orbit-eval.port');
+    let evalBridgeServer = null;
+
+    function startEvalBridge() {
+        if (evalBridgeServer) return;
+        const srv = http.createServer((req, res) => {
+            const remote = req.socket && req.socket.remoteAddress;
+            if (remote && remote !== '127.0.0.1' && remote !== '::1' && remote !== '::ffff:127.0.0.1') {
+                res.statusCode = 403; res.end(); return;
+            }
+            const url = req.url || '';
+            if (req.method === 'GET' && url === '/eval/markers') {
+                try {
+                    return sendJson(res, 200, { ok: true, markers: listEvaluateMarkers() });
+                } catch (err) {
+                    return sendJson(res, 500, { error: String(err && err.message || err) });
+                }
+            }
+            if (url === '/eval/undo') {
+                if (req.method !== 'POST') { res.statusCode = 405; res.end(); return; }
+                let chunks = '';
+                req.setEncoding('utf8');
+                req.on('data', (c) => { chunks += c; if (chunks.length > 256 * 1024) req.destroy(); });
+                req.on('end', () => {
+                    let id = null;
+                    try {
+                        const parsed = chunks ? JSON.parse(chunks) : {};
+                        if (parsed && parsed.id != null) id = String(parsed.id);
+                    } catch (_) {}
+                    if (!id) { return sendJson(res, 400, { error: 'missing id' }); }
+                    Promise.resolve(performEvaluateUndo(id)).then((result) => {
+                        const code = result.ok ? 200
+                            : result.alreadyUndone ? 409
+                            : result.reason === 'not-found' ? 404 : 500;
+                        sendJson(res, code, result);
+                    }, (err) => {
+                        sendJson(res, 500, { error: String(err && err.message || err) });
+                    });
+                });
+                return;
+            }
+            if (url === '/eval/clear') {
+                if (req.method !== 'POST') { res.statusCode = 405; res.end(); return; }
+                Promise.resolve(performEvaluateClear()).then((result) => {
+                    sendJson(res, 200, result);
+                }, (err) => {
+                    sendJson(res, 500, { error: String(err && err.message || err) });
+                });
+                return;
+            }
+            res.statusCode = 404; res.end();
+        });
+        srv.on('error', (err) => {
+            orbitError('[orbit] eval bridge error:', err && err.message);
+        });
+        srv.listen(0, '127.0.0.1', () => {
+            const port = srv.address().port;
+            try {
+                fs.writeFileSync(EVAL_PORT_FILE, String(port), { mode: 0o600 });
+            } catch (e) {
+                orbitError('[orbit] failed to write eval port file:', e && e.message);
+            }
+            orbitLog('[orbit] eval bridge listening on 127.0.0.1:' + port);
+        });
+        evalBridgeServer = srv;
+    }
+
+    function stopEvalBridge() {
+        if (evalBridgeServer) {
+            try { evalBridgeServer.close(); } catch (_) {}
+            evalBridgeServer = null;
+        }
+        try {
+            if (fs.existsSync(EVAL_PORT_FILE)) fs.unlinkSync(EVAL_PORT_FILE);
+        } catch (_) {}
+    }
+
     // ---- WebDAV server endpoint ------------------------------------------
     // Each Smalltalk backend exposes a WebDAV server on its own port
     // (see BACKENDS). The Orbit extension talks to those servers
@@ -1406,7 +1783,7 @@ module.exports = function (vscode) {
 
             // Invalidate require-cache entries under the website tree
             // so livecoding edits to app-impl.js, routes, src/tether.js,
-            // src/mcp-bridge.js, etc. take effect on the next
+            // src/caffeine-bridge.js, etc. take effect on the next
             // orbit.start without a full window reload (which would
             // restart SqueakJS in the page). We deliberately skip
             // extension-impl.js (we're running inside it) and anything
@@ -1445,6 +1822,21 @@ module.exports = function (vscode) {
             const app = require(path.join(context.extensionPath, 'app'));
             currentApp = app;
 
+            // Expose the reachable backend Snowglobe ports to the page
+            // (consumed by GET /orbit/backends.json, dialed by the
+            // Caffeine image's Lam2300>>connect). Probing here, on the
+            // extension host, mirrors the LAN path the browser uses, so
+            // the page only opens Snowglobe/tether WebSockets to
+            // backends that are actually up.
+            app.orbitSnowglobePorts = async () => {
+                try {
+                    const reachable = await reachableBackends('webdav');
+                    return reachable.map(b => b.webdavPort);
+                } catch (_) {
+                    return null;
+                }
+            };
+
             // Start per-backend MCP reverse-proxy servers so each
             // gets a unique serverInfo.name (and thus a distinct tool
             // prefix in VS Code). Each proxy listens on its own port
@@ -1461,7 +1853,7 @@ module.exports = function (vscode) {
                 orbitError('[orbit] MCP proxy require failed:', e && e.message);
             }
 
-            // Hook the McpBridge so a fresh page-MCP announce can
+            // Hook the CaffeineBridge so a fresh page-MCP announce can
             // refire VS Code's MCP definitions (used to expose the
             // Caffeine backend). We install the hook here because
             // the MCP definition provider is registered earlier in
@@ -1469,10 +1861,10 @@ module.exports = function (vscode) {
             if (app.mcpBridge && mcpDefinitionsChanged) {
                 // Route the bridge's logs through the Orbit output
                 // channel so we can see incoming HTTP requests.
-                app.mcpBridge.log = (...a) => orbitLog('[mcp-bridge]', ...a);
-                app.mcpBridge.error = (...a) => orbitError('[mcp-bridge]', ...a);
+                app.mcpBridge.log = (...a) => orbitLog('[caffeine-bridge]', ...a);
+                app.mcpBridge.error = (...a) => orbitError('[caffeine-bridge]', ...a);
                 app.mcpBridge.onProvidersChanged = () => {
-                    orbitLog('[orbit] McpBridge providers changed; refiring MCP definitions');
+                    orbitLog('[orbit] CaffeineBridge providers changed; refiring MCP definitions');
                     try { mcpDefinitionsChanged.fire(); } catch (_) {}
                     activateReachableBackends().catch((e) => {
                         orbitError('[orbit] activateReachableBackends after bridge change failed:',
@@ -1949,7 +2341,7 @@ module.exports = function (vscode) {
 
             server = http.createServer(app);
 
-            // The MCP bridge (see website/src/mcp-bridge.js) needs to
+            // The MCP bridge (see website/src/caffeine-bridge.js) needs to
             // own the WebSocket upgrade for its path; install its
             // upgrade listener now, before any clients connect.
             if (typeof app.attachMcpBridge === 'function') {
@@ -1968,6 +2360,11 @@ module.exports = function (vscode) {
                 if (openBrowser) {
                     showOrbitBrowser(orbitUrl(addr.port));
                 }
+                // Register the evaluate-marker append command and ensure
+                // the ledger file exists (undo itself is driven by the
+                // in-webapp Evaluate ledger via the eval bridge).
+                try { setupEvalMarkers(context); }
+                catch (e) { orbitError('[orbit] setupEvalMarkers failed:', e && e.message); }
                 // Start the MCP reverse proxies and wait for them so
                 // mcpProxies is set before we resolve — callers
                 // (orbit.start, autoStart) immediately run
@@ -2158,6 +2555,7 @@ module.exports = function (vscode) {
         // genuinely has an active MCP client connection.
         for (const b of BACKENDS) {
             if (mcpRunning[b.name]) continue;
+            if (mcpUserStopped.has(b.name)) continue;
             if (b.kind === 'bridge') continue;
             const connected = await isMcpServerConnected(b.name);
             if (connected) {
@@ -2192,6 +2590,7 @@ module.exports = function (vscode) {
         }
         for (const { b, mcp } of probes) {
             if (!mcp || mcpRunning[b.name]) continue;
+            if (mcpUserStopped.has(b.name)) continue;
             try {
                 await vscode.commands.executeCommand(
                     'workbench.mcp.startServer',
@@ -2226,7 +2625,7 @@ module.exports = function (vscode) {
         if (orbitTreeChangeFire) {
             try { orbitTreeChangeFire(); } catch (_) {}
         }
-        return BACKENDS.every(b => mcpRunning[b.name]);
+        return BACKENDS.every(b => mcpRunning[b.name] || mcpUserStopped.has(b.name));
     }
 
     // Periodically retry activateReachableBackends so a backend that
@@ -2277,95 +2676,50 @@ module.exports = function (vscode) {
         }
     }
 
-    // Replay all ops from the local audit trail into the Keep store.
-    // Called once on startup after the Caffeine MCP bridge is available,
-    // to recover state lost by an un-snapshotted image reload.
+    // Replay Keep state from the Caffeine-managed IndexedDB audit log.
+    // Called once on startup after the Caffeine MCP bridge is available.
+    // The Caffeine image handles its own persistence via the keepReplayAudit
+    // tool, which reads ops from the page's IndexedDB and replays them into
+    // the in-memory KStore.
     async function replayAuditTrailIntoKeep() {
         const bridgeEp = bridgeEndpointFor(backendByName('Caffeine'));
         if (!bridgeEp) {
             orbitLog('[keep-sync] Audit replay: Caffeine bridge not available');
             return;
         }
-        const auditDir = path.join(
-            vscode.workspace.workspaceFolders
-                && vscode.workspace.workspaceFolders[0]
-                && vscode.workspace.workspaceFolders[0].uri.fsPath
-                || context.extensionPath,
-            'audit');
-        let allOps = [];
+        const rpcBody = JSON.stringify({
+            jsonrpc: '2.0',
+            id: Date.now(),
+            method: 'tools/call',
+            params: { name: 'keepReplayAudit', arguments: {} }
+        });
         try {
-            const files = fs.readdirSync(auditDir)
-                .filter(f => f.endsWith('-keep-ops.jsonl'))
-                .sort();
-            for (const f of files) {
-                const content = fs.readFileSync(path.join(auditDir, f), 'utf8');
-                for (const line of content.split('\n')) {
-                    if (!line.trim()) continue;
-                    try { allOps.push(JSON.parse(line)); }
-                    catch (_) {}
-                }
-            }
-        } catch (_) { return; }
-
-        if (allOps.length === 0) return;
-        orbitLog(`[keep-sync] Replaying ${allOps.length} ops from audit trail into Keep...`);
-
-        let replayed = 0;
-        for (const op of allOps) {
-            if (!op.op || !op.id) continue;
-            let toolName, toolArgs;
-            if (op.op === 'put') {
-                toolName = 'keepPut';
-                toolArgs = {
-                    id: op.id,
-                    agent: op.agent || 'sync',
-                    content: op.content || '',
-                    summary: op.summary || '',
-                    tags: op.tags ? JSON.stringify(op.tags) : undefined
-                };
-            } else if (op.op === 'tag') {
-                toolName = 'keepTag';
-                toolArgs = { id: op.id, tags: op.tags ? JSON.stringify(op.tags) : '{}' };
-            } else if (op.op === 'remove') {
-                toolName = 'keepRemove';
-                toolArgs = { id: op.id };
-            }
-            if (!toolName) continue;
-            const rpcBody = JSON.stringify({
-                jsonrpc: '2.0',
-                id: Date.now() + replayed,
-                method: 'tools/call',
-                params: { name: toolName, arguments: toolArgs }
-            });
-            try {
-                await new Promise((resolve, reject) => {
-                    const r = require('http').request({
-                        hostname: 'localhost',
-                        port: ORBIT_WEB_PORT,
-                        path: bridgeEp,
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'Content-Length': Buffer.byteLength(rpcBody)
-                        }
-                    }, (resp) => {
-                        let d = '';
-                        resp.on('data', c => { d += c; });
-                        resp.on('end', () => {
-                            if (resp.statusCode >= 200 && resp.statusCode < 300) resolve(d);
-                            else reject(new Error(`bridge ${resp.statusCode}: ${d.slice(0, 200)}`));
-                        });
+            const result = await new Promise((resolve, reject) => {
+                const r = require('http').request({
+                    hostname: 'localhost',
+                    port: ORBIT_WEB_PORT,
+                    path: bridgeEp,
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Content-Length': Buffer.byteLength(rpcBody)
+                    }
+                }, (resp) => {
+                    let d = '';
+                    resp.on('data', c => { d += c; });
+                    resp.on('end', () => {
+                        if (resp.statusCode >= 200 && resp.statusCode < 300) resolve(d);
+                        else reject(new Error(`bridge ${resp.statusCode}: ${d.slice(0, 200)}`));
                     });
-                    r.on('error', reject);
-                    r.write(rpcBody);
-                    r.end();
                 });
-                replayed++;
-            } catch (e) {
-                orbitLog(`[keep-sync] Replay failed for ${op.op} ${op.id}: ${e.message}`);
-            }
+                r.on('error', reject);
+                r.write(rpcBody);
+                r.end();
+            });
+            orbitLog(`[keep-sync] Audit replay complete (Caffeine IndexedDB): ${result}`);
+        } catch (e) {
+            orbitLog(`[keep-sync] Audit replay failed: ${e.message}`);
         }
-        orbitLog(`[keep-sync] Audit replay complete: ${replayed}/${allOps.length} ops replayed`);
     }
 
     let activateBackendsTimer = null;
@@ -2476,6 +2830,7 @@ module.exports = function (vscode) {
         startClipboardBridge();
         startChatBridge();
         startWorkspaceFsBridge();
+        startEvalBridge();
         setRunningContext(false);
 
         // Register the in-process WebDAV FileSystemProvider under the
@@ -2737,6 +3092,9 @@ module.exports = function (vscode) {
                 mcpRunning[b.name] = false;
                 notifyMcpState(b.name, false);
             }
+            // A full teardown clears any per-server user-stop intent;
+            // the next orbit.start should bring every backend back up.
+            mcpUserStopped.clear();
             if (mcpEnabled) {
                 mcpEnabled = false;
                 if (mcpDefinitionsChanged) mcpDefinitionsChanged.fire();
@@ -2747,7 +3105,7 @@ module.exports = function (vscode) {
 
         // Recycle just the HTTP server (and its WebSocket upgrade
         // handler) so livecoding edits to app-impl.js / routes /
-        // src/mcp-bridge.js / src/tether.js take effect without
+        // src/caffeine-bridge.js / src/tether.js take effect without
         // touching the Orbit browser tab. Unlike orbit.start, this
         // does not close tabs, withdraw MCP definitions, remount
         // WebDAV folders, or restart the SqueakJS image in the page.
@@ -2936,6 +3294,14 @@ module.exports = function (vscode) {
                         if (mcpRunning[s.name]) {
                             return { name: s.name, running: true };
                         }
+                        // Respect an explicit user stop: report it as
+                        // stopped without probing, so the checkbox
+                        // stays unchecked instead of being reverted by
+                        // an echoMessage round-trip that still succeeds
+                        // moments after stopServer.
+                        if (mcpUserStopped.has(s.name)) {
+                            return { name: s.name, running: false };
+                        }
                         const connected = await isMcpServerConnected(s.name);
                         if (connected) {
                             mcpRunning[s.name] = true;
@@ -3008,7 +3374,6 @@ module.exports = function (vscode) {
     font-size: 0.9em;
   }
   .view-btn {
-    margin-left: auto;
     cursor: pointer;
     padding: 1px 6px;
     border: 1px solid var(--vscode-button-border, transparent);
@@ -3055,10 +3420,12 @@ module.exports = function (vscode) {
   </div>
   <hr id="hr-memory">
   <div id="memory-section-label" class="section-label">memory</div>
+  <div id="memory-view-row" class="server">
+    <button id="keep-view-btn" class="view-btn">view</button>
+  </div>
   <div id="memory-row" class="server">
     <input type="checkbox" id="memory-toggle">
     <label for="memory-toggle" class="name">share memory with other Orbits</label>
-    <button id="keep-view-btn" class="view-btn">view</button>
   </div>
   <hr id="hr-top">
   <div id="mcp-section-label" class="section-label">remote systems</div>
@@ -3102,6 +3469,7 @@ module.exports = function (vscode) {
     document.getElementById('hr-memory').style.display = showMemory ? '' : 'none';
     document.getElementById('memory-section-label').style.display = showMemory ? '' : 'none';
     document.getElementById('memory-row').style.display = showMemory ? '' : 'none';
+    document.getElementById('memory-view-row').style.display = showMemory ? '' : 'none';
     memoryCb.checked = !!state.keepSyncEnabled;
     const hasServers = state.orbitRunning && state.servers && state.servers.length > 0;
     document.getElementById('hr-top').style.display = hasServers ? '' : 'none';
@@ -3700,6 +4068,7 @@ module.exports = function (vscode) {
             // passes explicitly, so a manual start still wires
             // everything up.
             for (const b of BACKENDS) mcpRunning[b.name] = false;
+            mcpUserStopped.clear();
             const wantAutoStart = (() => {
                 try {
                     const cfg = vscode.workspace.getConfiguration('orbit').inspect('autoStart');
@@ -3859,6 +4228,7 @@ module.exports = function (vscode) {
         stopClipboardBridge();
         stopChatBridge();
         stopWorkspaceFsBridge();
+        stopEvalBridge();
         stopBackendActivationRetries();
         stopMcpDisconnectWatcher();
         stopTunnelHost();

@@ -5,6 +5,17 @@
 		}
 	],
 	"settings": {
+		"terminal.integrated.automationProfile.osx": {
+			"path": "/bin/zsh",
+			"args": ["--no-rcs", "--no-globalrcs"]
+		},
+		"terminal.integrated.profiles.osx": {
+			"zsh-virgin": {
+				"path": "/bin/zsh",
+				"args": ["--no-rcs", "--no-globalrcs"]
+			}
+		},
+		"terminal.integrated.defaultProfile.osx": "zsh-virgin",
 		"chat.tools.terminal.autoApprove": {
 			"/^cd /Users/craig/me/behavior/forks/orbit/website && npm run package -- --allow-missing-repository$/": {
 				"approve": true,

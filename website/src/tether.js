@@ -41,7 +41,7 @@ caffeine.specialVariables.set(caffeine.tags.get('trueTag'),  true);
 caffeine.specialVariables.set(caffeine.tags.get('falseTag'), false);
 caffeine.specialVariables.set(caffeine.tags.get('nilTag'),   null);
 
-// One Map per bridge instance (created by mcp-bridge). We keep a
+// One Map per bridge instance (created by caffeine-bridge). We keep a
 // module-level fallback for callers that don't supply one, matching
 // the bridge.js shape.
 caffeine.tethers = new Map();
@@ -117,11 +117,24 @@ caffeine.Portal = class { constructor(websocket) {
     this.initializeOutgoingMessage();
 }};
 
-caffeine.OtherMarker = class { constructor(object, tether, tethers) {
-    this.object = object;
-    const match = Array.from(tethers || caffeine.tethers).filter(
-        ([, value]) => value === object);
-    this.exposureHash = match[0][1].exposureHash;
+caffeine.OtherMarker = class { constructor(objectOrHash, tether, tethers) {
+    // An OtherMarker stands in for an object exposed on the OTHER side
+    // of a tether, identified by the exposure hash that side assigned
+    // it. It can be constructed two ways:
+    //   • from a bare exposure-hash number — a reference to a peer
+    //     (non-local) object, e.g. one handed back to us as an answer;
+    //   • from a locally-exposed Tether object, whose hash we look up
+    //     in the tethers registry (the original use, for addressing a
+    //     sibling tether that isn't the sender).
+    if (typeof objectOrHash === 'number') {
+        this.object = null;
+        this.exposureHash = objectOrHash;
+    } else {
+        this.object = objectOrHash;
+        const match = Array.from(tethers || caffeine.tethers).filter(
+            ([, value]) => value === objectOrHash);
+        this.exposureHash = match[0][1].exposureHash;
+    }
 
     this.storeOnTether = (t) => {
         t.nextWordPut(this.exposureHash + caffeine.otherMarkerBase);
@@ -227,6 +240,8 @@ caffeine.Tether = class { constructor(websocket, tethers) {
             this.nextBytesPut([...object].map((c) => c.codePointAt(0)));
         } else if (object && object.constructor === Uint8Array) {
             this.storeByteArray(object);
+        } else if (object && object.constructor === caffeine.OtherMarker) {
+            object.storeOnTether(this);
         } else if (object && object.constructor === caffeine.Tether) {
             object.storeOnTether(this);
         } else if (object && object.constructor === caffeine.UUID) {
@@ -246,14 +261,48 @@ caffeine.Tether = class { constructor(websocket, tethers) {
         array.forEach((each) => this.nextBytePut(each));
     };
 
-    this.sendMessage = (receiver, selector, args) => {
-        return new Promise((resolve) => {
+    this.sendMessage = (receiver, selector, args, options) => {
+        options = options || {};
+        const timeoutMs = typeof options.timeoutMs === 'number'
+            ? options.timeoutMs : 0;
+        // The receiver of a message-send is encoded as a BARE exposure
+        // hash (a raw word) — unlike object references in argument and
+        // answer positions, which carry the otherMarkerBase offset. So
+        // we don't route the receiver through store(); we derive its
+        // bare hash from a number, an OtherMarker (a peer reference),
+        // or a Tether (self / local).
+        const receiverHash =
+            typeof receiver === 'number' ? receiver
+            : (receiver && (receiver.constructor === caffeine.OtherMarker
+                            || receiver.constructor === caffeine.Tether))
+                ? receiver.exposureHash
+                : undefined;
+        if (receiverHash === undefined || receiverHash === null) {
+            return Promise.reject(new Error('unaddressable message-send receiver'));
+        }
+        return new Promise((resolve, reject) => {
             const uuid = new caffeine.UUID();
-            this.outgoingMessages.set(uuid, resolve);
+            let settled = false;
+            const cleanup = () => {
+                if (settled) return;
+                settled = true;
+                if (timer) { try { clearTimeout(timer); } catch (_) {} }
+                this.outgoingMessages.delete(uuid);
+            };
+            const resolver = (value) => { if (settled) return; cleanup(); resolve(value); };
+            // Expose the rejection path so a close handler can fail
+            // in-flight sends without changing the resolver-only
+            // contract that handleEventFrom relies on.
+            resolver.__reject = (err) => { if (settled) return; cleanup(); reject(err); };
+            const timer = timeoutMs > 0 ? setTimeout(() => {
+                resolver.__reject(new Error(
+                    'message-send ' + selector + ' timed out after ' + timeoutMs + 'ms'));
+            }, timeoutMs) : null;
+            this.outgoingMessages.set(uuid, resolver);
             this.send(() => {
                 this.nextBytesPut([32, 0, 0, 7]);   // a message-send
                 this.store(uuid);                   // exchange UUID
-                this.store(receiver);               // receiver
+                this.nextWordPut(receiverHash);     // receiver (bare hash)
                 this.nextBytesPut([32, 0, 0, 33]);  // a Message
                 this.storeSymbol(selector);         // selector
                 this.storeArray(args);              // arguments
@@ -273,7 +322,15 @@ caffeine.Tether = class { constructor(websocket, tethers) {
             throw new Error('instruction encountered when object expected');
         }
         if (tag >= caffeine.otherMarkerBase) {
-            return this.exposedObjects.get(tag - caffeine.otherMarkerBase);
+            // A reference to an object exposed on a tether. If we exposed
+            // it, hand back that local object; otherwise it's a peer
+            // object, so wrap its bare hash in an OtherMarker that can be
+            // stored back as a receiver in a subsequent message-send.
+            const hash = tag - caffeine.otherMarkerBase;
+            const local = this.exposedObjects.get(hash);
+            return local !== undefined
+                ? local
+                : new caffeine.OtherMarker(hash);
         }
         if (tag >= caffeine.smallIntegerTagBase) {
             return tag - caffeine.smallIntegerTagBase;

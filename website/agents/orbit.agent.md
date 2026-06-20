@@ -43,15 +43,24 @@ of the host chrome, not Snowglobe-mapped remote-window proxies, and
 must not be removed by cleanup code. Only touch elements you have
 positive evidence are Snowglobe-mapped remote windows.
 
-### never enumerate all classes in the remote Smalltalk
+### never enumerate all classes (either Smalltalk)
 
 Do not iterate over `Smalltalk allClassesDo:` (or equivalent
-whole-system scans) to search for senders, references, source
-substrings, etc. It's slow and can destabilize the image. Use the
-dedicated MCP tools instead: `getAllSenders`, `getAllImplementors`,
-`getAllReferences`, `findByName`, etc. If you only need to inspect a
-known class, query it directly (`SomeClass methodDictionary`,
-`SomeClass classPool`).
+whole-system scans like `allBehaviorsDo:`, `allClassesAndTraitsDo:`)
+to search for senders, references, source substrings, or — especially
+— to locate classes by name. It's slow and can destabilize the image.
+This applies to **both** the remote VisualWorks image and the local
+Caffeine/SqueakJS image.
+
+Use the dedicated tools instead:
+
+- To locate classes by name in the **Caffeine/SqueakJS** image, use
+  the `mcp_caffeine_findClassNames` MCP tool (case-insensitive
+  substring, or a `*` glob). It reads only the class-name set.
+- In the **remote VisualWorks** image, use `getAllSenders`,
+  `getAllImplementors`, `getAllReferences`, `findByName`, etc.
+- If you only need to inspect a known class, query it directly
+  (`SomeClass methodDictionary`, `SomeClass classPool`).
 
 ### re-reading this file when it changes
 
@@ -63,6 +72,14 @@ and obey it, without fail.
 Do not create additional steering files. When steering needs to be
 updated, modify this file by editing existing sections or adding new
 sections.
+
+### project memories
+
+Accumulated lessons, conventions, and debugging notes live in
+`./memories/` (top-level workspace directory). Read the files there at
+session start or when you need context about past decisions. When you
+learn something worth remembering, add or update a file in that
+directory rather than using `/memories/repo/`.
 
 ### conversation summaries
 
@@ -265,6 +282,58 @@ In a method, you must declare all temporary variables in a single
 pipe-delimited section at the beginning. You cannot have multiple
 temporary variable declaration sections.
 
+#### Always write an undo marker before an "evaluate" tool call
+
+The user can roll back the effect of an `evaluate` call from the
+in-webapp **Evaluate ledger** window (the `<evaluate-ledger>` web
+component), a table of every marker with a per-row **↩ Undo** button.
+Clicking it POSTs to the Orbit extension's eval bridge, which signals
+the rollback and stamps the row — no editor edit, so it never triggers
+VS Code's blocking "Would you like to undo 'X'?" modal (unlike the chat
+Keep/Undo controls, which always do for agent file edits). For the row
+to exist, **you** must record the marker line — but **not with your
+edit tools**: editing the logfile with
+`create_file`/`replace_string_in_file` makes the chat Keep/Undo buttons
+attach to it, which is exactly what we're avoiding.
+
+The markers live in a single, persistent ledger:
+
+```
+.orbit/toolLogs/evaluate-markers.jsonl
+```
+
+The Orbit extension owns this file. **Never create, edit, or delete it
+yourself with file tools.** Instead, record each marker by invoking the
+extension command `orbit.appendEvaluateMarker` (via `run_vscode_command`
+with `skipCheck: true`), passing the JSON record as the single string
+argument. The extension writes the line on disk itself, so the chat
+editing session never sees it and no Keep/Undo buttons appear.
+
+Immediately before every `evaluate` MCP tool call against a remote
+VisualWorks backend (`mcp_2300-ui_evaluate`, `mcp_2300-backend_evaluate`,
+`mcp_2300-tmc_evaluate`), invoke:
+
+```
+run_vscode_command(
+  commandId = "orbit.appendEvaluateMarker",
+  skipCheck = true,
+  args = ['{"tool":"evaluate","backend":"2300-ui","source":"<the Smalltalk source you are about to evaluate>"}']
+)
+```
+
+You don't compute anything: pass just `tool`, `backend`, and `source`.
+The extension generates the marker's `id` (a filename-safe, sortable
+unique id) and `at` timestamp for you, from a single instant. Record
+the actual backend you're calling so it's distinguishable. When the
+user clicks a row's **↩ Undo** button in the Evaluate ledger window,
+the extension signals the image to roll back the effect recorded for
+that marker (over the tether, to `Lam2300 class>>undo:`) and stamps the
+row `"undoneAt"` so it can't be undone twice. The rows are independent
+and the ledger is durable, so evaluations can be undone out of order
+and long after the fact. Record one marker per call. This does not
+apply to `runCode`, or to the Caffeine (`mcp_caffeine_evaluate`)
+backend.
+
 #### You can detect and manipulate unhandled exceptions
 
 In source code you evaluate, "self" is bound to an instance of a
@@ -278,6 +347,33 @@ debugger the system opens for the exception.
 
 You can use the WebDAV access to source code described above to read
 about these facilities.
+
+#### Long-running evaluations: poll for the result
+
+If an "evaluate" call doesn't finish quickly, you won't get the result
+inline. Instead you get a result whose status is `running`, carrying a
+`taskId` and a message describing the poll protocol. When that happens:
+
+1. Call the "createTaskProgressApp" tool exactly once, passing the
+   `taskId`. This mounts a single self-polling progress card for the
+   user. Don't call it again for the same task; the card polls itself
+   to completion.
+2. Then poll the "getTaskStatus" tool to retrieve the result. Pass the
+   `taskId` (or omit it to default to this conversation's most recent
+   task). Keep polling until it reports `finished` (or `failed`); it
+   returns the result alongside that status.
+
+`getTaskStatus` is the tool that actually delivers the result to you:
+keep polling it until it reports `finished` (or `failed`) and capture
+the result then. A task is only forgotten once **both** pollers have
+observed completion: the agent (via `getTaskStatus`) and the progress
+card (via its self-polls to `createTaskProgressApp`). Because removal
+can't precede either side's own observation, neither loses the result
+— the card always shows completion, and your `getTaskStatus` poll
+always returns the result. (If the progress card never renders — e.g.
+MCP Apps are disabled — only the agent ever observes completion, so
+the task is retained rather than removed; this is harmless but means
+finished tasks can linger in that case.)
 
 ### You can use Smalltalk MCP tools
 
@@ -346,6 +442,15 @@ the page), install it first by injecting the script into the page's
 `<head>` and writing/refreshing the source file. Treat this overlay
 as part of the page contract: it must never go stale while you are
 driving the mouse.
+
+When you are done using the mouse for a task, remove the purple
+cursor so it doesn't linger on the user's page: delete the
+`#agent-mouse-cursor` element and clear the `window.__agentMouseInstalled`
+flag (so a later task can reinstall it cleanly). This is the one
+sanctioned exception to the rule against removing `#agent-mouse-cursor`
+— that rule forbids *blanket/incidental* cleanup from sweeping it
+away, not the deliberate teardown of an overlay you yourself
+installed.
 
 ### clicking inside the Squeak canvas — coordinate mapping
 
@@ -458,6 +563,53 @@ already-installed VSIX (e.g. after a manual reinstall overwrote them),
 run ./scripts/js/install-extension.js instead. It does no build and no
 version bump.
 
+## 2300 simulation interaction
+
+The remote VisualWorks image hosts a live Lam 2300 cluster-tool
+simulator. A VR "digital twin" (`<lam2300-vr>`, served from
+`website/public/lam2300-vr.html`) renders it in the page, polling a
+computed WebDAV snapshot at
+`orbit-webdav://2300-ui/tool-state.json` (produced by
+`Snowglobe.SnowglobeToolStateFile`, whose JSON is built by
+`Snowglobe.SnowglobeToolState`). Tool state is held in CTROC
+variables, read/written via `CTRemote import: #SymbolName` →
+`value` / `value:`.
+
+### don't worry about alarms from unhandled exceptions
+
+When you interact with the 2300 simulation (probing CTROC variables,
+running exploratory `evaluate` snippets, etc.), every unhandled
+exception posts an alarm into the 2300 UI's alarm queue. Do not let
+that deter you, and do not contort your code to avoid it: just do the
+direct thing. The alarms are expected debris and you'll clear them
+later (e.g. `(LamAlarmHandler allInstances first) clearAlarmsNamed:
+#UnhandledException`). This does NOT relax the rule against
+whole-system class scans — it only means alarm noise from ordinary
+DNUs/Errors is acceptable.
+
+### restoring the live tool-state feed
+
+If the twin's HUD shows `offline (500)` and the snapshot endpoint
+returns `FileNotFound`/`EntryNotFound`, the WebDAV `RootResource`
+tree was rebuilt or lost its computed file. Re-run the shared
+variable's initializer:
+
+```smalltalk
+(Snowglobe.WebDAVServer classPool bindingFor: #RootResource)
+    reinitializeValue
+```
+
+### CTROC string variables can't hold true nil
+
+Writing `nil` to a string-typed CTROC variable stores the literal
+text `'nil'`; an empty string stays non-nil. So once you've written a
+register, you can't restore it to a genuine unset (nil) state via
+`value:`. The twin's state builder
+(`SnowglobeToolState class>>robotStateFor:effectors:using:`)
+normalizes blank / `'nil'` reads to nil so such residue doesn't show
+up as a phantom wafer; prefer fixing the twin-side normalization over
+fighting the registers.
+
 ## the Keep store
 
 If the user asks you to coordinate a multi-agent task through the
@@ -474,33 +626,9 @@ writing human review notes back into the store.
 
 ### Keep audit trail
 
-The Keep store lives only in volatile image memory until explicitly
-snapshotted. To enable crash recovery, every `keepPut` or `keepTag`
-operation MUST be followed by an append to the audit trail file
-`./audit/YYYY-MM-DD-keep-ops.jsonl` (use the date of the first
-entry in the file; don't start a new file mid-session).
-
-**Required fields for `put` entries:**
-
-```json
-{"op":"put","id":"<note-id>","ts":"<ISO8601>","agent":"<agent>","summary":"<summary>","tags":{...},"content":"<full note content>"}
-```
-
-Every `put` entry MUST include the full `content` and `tags` fields —
-these are the recovery payload. An entry without `content` is useless
-for crash recovery. Copy the content exactly as passed to `keepPut`.
-
-**Required fields for `tag` entries:**
-
-```json
-{"op":"tag","id":"<note-id>","ts":"<ISO8601>","tags":{...}}
-```
-
-**Rules:**
-- One JSON object per line, no trailing comma.
-- Newlines within `content` must be escaped as `\n` (standard JSON).
-- After a confirmed image snapshot, the audit file may be deleted.
-- Never delete the audit file without user consent.
+The Keep MCP tools handle their own audit logging internally
+(persisted to IndexedDB by the Caffeine image). Agents do NOT need
+to maintain a separate `./audit/` JSONL file for Keep operations.
 
 ## shared secret
 

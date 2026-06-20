@@ -60,4 +60,32 @@ router.get('/host.json', function (req, res) {
   });
 });
 
+// The Caffeine image's Lam2300>>connect opens one Snowglobe (and
+// tether) WebSocket per backend Snowglobe port. Dialing a backend
+// that isn't listening costs a slow TCP timeout and leaves a
+// "never connected" Snowglobe corpse in the image, and the noise
+// can delay the live backend's windows from mapping. So the page
+// asks us which backend Snowglobe ports are actually reachable
+// (as probed from this host, which shares the LAN path the browser
+// uses) and only connects to those. When the Orbit extension isn't
+// driving this webserver (plain webapp, no probe data), we fall back
+// to the full historical set so behavior is unchanged.
+var DEFAULT_SNOWGLOBE_PORTS = [19070, 19072, 19200];
+
+router.get('/backends.json', async function (req, res) {
+  if (!isPrivateAddress(req.ip)) {
+    return res.status(403).json({ error: 'forbidden', detail: 'private network only' });
+  }
+  var ports = null;
+  var provider = req.app.orbitSnowglobePorts;
+  if (typeof provider === 'function') {
+    try { ports = await provider(); } catch (_) { ports = null; }
+  }
+  if (!Array.isArray(ports) || ports.length === 0) {
+    ports = DEFAULT_SNOWGLOBE_PORTS;
+  }
+  // The image parses a whitespace-separated string of ports.
+  res.json({ ports: ports.join(' ') });
+});
+
 module.exports = router;

@@ -150,7 +150,37 @@ class KeepViewer extends HTMLElement {
     if (!this._graphLayout) this._graphLayout = 'force';
     this._setupHost();
     this._buildGraph();
+    this._applyDefaultCollapse();
     this._render();
+  }
+
+  // On first data load, collapse every section except the one with the
+  // most nodes, so the graph opens focused on the largest group rather
+  // than showing all groups expanded side-by-side. User toggles
+  // afterward are preserved (this runs only once).
+  _applyDefaultCollapse() {
+    if (this._defaultCollapseApplied) return;
+    var self = this;
+    var sizes = {};
+    Object.keys(this._groups).forEach(function(gid) {
+      sizes[gid] = self._groups[gid].length;
+    });
+    var ungroupedCount = this._notes.filter(function(n) {
+      return !self._childToGroup[n.id] && !(n.tags && n.tags.type === 'group');
+    }).length;
+    if (ungroupedCount > 0) sizes['__ungrouped__'] = ungroupedCount;
+
+    var sectionIds = Object.keys(sizes);
+    if (sectionIds.length === 0) { this._defaultCollapseApplied = true; return; }
+
+    var largest = sectionIds.reduce(function(best, id) {
+      return sizes[id] > sizes[best] ? id : best;
+    }, sectionIds[0]);
+
+    sectionIds.forEach(function(id) {
+      if (id !== largest) self._collapsedGroups.add(id);
+    });
+    this._defaultCollapseApplied = true;
   }
 
   // --- Internal ---
@@ -462,9 +492,10 @@ class KeepViewer extends HTMLElement {
       var type = n.tags && n.tags.type || '';
       var created = (n.createdAt || '').slice(0, 16).replace('T', ' ');
       var isChild = !!childToGroup[n.id];
+      var indent = isChild ? 'padding-left:18px;' : '';
       var groupBadge = type === 'group' ? '<span class="group-badge">▶</span> ' : '';
       return `<tr class="${isChild ? 'child-row' : ''}${type === 'group' ? ' group-row' : ''}" data-note-id="${KeepViewer._esc(n.id)}">
-        <td class="id">${groupBadge}${KeepViewer._esc(n.id)}</td>
+        <td class="id" style="${indent}">${groupBadge}${KeepViewer._esc(n.id)}</td>
         <td class="agent">${KeepViewer._esc(n.agent || (n.tags && n.tags.agent) || '')}</td>
         <td class="topic">${KeepViewer._esc(topic)}</td>
         <td class="type">${KeepViewer._esc(type)}</td>
@@ -664,8 +695,14 @@ class KeepViewer extends HTMLElement {
         '  legendEl.appendChild(el);\n' +
         '});\n' +
         'if (!legendData.length) legendEl.style.display = "none";\n' +
-        'import ForceGraph3D from "https://cdn.jsdelivr.net/npm/3d-force-graph/+esm";\n' +
-        'import SpriteText from "https://cdn.jsdelivr.net/npm/three-spritetext/+esm";\n' +
+        // Load 3d-force-graph and three-spritetext from esm.sh pinned to a
+        // single shared three instance (?deps=three@…). jsdelivr's /+esm
+        // bundles a separate three copy into each package, producing two
+        // THREE instances; the graph's raycaster (one copy) then cannot
+        // intersect the label sprites (the other copy), silently breaking
+        // node hover/tooltips. Sharing one three fixes raycasting.
+        'import ForceGraph3D from "https://esm.sh/3d-force-graph?deps=three@0.180.0";\n' +
+        'import SpriteText from "https://esm.sh/three-spritetext?deps=three@0.180.0";\n' +
         'import {forceCollide, forceRadial} from "https://cdn.jsdelivr.net/npm/d3-force-3d/+esm";\n' +
         'var data = ' + graphData + ';\n' +
         'var layout = ' + layoutMode + ';\n' +
@@ -757,6 +794,16 @@ class KeepViewer extends HTMLElement {
         '<\/script>\n</body></html>';
 
       iframe.srcdoc = html;
+
+      // Register this graph iframe with the host morphic-window's
+      // modifier-click system so cmd-drag moves the window even when the
+      // gesture starts over the 3D graph. The iframe lives in this
+      // component's shadow DOM, so the window's own light-DOM iframe scan
+      // never sees it — we must opt it in explicitly.
+      var MW = window.customElements && customElements.get('morphic-window');
+      if (MW && typeof MW._attachModifierClickToIframe === 'function') {
+        MW._attachModifierClickToIframe(iframe);
+      }
     });
 
     // Listen for click messages from iframes
@@ -1048,23 +1095,6 @@ class KeepViewer extends HTMLElement {
       overflow: auto;
       padding: 0;
       text-align: left;
-    }
-    .content::-webkit-scrollbar {
-      width: 8px;
-      height: 8px;
-    }
-    .content::-webkit-scrollbar-track {
-      background: #1a1a2a;
-    }
-    .content::-webkit-scrollbar-thumb {
-      background: #4a4a6a;
-      border-radius: 4px;
-    }
-    .content::-webkit-scrollbar-thumb:hover {
-      background: #6a6a8a;
-    }
-    .content::-webkit-scrollbar-corner {
-      background: #1a1a2a;
     }
     /* Table */
     table {

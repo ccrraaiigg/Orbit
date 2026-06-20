@@ -191,20 +191,71 @@ class MorphicWindow extends HTMLElement {
   // Clamp position so the window is fully visible within the viewport.
   // Adjusts left/top (and shrinks width/height if needed) so no edge
   // extends beyond the viewport boundaries.
+  //
+  // Self-healing: the shrink is released and re-measured on every call so
+  // that a window clamped to a small viewport re-expands when the viewport
+  // later grows. We only ever touch a width/height WE applied (tracked via
+  // _clampAppliedW/H); the pre-clamp inline value (which may be empty for a
+  // content-driven/canvas-backed window, or an intrinsic size set by a
+  // content component such as <markdown-viewer>) is captured and restored,
+  // so clamping never clobbers an intentional size.
   _clampToViewport() {
     var vw = window.innerWidth;
     var vh = window.innerHeight;
+
+    // A canvas-backed (Snowglobe-mapped) window shrink-wraps its slotted
+    // <canvas>, whose size is owned by the remote display policy. We must
+    // NOT write style.width/height on it here: that resizes the host
+    // chrome WITHOUT going through onResizeComplete, so Squeak is never
+    // told, the canvas desyncs from the chrome, and the window appears to
+    // vanish. For these windows we clamp position only and leave sizing to
+    // the remote resize path.
+    var canvasBacked = !!(this.querySelector && this.querySelector('canvas'));
+
+    if (!canvasBacked) {
+      // 1. Release any clamp WE applied previously, restoring the original
+      //    inline value so we can re-measure the natural size.
+      if (this._clampAppliedW) {
+        if (this._preClampW) this.style.width = this._preClampW;
+        else this.style.removeProperty('width');
+        this._clampAppliedW = false;
+      }
+      if (this._clampAppliedH) {
+        if (this._preClampH) this.style.height = this._preClampH;
+        else this.style.removeProperty('height');
+        this._clampAppliedH = false;
+      }
+    }
+
+    // 2. Measure the natural (unclamped) size.
     var w = this.offsetWidth;
     var h = this.offsetHeight;
-    // Shrink to fit if larger than viewport
-    if (w > vw) { this.style.width = vw + 'px'; w = vw; }
-    if (h > vh) { this.style.height = vh + 'px'; h = vh; }
+
+    // 3. Shrink to fit only if still larger than the viewport, remembering
+    //    the original inline value so it can be restored later. Skipped for
+    //    canvas-backed windows (see above).
+    if (!canvasBacked) {
+      if (w > vw) {
+        this._preClampW = this.style.width;
+        this.style.width = vw + 'px';
+        this._clampAppliedW = true;
+        w = vw;
+      }
+      if (h > vh) {
+        this._preClampH = this.style.height;
+        this.style.height = vh + 'px';
+        this._clampAppliedH = true;
+        h = vh;
+      }
+    }
+
+    // 4. Keep the window within the viewport bounds.
     var left = parseFloat(this.style.left) || 0;
     var top = parseFloat(this.style.top) || 0;
     if (left < 0) left = 0;
     if (top < 0) top = 0;
-    if (left + w > vw) left = vw - w;
-    if (top + h > vh) top = vh - h;
+    if (left + w > vw) left = Math.max(0, vw - w);
+    if (top + h > vh) top = Math.max(0, vh - h);
     this.style.left = left + 'px';
     this.style.top = top + 'px';
   }
@@ -401,7 +452,16 @@ class MorphicWindow extends HTMLElement {
     }
     this.style.transition = 'none';
     this.style.removeProperty('background');
-    this.style.backgroundColor = color;
+    // Restore the solid host bg by handing control BACK to the shadow
+    // stylesheet (`:host` #c0c0c0 / `:host(:hover)` #a8c8c8) rather than
+    // pinning an inline color. An inline background-color outranks the
+    // `:host(:hover)` rule, so leaving one here permanently defeats the
+    // teal hover tint for any window that has gone through a cutout
+    // transition (e.g. an interactive resize, whose pointer-up path does
+    // not otherwise clear it). The default `:host` color equals the
+    // normal lock color, so this is visually identical in the common
+    // case and additionally lets the stylesheet resolve the hover state.
+    this.style.removeProperty('background-color');
     this.getBoundingClientRect();
     // Don't leave 'transition: none' lingering on the host — later
     // transitions (collapse fade, etc.) would be silently suppressed
@@ -642,8 +702,16 @@ class MorphicWindow extends HTMLElement {
   }
 
   _onViewportResize() {
-    if (!this._isMaximized()) return;
-    this._resizeEmbeddedSurfaceToWindow();
+    if (this._isMaximized()) {
+      this._resizeEmbeddedSurfaceToWindow();
+      return;
+    }
+    // Re-evaluate viewport clamping for normal windows so one shrunk to fit
+    // a smaller viewport is released (and re-tracks its content) once the
+    // viewport grows again. Skip while a transition or interactive resize is
+    // in flight to avoid fighting those geometry animations.
+    if (this._isTransitioning || this._resizing) return;
+    this._clampToViewport();
   }
 
   async _maximize() {
@@ -1156,6 +1224,11 @@ class MorphicWindow extends HTMLElement {
       this.addEventListener('pointerdown', function(e) {
         if (!self.hasAttribute('chromeless')) return;
         if (self._isFrontMostMorphic()) return;
+        // If the pointerdown landed on a titlebar button (close,
+        // send-to-back, etc.), don't raise the window.
+        if (e.composedPath().some(function(el) {
+          return el.classList && el.classList.contains('btn');
+        })) return;
         // If the event targets the title-text drag strip, raise the
         // window but let the event continue so the titlebar drag
         // handler can initiate a move gesture.
@@ -1182,6 +1255,11 @@ class MorphicWindow extends HTMLElement {
         if (self.hasAttribute('chromeless')) return;
         if (self.id === 'embeddedSqueak') return;
         if (!self.isOccluded()) return;
+        // If the pointerdown landed on a titlebar button (close,
+        // send-to-back, etc.), don't raise the window.
+        if (e.composedPath().some(function(el) {
+          return el.classList && el.classList.contains('btn');
+        })) return;
         // Raise the window. If the pointerdown landed on the titlebar,
         // let the event continue so the drag handler can start a move.
         var titlebar = self.shadowRoot.querySelector('.titlebar');
@@ -1624,7 +1702,7 @@ class MorphicWindow extends HTMLElement {
         // Skip iframes whose enclosing morphic-window is maximized.
         var apply = !!on;
         if (apply) {
-          var iframes = document.querySelectorAll('iframe');
+          var iframes = MorphicWindow._allIframes();
           for (var i = 0; i < iframes.length; i++) {
             if (iframes[i].contentDocument === doc) {
               var host = MorphicWindow._findWindowAncestor(iframes[i]);
@@ -1752,6 +1830,10 @@ class MorphicWindow extends HTMLElement {
       e.preventDefault();
       e.stopImmediatePropagation();
       e.stopPropagation();
+      // Suppress the rest of the gesture (pointerup/mouseup/click) so
+      // the click doesn't leak to content underneath (e.g. a Keep
+      // viewer table row, which would otherwise open a detail window).
+      MorphicWindow._suppressNextGestureTail();
       if (typeof win.collapse === 'function') win.collapse();
       return;
     }
@@ -1946,10 +2028,29 @@ class MorphicWindow extends HTMLElement {
     target.__morphicArmDispatcherInstalled = true;
   }
 
+  // Collect every iframe in the document, descending into open shadow
+  // roots. The plain `document.querySelectorAll('iframe')` misses
+  // iframes that live inside a component's shadow DOM (e.g. the Keep
+  // viewer's graph frames), so cmd-drag would not engage over them.
+  static _allIframes() {
+    var out = [];
+    (function walk(root) {
+      try {
+        var ifs = root.querySelectorAll('iframe');
+        for (var i = 0; i < ifs.length; i++) out.push(ifs[i]);
+        var els = root.querySelectorAll('*');
+        for (var j = 0; j < els.length; j++) {
+          if (els[j].shadowRoot) walk(els[j].shadowRoot);
+        }
+      } catch (_) {}
+    })(document);
+    return out;
+  }
+
   static _installArmDispatchers() {
     MorphicWindow._ensureArmDispatcherOn(window);
     MorphicWindow._ensureArmDispatcherOn(document);
-    Array.from(document.querySelectorAll('iframe')).forEach(function(f) {
+    MorphicWindow._allIframes().forEach(function(f) {
       try {
         if (f.contentDocument) MorphicWindow._ensureArmDispatcherOn(f.contentDocument);
       } catch (_) {}
@@ -1961,7 +2062,7 @@ class MorphicWindow extends HTMLElement {
   // {x:0,y:0} for the outer document or an unknown document.
   static _iframeOffsetForDoc(doc) {
     if (!doc || doc === document) return { x: 0, y: 0 };
-    var iframes = document.querySelectorAll('iframe');
+    var iframes = MorphicWindow._allIframes();
     for (var i = 0; i < iframes.length; i++) {
       var f = iframes[i];
       try {
@@ -2053,7 +2154,7 @@ class MorphicWindow extends HTMLElement {
     MorphicWindow._setCmdDragging(win, true);
     var prevSel = document.body.style.userSelect;
     document.body.style.userSelect = 'none';
-    var allIframes = Array.from(document.querySelectorAll('iframe'));
+    var allIframes = MorphicWindow._allIframes();
     var prevPE = allIframes.map(function(f) { return f.style.pointerEvents; });
     allIframes.forEach(function(f) { f.style.pointerEvents = 'none'; });
     var onMove = function(ev) {
@@ -2100,28 +2201,40 @@ class MorphicWindow extends HTMLElement {
     }
   }
 
+  // Install the cmd/opt/ctrl modifier-click handlers on a single
+  // iframe so its content participates in cmd-drag (window move),
+  // opt-click (collapse), and ctrl-click (send-to-back). Idempotent and
+  // safe to call repeatedly; handles srcdoc/lazy iframes via a load
+  // hook. Exposed statically so components that create their own
+  // iframes inside shadow DOM (e.g. <keep-viewer>'s graph frames) can
+  // register them — the instance-level scan below only sees light-DOM
+  // iframes.
+  static _attachModifierClickToIframe(iframe) {
+    if (!iframe) return;
+    var attach = function() {
+      var doc;
+      try { doc = iframe.contentDocument; } catch (_) { return; }
+      if (!doc) return;
+      MorphicWindow._registerCmdCursorDoc(doc);
+      if (doc._morphicModifierClickInstalled) return;
+      var pd = function(e) { MorphicWindow._handleModifierEvent(e, iframe); };
+      doc.addEventListener('pointerdown', pd, true);
+      doc.addEventListener('mousedown', pd, true);
+      doc._morphicModifierClickInstalled = true;
+    };
+    attach();
+    // Gate the load listener so repeated calls (each hot-reload, each
+    // reconnect, each srcdoc swap) don't accumulate fresh closures on
+    // the same iframe.
+    if (!iframe.__morphicLoadHookInstalled) {
+      iframe.__morphicLoadHookInstalled = true;
+      iframe.addEventListener('load', attach);
+    }
+  }
+
   _installIframeModifierClickHandlers() {
-    var iframes = this.querySelectorAll('iframe');
-    iframes.forEach(function(iframe) {
-      var attach = function() {
-        var doc;
-        try { doc = iframe.contentDocument; } catch (_) { return; }
-        if (!doc) return;
-        MorphicWindow._registerCmdCursorDoc(doc);
-        if (doc._morphicModifierClickInstalled) return;
-        var pd = function(e) { MorphicWindow._handleModifierEvent(e, iframe); };
-        doc.addEventListener('pointerdown', pd, true);
-        doc.addEventListener('mousedown', pd, true);
-        doc._morphicModifierClickInstalled = true;
-      };
-      attach();
-      // Gate the load listener so repeated _attachBehavior calls (each
-      // hot-reload, each reconnect) don't accumulate fresh closures on
-      // the same iframe.
-      if (!iframe.__morphicLoadHookInstalled) {
-        iframe.__morphicLoadHookInstalled = true;
-        iframe.addEventListener('load', attach);
-      }
+    this.querySelectorAll('iframe').forEach(function(iframe) {
+      MorphicWindow._attachModifierClickToIframe(iframe);
     });
   }
 
@@ -2218,7 +2331,13 @@ class MorphicWindow extends HTMLElement {
         var NewClass = new Function(src + '\nreturn MorphicWindow;')();
         Object.getOwnPropertyNames(NewClass.prototype).forEach(function(key) {
           if (key !== 'constructor') {
-            ExistingClass.prototype[key] = NewClass.prototype[key];
+            // Copy the descriptor rather than reading NewClass.prototype[key]:
+            // reading an accessor (e.g. `get borderExtent`) would invoke the
+            // getter with the prototype as `this`, throwing "Illegal
+            // invocation" when it touches DOM APIs. defineProperty preserves
+            // accessors and plain methods alike.
+            var desc = Object.getOwnPropertyDescriptor(NewClass.prototype, key);
+            Object.defineProperty(ExistingClass.prototype, key, desc);
           }
         });
         // Copy static methods/properties (except hotReload itself, to avoid recursion issues)
