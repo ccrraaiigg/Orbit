@@ -3622,7 +3622,8 @@ module.exports = function (vscode) {
     document.getElementById('memory-row').style.display = showMemory ? '' : 'none';
     document.getElementById('memory-view-row').style.display = showMemory ? '' : 'none';
     memoryCb.checked = !!state.keepSyncEnabled;
-    const showTwin = !!state.orbitRunning;
+    // Digital twin section hidden until release.
+    const showTwin = false;
     document.getElementById('hr-twin').style.display = showTwin ? '' : 'none';
     document.getElementById('twin-section-label').style.display = showTwin ? '' : 'none';
     document.getElementById('twin-view-row').style.display = showTwin ? '' : 'none';

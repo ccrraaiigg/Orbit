@@ -4,9 +4,74 @@ Built 2026-06-19. Caffeine's `evaluate` MCP tool no longer blocks indefinitely
 on slow evals: it mirrors the VisualWorks 2300-ui async-task approach
 (register task → return `running`+`taskId` → poll for result).
 
+## Failure mode: Delay-based evals hang to 30s `ERROR: Canceled` (2026-06-23)
+Symptom: any `mcp_caffeine_evaluate` whose code (or whose 5s task-timeout)
+touches a `Delay` hangs ~30000ms then returns `ERROR: Canceled`, while
+fast non-Delay evals work. The 30s ceiling is the **MCP proxy** upstream
+timeout (`website/src/mcp-proxy.js`: `upReq.setTimeout(30000,...)`), NOT a user
+cancel and NOT a Caffeine fault.
+Why it defeats the long-running-task feature: the "return running at 5s" path is
+`resultAvailable waitTimeoutMSecs: 5000` → `DelayWaitTimeout>>wait` →
+`self schedule` (schedules a Delay). If Delay scheduling is stuck, that wait
+never wakes, so no `running` status is ever sent.
+Root cause seen: **accumulated stuck processes** wedged the delay scheduler.
+Each 30s-cancelled eval LEAKS two processes into the image — the responder
+(blocked in `DelayWaitTimeout>>wait`) and the forked eval — and prior hangs had
+piled up several frozen in `Delay>>schedule` / `Semaphore>>critical:`.
+Diagnose with a process dump: `Process allInstances do: [:p | p suspendedContext
+ifNotNil: [... p priority, (p suspendedContext method printString)]]` — look for
+clusters stuck in `Delay>>schedule`, `Delay>>wait`, `DelayWaitTimeout>>wait`,
+`Semaphore>>critical:`. (`Process>>stateString` DNU here; use priority + top
+method.)
+FIX: terminate the leaked/stuck processes (the user did this from the SqueakJS
+process browser) → the feature immediately works again. Key discriminator: if
+`(Delay forSeconds: 1) wait` works **from the SqueakJS UI** but Delay-based MCP
+evals hang, the timer itself is fine — suspect leaked processes, NOT a dead
+scheduler. (`Delay class>>AccessProtect excessSignals` reading >1 is a red
+herring for *hangs*: surplus signals make a mutex fail to block, not hang.)
+Each failed probe eval also opens a Debugger/SyntaxError notifier in the image
+(`evaluate:given:` runs `exception defaultAction`); those add `Debugger
+class>>morphicOpenOn:` / `SyntaxError class>>morphicOpen:` processes — clean
+them up too.
+
+## Cancelling a detached long-running eval (2026-06-23)
+Added an image-side cancellation primitive so a forked eval that's been
+abandoned (returned `running` but won't be polled to completion) can be
+terminated instead of leaking its process.
+- `evaluate:given:` now captures the forked eval process via
+  `newProcess`/`resume` (was `fork`) and records it on the task at
+  registration: `OrbitEvalTasks task: taskId setProcess: evalProcess`.
+- `OrbitEvalTasks class>>cancelTaskId:` — marks a *running* task `cancelled`,
+  removes it from the registry, then (AFTER releasing `taskMutex`)
+  `process terminate`s the captured process so its unwind blocks run. Returns
+  `{taskId, status, outcome}` where outcome ∈ `cancelled` / `notCancellable`
+  (already finished/failed) / `notFound` (nil or unknown). Idempotent.
+- `SmalltalkMCPServer>>cancelEvaluation:` (in `#tools`) is the MCP tool
+  wrapper: `^(OrbitEvalTasks cancelTaskId: taskId) json`.
+GOTCHA: MCP tools are NOT auto-discovered from the `#tools` method category —
+they're registered explicitly in `SmalltalkMCPServer class>>initializeTools`
+(each entry: `[self registeredInstance] aiToolNamed:withDescription:forSelector:`).
+A new tool method only becomes visible after adding an entry there AND re-running
+`SmalltalkMCPServer initializeTools` (which rebuilds the class-side `tools` ivar
+and calls `Webpage current tether notifyOfToolsListChange`).
+Why agent/UI-triggered (NOT proxy/bridge-triggered): the bridge has **no
+reliable abandonment signal** for a detached eval. A well-behaved long eval
+returns `running` at 5s so the bridge's 30s `tether.sendMessage` timeout never
+fires; a true scheduler wedge holds `Tether messageHandlingLock` forever so a
+tether-delivered cancel can't acquire the lock anyway (`Tether>>handleEvent:`
+forks but wraps dispatch in `messageHandlingLock critical:`, serializing all
+incoming sends). So the only actor that knows to cancel is the agent (or a
+future Evaluate-ledger ✕ button). NOTE: the Caffeine MCP path does NOT go
+through `mcp-proxy.js` (that proxy skips non-TCP backends); it flows through
+`caffeine-bridge.js`. All four methods are image-side (compiled via
+`compileMethod`) — no extension rebuild needed.
+
 ## Wire tools (Caffeine SqueakJS MCP server, `mcp_caffeine_*`)
 - `evaluate` — on timeout (5s) answers `{status:'running', taskId, message}`
   instead of a value.
+- `cancelEvaluation` (`SmalltalkMCPServer>>cancelEvaluation:`, `taskId`) —
+  cancel a detached running eval; terminates its forked process + forgets the
+  task.
 - `getTaskStatus` (`SmalltalkMCPServer>>getTaskStatus:`, optional `taskId`) —
   no-card poller; **delivers the result** and marks the `#agent` observer.
 - `createTaskProgressApp` (`SmalltalkMCPServer>>createTaskProgressApp:`,
