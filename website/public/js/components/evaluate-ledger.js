@@ -404,8 +404,11 @@
   // ---- singleton opener ------------------------------------------------
   // window.OrbitEvaluateLedger.open() creates (or focuses) a
   // <morphic-window> hosting the ledger. Mirrors orbit-task-mirror's
-  // window-building approach.
-  function open() {
+  // window-building approach. Pass { collapsed: true } to have a freshly
+  // created window come up collapsed (docked to the icon-manager); used
+  // by the auto-open on page load so the ledger is available but not in
+  // the way. Has no effect when an existing window is just refocused.
+  function open(opts) {
     var existing = document.querySelector('morphic-window[data-evaluate-ledger]');
     if (existing) {
       // Restore the window if the icon-manager has collapsed it
@@ -427,6 +430,7 @@
     var mw = document.createElement('morphic-window');
     mw.setAttribute('caption', 'evaluations');
     mw.setAttribute('data-evaluate-ledger', '1');
+    if (opts && opts.collapsed) mw.setAttribute('collapsed', '');
     mw.useCutout = false;
     mw.style.width = '560px';
     mw.style.height = '360px';
@@ -450,10 +454,11 @@
 
   window.OrbitEvaluateLedger = { open: open };
 
-  // Open on page load, like the Keep viewer.
+  // Open on page load, like the Keep viewer — but collapsed, so the
+  // ledger is docked in the icon-manager rather than covering the page.
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', function () { open(); }, { once: true });
+    document.addEventListener('DOMContentLoaded', function () { open({ collapsed: true }); }, { once: true });
   } else {
-    open();
+    open({ collapsed: true });
   }
 })();

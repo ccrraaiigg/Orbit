@@ -61,6 +61,36 @@ behavior: page-sharing, Playwright instrumentation, MCP usage, WebDAV
 conventions, and livecoding sync rules. Edit it to change how the
 agent works; no rebuild of the extension is required.
 
+### The `@orbit` participant is a quick-start, not a workhorse
+
+The `@orbit` participant exists so you can try Orbit's steering with
+**zero configuration** — install the extension, type `@orbit`, and the
+steering is already loaded without touching your workspace. That makes
+it ideal for a first look or a demo in an otherwise-empty directory.
+
+It is **not** suitable for serious work. A VS Code chat participant
+must run its own tool-calling loop, and the stable extension API gives
+it no way to borrow the host's native agent loop. As a consequence,
+`@orbit` does **not** get the agent-mode features you may rely on:
+
+- **No checkpoints** and **no edit-review (Keep/Undo) UI** for the
+  files it changes.
+- **Session "Bypass Approvals" is ignored.** That toggle is part of the
+  built-in agent's private machinery, so tools that normally prompt
+  will still prompt under `@orbit`.
+- **No host tool grouping / overflow management.** The participant
+  forwards the full tool registry, so in a tool-heavy workspace it can
+  hit the model's per-request tool cap.
+
+For real work, install the steering into your workspace and use the
+**default Copilot agent** (not a participant), which gives you the full
+agent loop, checkpoints, edit review, and approval handling. The
+simplest way is to copy Orbit's steering into your workspace's
+`.github/copilot-instructions.md` (it is auto-loaded by the default
+agent). Note that this **overrides/merges with your existing workspace
+steering** — a deliberate disruption that the participant deliberately
+avoids.
+
 ## More
 
 See [the architecture

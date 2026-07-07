@@ -36,20 +36,46 @@
       window.onload = async function () {
 	var magicWindow,
 	    squeakDisplay,
-	    snapshot
+	    imageName,
+	    zipUrl,
+	    windowTitle,
+	    isCustomSnapshot
 
 	const urlParams = new URLSearchParams(window.top.location.search)
 
-	snapshot = "caffeine"
+	// Default: the bundled Caffeine image, loaded from
+	// memories/caffeine.zip with a "Caffeine" window title.
+	imageName = "caffeine"
+	zipUrl = null
+	windowTitle = "Caffeine"
+	isCustomSnapshot = false
 
-	if (urlParams.has('snapshot'))
-	  snapshot = urlParams.get('snapshot')
+	if (urlParams.has('snapshot')) {
+	  // The snapshot value is a URL to an alternate image ZIP file.
+	  // Use it directly as the zip, and derive the image name and
+	  // window title from its basename (stripping any query/fragment,
+	  // directory, and the .zip extension).
+	  zipUrl = urlParams.get('snapshot')
+	  const base = decodeURIComponent(
+	    zipUrl.split(/[?#]/)[0].split('/').pop()).replace(/\.zip$/i, '')
+	  imageName = base || "caffeine"
+	  windowTitle = imageName
+	  isCustomSnapshot = true
+	}
+
+	// Reflect the snapshot's name in the embedding window's titlebar.
+	try {
+	  const host = window.top.document.getElementById('embeddedSqueak')
+	  if (host) host.setAttribute('caption', windowTitle)
+	} catch (e) {console.warn('could not set Squeak window title', e)}
 
 	// Detect new-version-of-extension by comparing zip-entry sizes;
 	// may prompt the user and erase the "squeak" IndexedDB before
-	// SqueakJS boots.
-	try {await window.orbitCheckCaffeineZipVersion()}
-	catch (e) {console.warn('orbit version check failed', e)}
+	// SqueakJS boots. Only applies to the bundled caffeine.zip.
+	if (!isCustomSnapshot) {
+	  try {await window.orbitCheckCaffeineZipVersion()}
+	  catch (e) {console.warn('orbit version check failed', e)}
+	}
 
 	console.log('Starting Snowglobe')
 
@@ -59,11 +85,12 @@
 	squeakDisplay = (
 	  window.startCaffeine(
 	    squeak,
-	    snapshot,
+	    imageName,
 	    "SqueakV46",
 	    {
               appID: "b7837a39-aead-40a9-818e-48bf196d55d9",
-              appName: "Lam2300"}))
+              appName: "Lam2300"},
+	    zipUrl))
 
 	if (magicWindow) {magicWindow.squeakDisplay = squeakDisplay}}
       </script>

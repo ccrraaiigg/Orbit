@@ -31,6 +31,8 @@ function symlinkExtension(extDir, website) {
         symlink(path.join(srcJs, f), path.join(dstJs, f), `js/${f}`);
     }
 
+    symlink(path.join(srcJs, 'html/utilities.js'), path.join(dstJs, 'html/utilities.js'), 'js/html/utilities.js');
+
     symlink(path.join(website, 'public/orbit.html'), path.join(extDir, 'public/orbit.html'), 'orbit.html');
     symlink(path.join(website, 'public/squeak.html'), path.join(extDir, 'public/squeak.html'), 'squeak.html');
     symlink(path.join(srcSqueakjs, 'vm.js'), path.join(dstSqueakjs, 'vm.js'), 'squeakjs/vm.js');

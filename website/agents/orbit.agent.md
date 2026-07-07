@@ -48,16 +48,16 @@ of the host chrome, not Snowglobe-mapped remote-window proxies, and
 must not be removed by cleanup code. Only touch elements you have
 positive evidence are Snowglobe-mapped remote windows.
 
-### never enumerate all classes (either Smalltalk)
+### There are faster alternatives to enumerating all classes (in any Smalltalk system)
 
-Do not iterate over `Smalltalk allClassesDo:` (or equivalent
+Avoid iterating over `Smalltalk allClassesDo:` (or equivalent
 whole-system scans like `allBehaviorsDo:`, `allClassesAndTraitsDo:`)
 to search for senders, references, source substrings, or — especially
-— to locate classes by name. It's slow and can destabilize the image.
-This applies to **both** the remote VisualWorks image and the local
-Caffeine/SqueakJS image.
+— to locate classes by name. It's slow. While the MCP enumerate tool
+supports long-running tasks, there are better alternatives in all of
+the Smalltalks.
 
-Use the dedicated tools instead:
+Use dedicated tools instead:
 
 - To locate classes by name in the **Caffeine/SqueakJS** image, use
   the `mcp_caffeine_findClassNames` MCP tool (case-insensitive
@@ -98,17 +98,6 @@ changed since you last wrote it (e.g. sections added, removed, or
 reworded), write a new file with the updated contents. Only write once
 per summary version; don't re-write an identical summary. Never modify
 or delete an existing summary file.
-
-### ensure the page is shared
-
-Whenever you need the Integrated Browser page to be shared and it
-isn't (no shared page in your context, only an unshared page open),
-you MUST use the VSCode elicitation API to ask the user to share the
-tab. Do not ask in the conversation. Do not proceed with a workaround
-that pretends sharing isn't needed (e.g. "I can't inject because the
-page isn't shared — let me know when you've shared it"). Always
-elicit. This applies every time you discover the page isn't shared,
-not just the first time in a conversation.
 
 ### MCP tools are deferred; load their schemas first
 

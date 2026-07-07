@@ -1,8 +1,9 @@
 // <keep-viewer> Web Component
 //
-// Visualizes the Keep store contents in two views:
+// Visualizes the Keep store contents in three views:
 //   1. Table — filterable, sortable list of notes
-//   2. Graph — 3D force-directed graph (WebGL) showing note relationships
+//   2. 3D — 3D force-directed graph (WebGL) showing note relationships
+//   3. 2D — 2D force-directed graph (canvas) showing note relationships
 //
 // Usage:
 //   var kv = document.createElement('keep-viewer');
@@ -185,6 +186,10 @@ class KeepViewer extends HTMLElement {
 
   // --- Internal ---
 
+  _isGraphTab() {
+    return this._activeTab === 'graph' || this._activeTab === 'graph2d';
+  }
+
   _render() {
     const self = this;
     this._destroyForceGraph();
@@ -193,9 +198,10 @@ class KeepViewer extends HTMLElement {
       <div class="container">
         <div class="toolbar">
           <button class="tab ${this._activeTab === 'table' ? 'active' : ''}" data-tab="table">Table</button>
-          <button class="tab ${this._activeTab === 'graph' ? 'active' : ''}" data-tab="graph">Graph</button>
+          <button class="tab ${this._activeTab === 'graph2d' ? 'active' : ''}" data-tab="graph2d">2D</button>
+          <button class="tab ${this._activeTab === 'graph' ? 'active' : ''}" data-tab="graph">3D</button>
           <input type="text" class="filter" placeholder="Filter…" value="${this._escHtml(this._filter)}">
-          ${this._activeTab === 'graph' ? `<button class="home-btn">home</button><select class="layout-select">
+          ${this._isGraphTab() ? `<button class="home-btn">home</button><select class="layout-select">
             <option value="force"${this._graphLayout === 'force' ? ' selected' : ''}>Force</option>
             <option value="td"${this._graphLayout === 'td' ? ' selected' : ''}>Top-Down</option>
             <option value="lr"${this._graphLayout === 'lr' ? ' selected' : ''}>Left-Right</option>
@@ -226,7 +232,7 @@ class KeepViewer extends HTMLElement {
         var row = self.shadowRoot.querySelector('tr[data-note-id="' + id + '"]');
         if (row) row.classList.add('detail-open');
       });
-    } else if (this._activeTab === 'graph') {
+    } else if (this._isGraphTab()) {
       // Send highlight messages to graph iframes once they signal ready
       var frames = this.shadowRoot.querySelectorAll('.graph-frame');
       var pending = frames.length;
@@ -324,7 +330,7 @@ class KeepViewer extends HTMLElement {
       });
     });
     // Graph interactivity
-    if (this._activeTab === 'graph') {
+    if (this._isGraphTab()) {
       this._initForceGraph();
       // Layout selector
       var layoutSelect = this.shadowRoot.querySelector('.layout-select');
@@ -646,7 +652,11 @@ class KeepViewer extends HTMLElement {
       var topicLegend = JSON.stringify(topics.map(function(t, i) { return { topic: t, color: COLORS[i % COLORS.length] }; }));
       var layoutMode = JSON.stringify(self._graphLayout || 'force');
 
-      var html = '<!DOCTYPE html>\n<html><head>\n' +
+      var html;
+      if (self._activeTab === 'graph2d') {
+        html = self._build2DGraphHtml(graphData, topicLegend, layoutMode);
+      } else {
+        html = '<!DOCTYPE html>\n<html><head>\n' +
         '<style>\n' +
         '* { margin: 0; padding: 0; }\n' +
         'html, body { width: 100%; height: 100%; overflow: hidden; background: transparent; }\n' +
@@ -792,6 +802,7 @@ class KeepViewer extends HTMLElement {
         '});\n' +
         'window.parent.postMessage({ type: "keep-graph-ready" }, "*");\n' +
         '<\/script>\n</body></html>';
+      }
 
       iframe.srcdoc = html;
 
@@ -813,6 +824,130 @@ class KeepViewer extends HTMLElement {
       }
     };
     window.addEventListener('message', this._iframeMessageHandler);
+  }
+
+  // Build the 2D force-graph iframe document. Mirrors the 3D variant but
+  // renders each node as a labeled rounded rect on a 2D canvas (force-graph)
+  // instead of a WebGL SpriteText. Shares the layout selector, legend
+  // topic-highlight, node-click, and home/highlight postMessage protocol.
+  _build2DGraphHtml(graphData, topicLegend, layoutMode) {
+    return '<!DOCTYPE html>\n<html><head>\n' +
+      '<style>\n' +
+      '* { margin: 0; padding: 0; }\n' +
+      'html, body { width: 100%; height: 100%; overflow: hidden; background: transparent; }\n' +
+      '#graph { width: 100%; height: 100%; }\n' +
+      '#legend { position: absolute; bottom: 4px; left: 4px; right: 4px; display: flex; flex-wrap: wrap; gap: 6px; padding: 3px 6px; background: rgba(0,0,0,0.5); border-radius: 3px; }\n' +
+      '.legend-item { display: flex; align-items: center; gap: 3px; font: 10px -apple-system, sans-serif; color: #ccc; cursor: pointer; pointer-events: auto; user-select: none; }\n' +
+      '.legend-item:hover { color: #fff; }\n' +
+      '.legend-item.active { color: #fff; text-decoration: underline; }\n' +
+      '.legend-swatch { width: 8px; height: 8px; border-radius: 2px; flex-shrink: 0; }\n' +
+      '</style>\n' +
+      '</head><body>\n<div id="graph"></div>\n' +
+      '<div id="legend"></div>\n' +
+      '<script type="module">\n' +
+      'var legendData = ' + topicLegend + ';\n' +
+      'var legendEl = document.getElementById("legend");\n' +
+      'var highlightTopics = new Set();\n' +
+      'var highlightNodeId = null;\n' +
+      'window.addEventListener("message", function(e) {\n' +
+      '  if (e.data && e.data.type === "keep-highlight-node") {\n' +
+      '    highlightNodeId = e.data.id || null;\n' +
+      '    if (graph) graph.nodeCanvasObject(graph.nodeCanvasObject());\n' +
+      '  }\n' +
+      '  if (e.data && e.data.type === "keep-home") {\n' +
+      '    if (graph) graph.zoomToFit(800, 30);\n' +
+      '  }\n' +
+      '});\n' +
+      'legendData.forEach(function(item, idx) {\n' +
+      '  var el = document.createElement("div");\n' +
+      '  el.className = "legend-item";\n' +
+      '  el.dataset.topic = item.topic;\n' +
+      '  el.innerHTML = \'<div class="legend-swatch" style="background:\' + item.color + \'"></div>\' + item.topic;\n' +
+      '  el.addEventListener("click", function() {\n' +
+      '    if (highlightTopics.has(item.topic)) { highlightTopics.delete(item.topic); } else { highlightTopics.add(item.topic); }\n' +
+      '    el.classList.toggle("active", highlightTopics.has(item.topic));\n' +
+      '    graph.nodeCanvasObject(graph.nodeCanvasObject());\n' +
+      '    if (highlightTopics.has(item.topic)) {\n' +
+      '      var target = data.nodes.find(function(n) { return n.topic === item.topic; });\n' +
+      '      if (target && target.x != null) { graph.centerAt(target.x, target.y, 1000); graph.zoom(3, 1000); }\n' +
+      '    }\n' +
+      '  });\n' +
+      '  legendEl.appendChild(el);\n' +
+      '});\n' +
+      'if (!legendData.length) legendEl.style.display = "none";\n' +
+      'import ForceGraph from "https://esm.sh/force-graph";\n' +
+      'import {forceCollide} from "https://cdn.jsdelivr.net/npm/d3-force/+esm";\n' +
+      'var data = ' + graphData + ';\n' +
+      'var layout = ' + layoutMode + ';\n' +
+      'var graph = ForceGraph()(document.getElementById("graph"))\n' +
+      '  .backgroundColor("rgba(0,0,0,0)")\n' +
+      '  .nodeRelSize(4)\n' +
+      '  .nodeLabel(function(n) {\n' +
+      '    return "<div style=\\"color:#fff;background:#333;padding:4px 8px;border-radius:4px;font-size:11px;\\"><b>" + n.id + "</b><br/>" + (n.summary || "") + "</div>";\n' +
+      '  })\n' +
+      '  .nodeCanvasObject(function(node, ctx, globalScale) {\n' +
+      '    var label = node.id;\n' +
+      '    var fontSize = 12 / globalScale;\n' +
+      '    ctx.font = fontSize + "px -apple-system, sans-serif";\n' +
+      '    var textWidth = ctx.measureText(label).width;\n' +
+      '    var padH = 4 / globalScale, padV = 2 / globalScale;\n' +
+      '    var w = textWidth + padH * 2, h = fontSize + padV * 2;\n' +
+      '    var isHighlighted = (highlightTopics.size > 0 && highlightTopics.has(node.topic)) || node.id === highlightNodeId;\n' +
+      '    var r = 2 / globalScale;\n' +
+      '    var x = node.x - w / 2, y = node.y - h / 2;\n' +
+      '    ctx.beginPath();\n' +
+      '    if (ctx.roundRect) { ctx.roundRect(x, y, w, h, r); } else { ctx.rect(x, y, w, h); }\n' +
+      '    ctx.fillStyle = node.color;\n' +
+      '    ctx.fill();\n' +
+      '    if (isHighlighted) { ctx.strokeStyle = "#ff0000"; ctx.lineWidth = 1.5 / globalScale; ctx.stroke(); }\n' +
+      '    ctx.textAlign = "center"; ctx.textBaseline = "middle";\n' +
+      '    ctx.fillStyle = "#ffffff";\n' +
+      '    ctx.fillText(label, node.x, node.y);\n' +
+      '    node.__bckgDimensions = [w, h];\n' +
+      '  })\n' +
+      '  .nodePointerAreaPaint(function(node, color, ctx) {\n' +
+      '    var d = node.__bckgDimensions;\n' +
+      '    if (d) { ctx.fillStyle = color; ctx.fillRect(node.x - d[0] / 2, node.y - d[1] / 2, d[0], d[1]); }\n' +
+      '  })\n' +
+      '  .linkColor(function() { return "#5a5a7a"; })\n' +
+      '  .linkWidth(1.5)\n' +
+      '  .linkDirectionalArrowLength(3.5)\n' +
+      '  .linkDirectionalArrowRelPos(1)\n' +
+      '  .linkCanvasObjectMode(function() { return "after"; })\n' +
+      '  .linkCanvasObject(function(link, ctx, globalScale) {\n' +
+      '    var label = link.via || "";\n' +
+      '    if (!label) return;\n' +
+      '    var start = link.source, end = link.target;\n' +
+      '    if (typeof start !== "object" || typeof end !== "object") return;\n' +
+      '    var midX = (start.x + end.x) / 2, midY = (start.y + end.y) / 2;\n' +
+      '    var fontSize = 9 / globalScale;\n' +
+      '    ctx.font = fontSize + "px -apple-system, sans-serif";\n' +
+      '    ctx.textAlign = "center"; ctx.textBaseline = "middle";\n' +
+      '    ctx.fillStyle = "#aaaaaa";\n' +
+      '    ctx.fillText(label, midX, midY);\n' +
+      '  })\n' +
+      '  .onNodeClick(function(node) {\n' +
+      '    window.parent.postMessage({ type: "keep-node-click", id: node.id }, "*");\n' +
+      '  })\n' +
+      '  .onNodeDragEnd(function(node) {\n' +
+      '    node.fx = node.x; node.fy = node.y;\n' +
+      '  });\n' +
+      'if (layout === "td" || layout === "lr" || layout === "radialout") {\n' +
+      '  graph.dagMode(layout);\n' +
+      '  graph.dagLevelDistance(60);\n' +
+      '}\n' +
+      'graph.d3Force("charge").strength(-200);\n' +
+      'graph.d3Force("collide", forceCollide(14));\n' +
+      'graph.graphData(data);\n' +
+      'var firstStop = true;\n' +
+      'graph.onEngineStop(function() {\n' +
+      '  if (firstStop) { firstStop = false; graph.zoomToFit(800, 30); }\n' +
+      '});\n' +
+      'window.addEventListener("resize", function() {\n' +
+      '  graph.width(window.innerWidth).height(window.innerHeight);\n' +
+      '});\n' +
+      'window.parent.postMessage({ type: "keep-graph-ready" }, "*");\n' +
+      '<\/script>\n</body></html>';
   }
 
   _destroyForceGraph() {

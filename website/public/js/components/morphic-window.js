@@ -842,6 +842,23 @@ class MorphicWindow extends HTMLElement {
     this._render();
     this._attachBehavior();
     window.addEventListener('resize', this._onViewportResize);
+    // Open collapsed if the creator stipulated it (boolean `collapsed`
+    // attribute, read once at mount). The icon-manager lists every
+    // morphic-window and treats a hidden window as collapsed (docked), so
+    // we simply come up hidden — no flash, no fade. This matches the
+    // resting state collapse() leaves a window in (visibility:hidden,
+    // opacity:0), so the icon-manager's restore path fades it back in
+    // exactly as for a window the user collapsed by hand. Set the
+    // attribute BEFORE the element is connected (e.g. before appending it)
+    // for the creator's stipulation to take effect.
+    if (this.hasAttribute('collapsed')) {
+      this.style.visibility = 'hidden';
+      this.style.opacity = '0';
+      // One-shot directive: consume it so a later re-connect (e.g. the
+      // element being moved in the DOM) doesn't re-collapse a window the
+      // user has since restored.
+      this.removeAttribute('collapsed');
+    }
     // Ensure the window comes up entirely onscreen, wherever it was
     // inserted. Deferred a frame so content (canvas/iframe) has laid out
     // before we measure. (The MutationObserver below is the hot-reload-safe

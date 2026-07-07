@@ -126,7 +126,7 @@ function showFiles() {
   else images.innerHTML = "<ul>[Once you have dropped local images to this page they will be listed here.]</ul>"
 }
 
-window.startCaffeine = function(canvas, imageName, sourcesName, parameters) {
+window.startCaffeine = function(canvas, imageName, sourcesName, parameters, zipUrl) {
   // if we have a hash image then we just run Squeak with the options provided in the url
   if (location.hash.match(/\.image/)) {
     return Squeak.runSqueak()
@@ -142,7 +142,7 @@ window.startCaffeine = function(canvas, imageName, sourcesName, parameters) {
     canvas,
     {
       zip: [
-	"memories/" + imageName + ".zip",
+	zipUrl || ("memories/" + imageName + ".zip"),
 	"sources/" + sourcesName + ".sources.zip"],
       swapButtons: true,
       spinner: window.document.getElementById("sqSpinner"),

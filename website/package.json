@@ -2,7 +2,7 @@
     "name": "orbit-agentic-pair-programming-for-smalltalk",
     "displayName": "Orbit: Agentic Pair Programming for Smalltalk",
     "description": "A livecoding pair-programming harness for Smalltalk.",
-    "version": "1.217.0",
+    "version": "1.223.0",
     "publisher": "BlackPageDigital",
     "icon": "public/pictures/icons/participant/orbit.jpg",
     "engines": {
@@ -50,6 +50,11 @@
                     "type": "boolean",
                     "default": false,
                     "description": "Automatically start the Orbit web server when VS Code starts. When false (the default), Orbit only starts when the user clicks \"Start Orbit\" in the Orbit view. When true, Orbit starts on extension activation so browser tabs left open at the Orbit URL can reconnect after a restart."
+                },
+                "orbit.onboarded": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Set to true once you have completed (or dismissed) the Orbit onboarding walkthrough. While false, Orbit offers the onboarding walkthrough when it starts. Uncheck this to see the onboarding walkthrough again."
                 },
                 "orbit.mountWebdav": {
                     "type": "boolean",

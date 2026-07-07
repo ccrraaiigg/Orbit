@@ -1,212 +1,152 @@
-// It's not strictly necessary to write a Flow primitives plugin for
-// SqueakJS, since we can do everything we need to do from Smalltalk
-// over the JS bridge. It's an interesting exercise, though. It's
-// slightly less awkward to implement the code here, and there's
-// probably some performance benefit, too (no fiddling about with
-// proxies and the message-not-understood code path).
-
 module("SqueakJS.plugins.Flow").requires("users.bert.SqueakJS.vm").toRun(
-  function () {
-    "use strict"
+    function () {
+	"use strict"
 
-    var VM_PROXY_MAJOR = 1,
-	VM_PROXY_MINOR = 11,
-	interpreterProxy = null,
-	moduleName = "Flow v7"
+	var VM_PROXY_MAJOR = 1,
+	    VM_PROXY_MINOR = 11,
+	    interpreterProxy = null,
+	    moduleName = "Flow v7"
 
-//    navigator.requestMIDIAccess().then(function (access) {
-//      window.caffeineMIDIAccess = access})
+	function setInterpreter(interpreter) {
+	    interpreterProxy = interpreter
+	    self.interpreter = interpreter
 
-    function setInterpreter(interpreter) {
-      interpreterProxy = interpreter
-      if ((interpreterProxy.majorVersion() == VM_PROXY_MAJOR) === false) return false
-      else return (interpreterProxy.minorVersion() >= VM_PROXY_MINOR)}
+	    if ((interpreterProxy.majorVersion() == VM_PROXY_MAJOR) === false) return false
+	    else return (interpreterProxy.minorVersion() >= VM_PROXY_MINOR)}
 
-    // MIDI
-    
-    function numberOfMIDIPorts () {
-      interpreterProxy.pop(1)
-      interpreterProxy.pushInteger(window.caffeineMIDIAccess.inputs.size + window.caffeineMIDIAccess.outputs.size)}
 
-    function nameOfMIDIPortAt () {
-      // Enumerate inputs, then outputs, to emulate macOS.
-      var requestedIndex = interpreterProxy.stackValue(0),
-	  inputs = window.caffeineMIDIAccess.inputs,
-	  outputs = window.caffeineMIDIAccess.outputs
+	// MIDI (via WebMidi.js)
 
-      if (requestedIndex >= inputs.size + outputs.size) return interpreterProxy.primitiveFail()
-      else {
-	var inputValues = inputs.values(),
-	    outputValues = outputs.values(),
-	    port,
-	    selectedValues,
-	    index
+	function numberOfMIDIPorts () {
+	    if (top.WebMidi) {
+		interpreterProxy.popthenPush(
+		    1,
+		    (top.WebMidi.inputs.length + top.WebMidi.outputs.length))}
+	    else {
+		interpreterProxy.popthenPush(1, 0)}}
 
-	if (requestedIndex < inputs.size) {
-	  selectedValues = inputValues
-	  index = 0
-	  port = inputValues.next()}
-	else {
-	  selectedValues = outputValues
-	  index = inputs.size
-	  port = outputValues.next()}
+	function nameOfMIDIPortAt () {
+	    var portIndex = interpreterProxy.stackIntegerValue(0),
+		numberOfInterfaces = top.WebMidi.inputs.length
+
+	    if (portIndex < numberOfInterfaces) {
+		// input
+		interpreterProxy.popthenPush(
+		    2,
+		    interpreterProxy.vm.Squeak.Primitives.prototype.makeStString.apply(
+			interpreterProxy,
+			["in: " + top.WebMidi.inputs[portIndex].name]))}
+	    else {
+		// output
+		interpreterProxy.popthenPush(
+		    2,
+		    interpreterProxy.vm.Squeak.Primitives.prototype.makeStString.apply(
+			interpreterProxy,
+			["out: " + top.WebMidi.outputs[portIndex - numberOfInterfaces].name]))}}
+
+	function newMIDIPortHandleInto () {
+	    // With WebMidi.js, no handles are necessary.
+	}
 	
-	while (index < requestedIndex) {
-	  port = values.next()
-	  index = index + 1}
+	function outputPortIndexInputPortIndex () {
+	    var receiver = interpreterProxy.stackObjectValue(2),
+		jsProxyClass = interpreterProxy.vm.image.specialObjectsArray.pointers[Squeak.splOb_JSProxyClass]
+	    
+	    interpreterProxy.storePointerofObjectwithValue(
+		7,
+		receiver,
+		SqueakJS.vm.primHandler.makeStObject(
+		    top.WebMidi.inputs[interpreterProxy.stackIntegerValue(0)],
+		    jsProxyClass))
 
-	interpreterProxy.popthenPush(
-	  2,
-	  interpreterProxy.vm.Squeak.Primitives.prototype.makeStString.apply(
-	    interpreterProxy,
-	    [port.value.name]))}}
-    
-    function newMIDIPortHandleInto () {
-      // The web browser's JS engine manages all MIDI port
-      // handles. Smalltalk knows to find the Web MIDI API access
-      // object as a window property.
-    }
+	    interpreterProxy.storePointerofObjectwithValue(
+		8,
+		receiver,
+		SqueakJS.vm.primHandler.makeStObject(
+		    top.WebMidi.outputs[interpreterProxy.stackIntegerValue(1) - top.WebMidi.inputs.length],
+		    jsProxyClass))
 
-    function enableMIDIPortAtAnd () {
-      // Sending data to a Web MIDIOutput automatically opens
-      // it. Unless we're going to share the output with other JS
-      // code, we don't need to do anything for it when enabling a
-      // Smalltalk MIDIPort. For a Web MIDIInput, we need to listen
-      // for events. We can do this from Smalltalk, without a
-      // primitive.
-      interpreterProxy.primitiveFail()
-    }
-
-    function MIDIClockValue () {
-      // Web MIDI uses DOM time, not the host OS MIDI time. Events
-      // timestamped from SqueakJS can't be scheduled properly after
-      // resuming the system on another host.
-      interpreterProxy.popthenPush(
-	1,
-	interpreterProxy.vm.Squeak.Primitives.prototype.makeLargeIfNeeded.apply(
-	  interpreterProxy,
-	  [Math.floor(performance.now())]))}
-
-    function scheduleMIDIMessagesInQuantityOn () {
-      var outputs = window.caffeineMIDIAccess.outputs.values(),
-	  index = window.caffeineMIDIAccess.inputs.size,
-	  port = outputs.next(),
-	  requestedIndex = interpreterProxy.stackValue(0),
-	  words = interpreterProxy.stackValue(2).words,
-	  numberOfWords = words.length,
-	  wordIndex = 0,
-	  data
-      
-      while (index < requestedIndex) {
-	port = outputs.next()
-	index = index + 1}
-
-      port = port.value
-      
-      while (wordIndex < numberOfWords) {
-	data = words[wordIndex]
-	port.send(
-	  [
-	    data & 0xFF,
-	    (data >> 8) & 0xFF,
-	    data >> 16],
-	  words[wordIndex + 1])
-	wordIndex = wordIndex + 2}
-
-      interpreterProxy.pop(3)}
-
-    // HTML UI support
-
-    function htmlSelectElementSetOptions () {
-      var self = (interpreterProxy.stackValue(1)).pointers[0].jsObject,
-	  strings = interpreterProxy.vm.primHandler.loadedModules.JavaScriptPlugin.primitiveFromStObject(interpreterProxy.stackValue(0))
-
-      while (self.children.length > 0) {
-	var child = self.firstChild
+	    interpreterProxy.pop(2)}
 	
-	self.removeChild(child)}
+	
+	// read from Blobs, for sending binary WebSocket frames
 
-      (
-	strings.map(function (string) {
-	  var option = document.createElement('option')
+	function setBytesFrom () {
+	    var byteArray = interpreterProxy.stackValue(1),
+		result = interpreterProxy.stackValue(0).jsObject
 
-	  option.value = string
-	  option.innerHTML = string
+	    byteArray.bytes = new Uint8Array(result)
 
-	  return option})
-      )
-	.forEach(function (element) {self.appendChild(element)})
+	    interpreterProxy.pop(1)}
+	
 
-      interpreterProxy.pop(1)}
+	// Ensure that a websocket's "open" event handler is set before
+	// the event occurs, by creating the websocket and setting the
+	// handler in the same JS context (JS is single-threaded).
 
-    // read from Blobs, for sending binary WebSocket frames
+	function urlonOpenonErroronMessageonClose () {
+	    var websocket = new WebSocket(interpreterProxy.stackValue(4).bytesAsString())
 
-    function setBytesFrom () {
-      var byteArray = interpreterProxy.stackValue(1),
-	  result = interpreterProxy.stackValue(0).jsObject
+	    websocket.onopen = interpreterProxy.vm.primHandler.js_fromStBlock(interpreterProxy.stackValue(3))
+	    websocket.onerror = interpreterProxy.vm.primHandler.js_fromStBlock(interpreterProxy.stackValue(2))
+	    websocket.onmessage = interpreterProxy.vm.primHandler.js_fromStBlock(interpreterProxy.stackValue(1))
+	    websocket.onclose = interpreterProxy.vm.primHandler.js_fromStBlock(interpreterProxy.stackValue(0))
 
-      byteArray.bytes = new Uint8Array(result)}
-    
-    // VisualWorks support
+	    interpreterProxy.stackValue(5).jsObject = websocket
+	    interpreterProxy.pop(5)}
 
-    function decompressVisualWorksBitmapFromByteArray () {
-      var words = interpreterProxy.stackValue(1).words,
-	  bytes = interpreterProxy.stackValue(0).bytes,
-	  numberOfBytes = bytes.length,
-	  bytesPosition = 0,
-	  wordIndex = 0,
-	  word
+	
+	// Naiad support
 
-      while (bytesPosition < numberOfBytes) {
-	word = (bytes[bytesPosition++] << 24) + bytes[bytesPosition++]
+	function isMethodFused () {
+	    var isFused = (interpreterProxy.stackValue(0).fused != 0)
+	    
+	    interpreterProxy.pop(1)
+	    interpreterProxy.pushBool(isFused)}
 
-	if (bytesPosition < numberOfBytes) {
-	  word = word + (bytes[bytesPosition++] << 8) + (bytes[bytesPosition++] << 16)}
+	function methodFuseTime () {
+	    interpreterProxy.popthenPush(1, interpreterProxy.stackValue(0).fused)}
 
-	words[wordIndex++] = word}
+	function resetMethodFusingIndex () {
+	    SqueakJS.vm.methodFusingIndex = 1}
+	
+	function defuseMethod () {
+	    interpreterProxy.stackValue(0).fused = 0}
+	
+	function fuseMethod () {
+	    SqueakJS.vm.fuseMethod(interpreterProxy.stackValue(0))}
 
-      interpreterProxy.pop(1)}
+	function setSpecialObjectsArray () {
+	    interpreterProxy.vm.image.specialObjectsArray = interpreterProxy.stackValue(0)
+	    interpreterProxy.pop(1)}
 
-    // Naiad support
+	function performSelector () {
+	    var performSelector = interpreterProxy.stackValue(0).performSelector
 
-    function isMethodFused () {
-      interpreterProxy.pushBool(interpreterProxy.stackValue(0).fused)}
+	    if (!performSelector) {
+		interpreterProxy.primitiveFail()}
+	    else {
+		interpreterProxy.popthenPush(
+		    1,
+		    performSelector)}}
 
-    function defuseMethod () {
-      interpreterProxy.stackValue(0).fused = false}
-    
-    function fuseMethod () {
-      interpreterProxy.stackValue(0).fused = true}
-
-    function setReloadingMethodHeader () {
-      // Hack the header of the reloading method to indicate that it
-      // needs large context frames, to accommodate the arguments of
-      // any method it might eventually install.
-      var method = interpreterProxy.stackValue(0)
-
-      method.pointers[0] = method.pointers[0] | 0x20000}
-
-    function setSpecialObjectsArray () {
-      interpreterProxy.vm.image.specialObjectsArray = interpreterProxy.stackValue(0)
-      interpreterProxy.pop(1)}
-    
-    Squeak.registerExternalModule(
-      "Flow",
-      {
-	setInterpreter: setInterpreter,
-	numberOfMIDIPorts: numberOfMIDIPorts,
-	nameOfMIDIPortAt: nameOfMIDIPortAt,
-	newMIDIPortHandleInto: newMIDIPortHandleInto,
-	enableMIDIPortAtAnd: enableMIDIPortAtAnd,
-	MIDIClockValue: MIDIClockValue,
-	scheduleMIDIMessagesInQuantityOn: scheduleMIDIMessagesInQuantityOn,
-	htmlSelectElementSetOptions: htmlSelectElementSetOptions,
-	decompressVisualWorksBitmapFromByteArray: decompressVisualWorksBitmapFromByteArray,
-	setBytesFrom: setBytesFrom,
-	isMethodFused: isMethodFused,
-	fuseMethod: fuseMethod,
-	defuseMethod: defuseMethod,
-	setReloadingMethodHeader: setReloadingMethodHeader,
-	setSpecialObjectsArray: setSpecialObjectsArray
-      })})
+	
+	Squeak.registerExternalModule(
+	    "Flow",
+	    {
+		setInterpreter: setInterpreter,
+		numberOfMIDIPorts: numberOfMIDIPorts,
+		nameOfMIDIPortAt: nameOfMIDIPortAt,
+		newMIDIPortHandleInto: newMIDIPortHandleInto,
+		outputPortIndexInputPortIndex: outputPortIndexInputPortIndex,
+		setBytesFrom: setBytesFrom,
+		urlonOpenonErroronMessageonClose: urlonOpenonErroronMessageonClose,
+		isMethodFused: isMethodFused,
+		methodFuseTime: methodFuseTime,
+		resetMethodFusingIndex: resetMethodFusingIndex,
+		fuseMethod: fuseMethod,
+		defuseMethod: defuseMethod,
+		setSpecialObjectsArray: setSpecialObjectsArray,
+		performSelector: performSelector
+	    })})
 

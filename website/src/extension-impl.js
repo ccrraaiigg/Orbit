@@ -323,6 +323,165 @@ module.exports = function (vscode) {
         return true;
     }
 
+    // --- Keep note filesystem mirror ---------------------------------
+    //
+    // The Keep store lives inside the Caffeine SqueakJS image and is
+    // otherwise persisted only when the image is snapshotted. To make
+    // agent memory survive image loss (and to make it diffable /
+    // greppable / PR-reviewable), we mirror every Keep *mutation* that
+    // flows through the CaffeineBridge to two on-disk artifacts under
+    // .orbit/keep/ (see designs/keep-fs-persistence.md):
+    //
+    //   ops.jsonl        append-only, event-sourced mutation log
+    //                    (durable source of truth on disk; replayable)
+    //   notes/<id>.md    per-note Markdown projection (front-matter +
+    //                    content; human-readable, regenerable)
+    //   edge-tags.json   declared edge-tag forward/inverse pairs
+    //
+    // As with the Evaluate ledger, the *extension* writes these files
+    // itself (plain fs, off to the side of the chat editing session) —
+    // never the image, never an agent edit tool — so no chat Keep/Undo
+    // controls attach. The tap is CaffeineBridge's onKeepMutation hook.
+    const KEEP_DIR_REL   = path.join('.orbit', 'keep');
+    const KEEP_OPS_REL   = path.join(KEEP_DIR_REL, 'ops.jsonl');
+    const KEEP_NOTES_REL = path.join(KEEP_DIR_REL, 'notes');
+    const KEEP_EDGES_REL = path.join(KEEP_DIR_REL, 'edge-tags.json');
+    let keepOpSeq = null; // lazily initialized from existing line count
+
+    function keepPathFor(rel) {
+        const root = localWorkspaceFsPath();
+        return root ? path.join(root, rel) : null;
+    }
+
+    // Sanitize a note id for use as a filename. The true id is always
+    // preserved inside the note's front-matter, so the mapping is
+    // recoverable even when sanitization collapses distinct ids.
+    function keepSafeId(id) {
+        return String(id == null ? 'unnamed' : id)
+            .replace(/[^A-Za-z0-9._-]/g, '_')
+            .slice(0, 200) || 'unnamed';
+    }
+
+    // Next monotonic op sequence number, initialized once from the
+    // existing ops.jsonl line count so numbering is stable across
+    // extension restarts.
+    function nextKeepSeq(opsFile) {
+        if (keepOpSeq == null) {
+            let count = 0;
+            try {
+                const text = fs.readFileSync(opsFile, 'utf8');
+                count = text.split('\n').filter((l) => l.trim() !== '').length;
+            } catch (_) { count = 0; }
+            keepOpSeq = count;
+        }
+        keepOpSeq += 1;
+        return keepOpSeq;
+    }
+
+    // Render a note's Markdown projection: JSON-encoded scalars in the
+    // front-matter (valid YAML flow scalars, no YAML dep, no injection)
+    // followed by the note content as the body.
+    function keepNoteMarkdown(note) {
+        const j = (v) => JSON.stringify(v == null ? '' : v);
+        const tags = note && typeof note.tags === 'object' && note.tags
+            ? note.tags : {};
+        const lines = [
+            '---',
+            'id: ' + j(note && note.id),
+            'agent: ' + j(note && note.agent),
+            'createdAt: ' + j(note && note.createdAt),
+            'summary: ' + j(note && note.summary),
+            'tags: ' + JSON.stringify(tags),
+            '---',
+            '',
+            (note && typeof note.content === 'string') ? note.content : ''
+        ];
+        return lines.join('\n') + '\n';
+    }
+
+    // Write/overwrite a note's Markdown projection from a full note
+    // object (as returned by keepPut / keepTag / keepNow-write).
+    function keepWriteNoteFile(note) {
+        const notesDir = keepPathFor(KEEP_NOTES_REL);
+        if (!notesDir || !note || note.id == null) return;
+        fs.mkdirSync(notesDir, { recursive: true });
+        const file = path.join(notesDir, keepSafeId(note.id) + '.md');
+        fs.writeFileSync(file, keepNoteMarkdown(note), 'utf8');
+    }
+
+    // Delete a note's Markdown projection (keepRemove).
+    function keepDeleteNoteFile(id) {
+        const notesDir = keepPathFor(KEEP_NOTES_REL);
+        if (!notesDir || id == null) return;
+        const file = path.join(notesDir, keepSafeId(id) + '.md');
+        try { fs.unlinkSync(file); } catch (_) { /* already gone */ }
+    }
+
+    // Merge a declared edge tag into edge-tags.json (keepDeclareEdgeTag).
+    function keepMergeEdgeTag(tag, inverse) {
+        const file = keepPathFor(KEEP_EDGES_REL);
+        if (!file || tag == null) return;
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        let map = {};
+        try { map = JSON.parse(fs.readFileSync(file, 'utf8')) || {}; }
+        catch (_) { map = {}; }
+        map[tag] = inverse == null ? null : inverse;
+        fs.writeFileSync(file, JSON.stringify(map, null, 2) + '\n', 'utf8');
+    }
+
+    // The CaffeineBridge.onKeepMutation hook: append a faithful op-log
+    // record for the mutation, then update the Markdown/edge-tag
+    // projection. Best-effort — never allowed to break an MCP call.
+    function mirrorKeepMutation(params, result) {
+        const opsFile = keepPathFor(KEEP_OPS_REL);
+        if (!opsFile) return;
+        const name = params && params.name;
+        const args = (params && params.arguments) || {};
+        const res  = (result && typeof result === 'object') ? result : {};
+        const note = res.note && typeof res.note === 'object' ? res.note : null;
+        const id = (note && note.id) != null ? note.id
+            : (res.id != null ? res.id : args.id);
+
+        // 1) Append the op-log record (source of truth on disk).
+        fs.mkdirSync(path.dirname(opsFile), { recursive: true });
+        const record = {
+            seq: nextKeepSeq(opsFile),
+            at: new Date().toISOString(),
+            tool: name,
+            id: id == null ? null : id,
+            agent: args.agent != null ? args.agent
+                : (note && note.agent != null ? note.agent : undefined),
+            args,
+            result: res
+        };
+        fs.appendFileSync(opsFile, JSON.stringify(record) + '\n', 'utf8');
+
+        // 2) Update the projection.
+        switch (name) {
+        case 'keepPut':
+        case 'keepTag':
+        case 'keepNow':
+            if (note) keepWriteNoteFile(note);
+            break;
+        case 'keepRemove':
+            keepDeleteNoteFile(id);
+            break;
+        case 'keepDeclareEdgeTag':
+            keepMergeEdgeTag(res.tag != null ? res.tag : args.tag,
+                res.inverse != null ? res.inverse : args.inverse);
+            break;
+        case 'keepArchive':
+            // Op-log only: the archive result carries just the affected
+            // ids, not their bodies, so the per-note `archived` flag
+            // lags until each note is next put/tagged. See the design
+            // note's "known limitation".
+            break;
+        default:
+            break;
+        }
+        orbitLog(`[orbit] Keep mirror: ${name} ${id || ''} (seq ${record.seq})`);
+    }
+
     // Core rollback: signal the tether and stamp the matching marker
     // "undoneAt". Driven by the eval bridge (the web component's ↩ Undo).
     // Returns { ok, record, alreadyUndone?, reason? } — never throws for
@@ -1914,6 +2073,17 @@ module.exports = function (vscode) {
                             '[orbit] recording Caffeine evaluate marker failed:',
                             e && e.message));
                 };
+                // Mirror every Keep mutation that flows through the
+                // bridge to the on-disk op-log + Markdown projection
+                // under .orbit/keep/ (see designs/keep-fs-persistence.md
+                // and mirrorKeepMutation above). Best-effort: a
+                // filesystem error degrades to "not mirrored", never to
+                // a failed MCP call.
+                app.mcpBridge.onKeepMutation = (params, result) => {
+                    try { mirrorKeepMutation(params, result); }
+                    catch (e) { orbitError(
+                        '[orbit] Keep mirror failed:', e && e.message); }
+                };
             }
             // Server-Sent Events endpoint that streams MCP server
             // state changes to the Orbit webapp. The page subscribes
@@ -1945,6 +2115,71 @@ module.exports = function (vscode) {
                     clearInterval(keepAlive);
                     mcpStateSubscribers.delete(subscriber);
                 });
+            });
+
+            // Onboarding routing (page -> extension).
+            //
+            // The on-page onboarding App (and the image, on behalf of the
+            // in-conversation App) POSTs the user's choice here so the
+            // steering write happens *deterministically in the extension*
+            // — the App never edits files itself. Same-origin loopback
+            // POST from the shared page on :8089.
+            //
+            //   POST /onboarding/apply-steering   body { choice }
+            //     'augment' -> run orbit.applyOnboardingSteering, clear suppression
+            //     'never'   -> remember "don't ask again" for this workspace
+            //     'later'   -> noted (will offer again next session)
+            //
+            //   GET  /onboarding/should-show
+            //     -> { show } so the image can gate startup mounting on the
+            //        remembered "don't ask again" preference.
+            //
+            // The "already onboarded" flag is stored in the discoverable
+            // VS Code setting `orbit.onboarded` (searchable in Settings so
+            // the user can toggle it), not a hidden workspaceState memento.
+            (app.extensionRoutes || app).get('/onboarding/should-show', (req, res) => {
+                res.setHeader('Content-Type', 'application/json');
+                let onboarded = false;
+                try { onboarded = !!vscode.workspace.getConfiguration('orbit').get('onboarded', false); }
+                catch (_) {}
+                const show = !onboarded;
+                // When onboarding is about to be shown on the page, reveal the
+                // Orbit panel so the App's "its controls live in the Orbit
+                // panel" tour points at something visible. Best-effort and
+                // non-blocking — never let a reveal failure affect the gate.
+                if (show) {
+                    Promise.resolve(
+                        vscode.commands.executeCommand('orbit.revealPanel')
+                    ).catch(() => {});
+                }
+                res.end(JSON.stringify({ show }));
+            });
+            (app.extensionRoutes || app).post('/onboarding/apply-steering', async (req, res) => {
+                res.setHeader('Content-Type', 'application/json');
+                const choice = req.body && req.body.choice;
+                try {
+                    if (choice === 'augment') {
+                        try { await vscode.workspace.getConfiguration('orbit').update('onboarded', true, vscode.ConfigurationTarget.Global); } catch (_) {}
+                        const r = await vscode.commands.executeCommand('orbit.applyOnboardingSteering');
+                        res.end(JSON.stringify(r || { ok: false, reason: 'no-result' }));
+                        return;
+                    }
+                    if (choice === 'never') {
+                        try { await vscode.workspace.getConfiguration('orbit').update('onboarded', true, vscode.ConfigurationTarget.Global); } catch (_) {}
+                        res.end(JSON.stringify({ ok: true, action: 'suppressed' }));
+                        return;
+                    }
+                    if (choice === 'later') {
+                        res.end(JSON.stringify({ ok: true, action: 'noted' }));
+                        return;
+                    }
+                    res.statusCode = 400;
+                    res.end(JSON.stringify({ ok: false, reason: 'bad-choice' }));
+                } catch (e) {
+                    orbitError('[orbit] /onboarding/apply-steering failed:', e && e.message);
+                    res.statusCode = 500;
+                    res.end(JSON.stringify({ ok: false, reason: 'error' }));
+                }
             });
 
             // GET /keep-sync/status
@@ -3104,6 +3339,11 @@ module.exports = function (vscode) {
             }
             await startServer(context, !keepExistingTab);
             orbitLog('[orbit] orbit.start: startServer done; webdavMountEnabled=' + webdavMountEnabled());
+            // Ensure the Orbit panel is visible so the user can see the
+            // start/stop, preferences and backend controls (and so the
+            // onboarding flow can point at it). Best-effort.
+            try { await vscode.commands.executeCommand('orbit.revealPanel'); }
+            catch (_) {}
             // Re-publish the Orbit MCP definitions (orbit.stop withdrew
             // them) before asking VS Code to start the servers.
             if (!mcpEnabled) {
@@ -3838,6 +4078,89 @@ module.exports = function (vscode) {
         } catch (e) {
             orbitError('[orbit] activity bar view registration failed:', e && e.message);
         }
+
+        // Reveal the Orbit panel on demand. VS Code auto-registers
+        // `<viewId>.focus` for every contributed view, which reveals the
+        // view's container and the view itself. The onboarding flow (and
+        // orbit.start) use this to guarantee the panel is visible while
+        // it teaches about the controls there.
+        try {
+            const revealPanelCmd = vscode.commands.registerCommand('orbit.revealPanel', async () => {
+                try { await vscode.commands.executeCommand('orbit.status.focus'); }
+                catch (e) { orbitError('[orbit] orbit.revealPanel failed:', e && e.message); }
+            });
+            context.subscriptions.push(revealPanelCmd);
+        } catch (e) {
+            orbitError('[orbit] orbit.revealPanel registration failed:', e && e.message);
+        }
+
+        // Onboarding: merge Orbit's bundled steering into the workspace's
+        // .github/copilot-instructions.md so the *default* Copilot agent
+        // follows it. This is the deterministic write the onboarding App's
+        // "augment" choice routes to (and the chat fallback reuses), so the
+        // App itself never edits files. Idempotent via marker comments;
+        // the whole inserted block is safe to delete to undo.
+        const ORBIT_STEERING_BEGIN = '<!-- ORBIT:STEERING:BEGIN -->';
+        const ORBIT_STEERING_END = '<!-- ORBIT:STEERING:END -->';
+        const applySteeringCmd = vscode.commands.registerCommand('orbit.applyOnboardingSteering', async () => {
+            try {
+                const folders = vscode.workspace.workspaceFolders;
+                if (!folders || folders.length === 0) {
+                    vscode.window.showWarningMessage('Orbit: open a folder before adding steering.');
+                    return { ok: false, reason: 'no-workspace' };
+                }
+                const folder = folders[0];
+                const srcPath = path.join(context.extensionPath, 'agents', 'orbit.agent.md');
+                let steering;
+                try { steering = fs.readFileSync(srcPath, 'utf8'); }
+                catch (e) {
+                    orbitError('[orbit] applyOnboardingSteering: steering source missing:', e && e.message);
+                    return { ok: false, reason: 'no-steering-source' };
+                }
+
+                const block = ORBIT_STEERING_BEGIN + '\n'
+                    + '<!-- Added by Orbit. Safe to remove this whole block to undo. -->\n\n'
+                    + steering.trim() + '\n\n' + ORBIT_STEERING_END;
+
+                const targetUri = vscode.Uri.joinPath(folder.uri, '.github', 'copilot-instructions.md');
+                let existing = '';
+                let existed = false;
+                try {
+                    const buf = await vscode.workspace.fs.readFile(targetUri);
+                    existing = Buffer.from(buf).toString('utf8');
+                    existed = true;
+                } catch (_) { existed = false; }
+
+                let next, action;
+                const bi = existing.indexOf(ORBIT_STEERING_BEGIN);
+                const ei = existing.indexOf(ORBIT_STEERING_END);
+                if (bi !== -1 && ei !== -1 && ei > bi) {
+                    const replaced = existing.slice(0, bi) + block
+                        + existing.slice(ei + ORBIT_STEERING_END.length);
+                    if (replaced === existing) { action = 'unchanged'; next = existing; }
+                    else { action = 'updated'; next = replaced; }
+                } else if (existed) {
+                    const sep = existing.length === 0 ? '' : (existing.endsWith('\n') ? '\n' : '\n\n');
+                    next = existing + sep + block + '\n';
+                    action = 'appended';
+                } else {
+                    next = block + '\n';
+                    action = 'created';
+                }
+
+                if (action !== 'unchanged') {
+                    try { await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(folder.uri, '.github')); }
+                    catch (_) {}
+                    await vscode.workspace.fs.writeFile(targetUri, Buffer.from(next, 'utf8'));
+                }
+                orbitLog('[orbit] applyOnboardingSteering: ' + action + ' ' + targetUri.fsPath);
+                return { ok: true, action, path: targetUri.fsPath };
+            } catch (e) {
+                orbitError('[orbit] applyOnboardingSteering failed:', e && e.message);
+                return { ok: false, reason: 'error' };
+            }
+        });
+        context.subscriptions.push(applySteeringCmd);
 
         // Ad-hoc command: prompt the user for a task and run an isolated
         // Copilot CLI subagent. Output streams to the "Orbit Subagent"

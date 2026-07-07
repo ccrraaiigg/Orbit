@@ -38,6 +38,26 @@ const { readBearer, isLoopback, bearerHeaderMatches } = require('./bearer');
 
 const FAILURE = -1337;
 
+// Keep tools that mutate the store. Calls to these are mirrored to the
+// filesystem op-log + Markdown projection via the onKeepMutation hook
+// (see designs/keep-fs-persistence.md). Read tools (keepGet, keepQuery,
+// keepFindDeep, keepOrient) are not mirrored.
+const KEEP_MUTATION_TOOLS = new Set([
+    'keepPut', 'keepTag', 'keepRemove',
+    'keepNow', 'keepArchive', 'keepDeclareEdgeTag'
+]);
+
+// Does this tools/call mutate the Keep store? keepNow is a read unless
+// it carries `content` to write into the shared `now` blackboard.
+function isKeepMutationCall(params) {
+    if (!params || !KEEP_MUTATION_TOOLS.has(params.name)) return false;
+    if (params.name === 'keepNow') {
+        const a = params.arguments || {};
+        return a.content != null;
+    }
+    return true;
+}
+
 function response(id, content) {
     return { ...{ jsonrpc: '2.0', id }, ...content };
 }
@@ -106,6 +126,13 @@ class CaffeineBridge {
         // marker so Caffeine evaluations show up in the Evaluate
         // ledger window just like the VisualWorks backends' do.
         this.onEvaluateCall = opts.onEvaluateCall || (() => {});
+
+        // Called for every Keep *mutation* tools/call that flows
+        // through the bridge, with (params, decodedResult). Hook used
+        // by extension-impl to mirror the mutation to the on-disk Keep
+        // op-log + Markdown projection under .orbit/keep/ (see
+        // designs/keep-fs-persistence.md).
+        this.onKeepMutation = opts.onKeepMutation || (() => {});
 
         // sessionId -> { stream: res, lastEventId }
         this.postSessions = new Map();
@@ -461,7 +488,15 @@ class CaffeineBridge {
             }
             const r = await this._forwardRequest(tether,
                 { endpoint, action: 'tools/call', data: params });
-            return output(id, objectFromTetherEncodedJSON(r));
+            const decoded = objectFromTetherEncodedJSON(r);
+            // Mirror Keep mutations to the on-disk op-log + Markdown
+            // projection (see designs/keep-fs-persistence.md). Reads
+            // and keepNow-without-content are skipped.
+            if (isKeepMutationCall(params)) {
+                try { this.onKeepMutation(params, decoded); }
+                catch (e) { this.error('onKeepMutation failed:', e && e.message); }
+            }
+            return output(id, decoded);
         }
         default:
             // JSON-RPC notifications have no `id` and require no
@@ -486,6 +521,18 @@ class CaffeineBridge {
     middleware() {
         return async (req, res, next) => {
             const endpoint = req.path;
+            // Loopback-only discovery: let standalone tools (e.g. the
+            // Keep export script, scripts/js/keep-export.js) find the
+            // MCP endpoint(s) the page announced, without knowing the
+            // image-chosen path in advance. Returns the registered
+            // endpoint paths as JSON. Refused off-loopback.
+            if (req.method === 'GET' && endpoint === '/caffeine-mcp-endpoints') {
+                if (!isLoopback(req)) return res.status(403).end();
+                res.setHeader('Content-Type', 'application/json');
+                return res.status(200).send(JSON.stringify({
+                    endpoints: Array.from(this.mcpServers.keys())
+                }));
+            }
             // Log every request that reaches the bridge middleware,
             // including ones whose path doesn't match a registered
             // MCP endpoint, so we can see whether VS Code's MCP

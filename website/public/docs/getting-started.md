@@ -31,6 +31,26 @@ To see that the agent can access Smalltalk, try these prompts:
 
 "@orbit Evaluate '3 + 4'."
 
+### `@orbit` is for getting started, not for serious work
+
+The `@orbit` participant is the fastest way to try Orbit: it loads the
+steering with zero configuration and without changing your workspace.
+That convenience comes with limits. A chat participant has to run its
+own tool loop, and VS Code's stable API gives it no access to the
+built-in agent loop — so `@orbit` has **no checkpoints**, **no
+edit-review (Keep/Undo) UI**, and it **ignores the session's "Bypass
+Approvals" toggle** (tools that normally prompt will still prompt). In
+a tool-heavy workspace it can also hit the model's per-request tool
+limit.
+
+For sustained work, copy Orbit's steering into your workspace's
+`.github/copilot-instructions.md` and use the **default Copilot agent**
+instead of `@orbit`. The default agent reads that file automatically
+and gives you the full agent loop — checkpoints, edit review, and
+approval handling included. This does change your workspace's steering,
+which is exactly the disruption the participant is designed to spare
+you for a first look.
+
 ### Subagents
 
 You can also ask the agent to orchestrate tasks with subagents, and
