@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<!--
+
+    Orbit presentation deck (impress.js), served inside an Orbit
+    <morphic-window> via <iframe> on orbit.html.
+
+    This page is intentionally "chrome-less": the surrounding
+    <morphic-window> supplies the titlebar and window controls, so the
+    deck fills the iframe. impress.js's page-global side effects (body
+    styles, keyboard, and hash routing) stay sandboxed in this frame.
+
+-->
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=1024" />
+    <title>Orbit — a presentation</title>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link
+        href="https://fonts.googleapis.com/css?family=Open+Sans:regular,semibold,italic,italicsemibold|PT+Sans:400,700,400italic,700italic|PT+Serif:400,700,400italic,700italic|PT+Mono"
+        rel="stylesheet" />
+    <link href="css/orbit-talk.css" rel="stylesheet" />
+</head>
+
+<body class="impress-not-supported">
+
+    <div class="fallback-message">
+        <p>
+            Your browser <b>doesn't support the features required</b> by
+            impress.js, so this presentation is shown in a simplified form.
+        </p>
+        <p>
+            For the best experience please use a recent
+            <b>Chrome</b>, <b>Safari</b>, or <b>Firefox</b> browser.
+        </p>
+    </div>
+
+    <div id="impress"
+         data-transition-duration="900"
+         data-width="1920"
+         data-height="1080">
+
+        <!-- Title -->
+        <div id="title" class="step" data-x="9000" data-y="3000" data-scale="25">
+            <span class="brand">Orbit</span>
+            <span class="tag">agentic pair programming in Smalltalk</span>
+            <img class="qr" src="img/qr-marketplace.png"
+                 alt="QR code linking to the Orbit extension on the VS Code Marketplace" />
+        </div>
+
+        <!-- Opening note -->
+        <div id="intro" class="step" data-x="30000" data-y="10000" data-z="35000"
+             data-rotate-z="20" data-scale="10">
+            <p contentEditable="true">
+                This is early, evolving work &mdash; please jump in with
+                questions and comments at any time. The text on every slide
+                is <i>live and editable</i>.
+            </p>
+        </div>
+
+        <!-- Premise -->
+        <div id="premise" class="step" data-x="35000" data-y="15000" data-z="30000"
+             data-rotate-x="20" data-rotate-z="40" data-scale="10">
+            <p contentEditable="true">
+                How can an AI agent join a human pair-programming team?
+            </p>
+        </div>
+
+        <!-- What is Orbit -->
+        <div id="what" class="step" data-x="40000" data-y="20000" data-z="25000"
+             data-rotate-x="40" data-rotate-z="60" data-scale="10">
+            <span class="kicker" contentEditable="true">What is Orbit</span>
+            <p contentEditable="true">
+                <b>Orbit</b> connects an AI agent to a running Smalltalk
+                system through the <i>Model Context Protocol</i>. The agent
+                can read, evaluate, compile, test, and refactor live code as
+                a genuine collaborator.
+            </p>
+        </div>
+
+        <!-- Live image -->
+        <div id="live" class="step" data-x="45000" data-y="25000" data-z="20000"
+             data-rotate-x="60" data-rotate-z="80" data-scale="10">
+            <span class="kicker" contentEditable="true">A living system</span>
+            <p contentEditable="true">
+                There is no build and no restart. The agent works inside a
+                <i>live object memory</i>, changing the system while it runs
+                &mdash; classic Smalltalk <b>livecoding</b>.
+            </p>
+        </div>
+
+        <!-- MCP server -->
+        <div id="mcp" class="step" data-x="50000" data-y="30000" data-z="15000"
+             data-rotate-x="80" data-rotate-z="100" data-scale="10">
+            <span class="kicker" contentEditable="true">Tools &amp; resources</span>
+            <p contentEditable="true">
+                An <b>MCP server</b> exposes the image as a rich toolbox:
+                evaluate expressions, compile methods, create classes, run
+                tests, and trace <i>senders</i> and <i>implementors</i>.
+            </p>
+        </div>
+
+        <!-- WebDAV filesystem -->
+        <div id="webdav" class="step" data-x="55000" data-y="35000" data-z="10000"
+             data-rotate-x="100" data-rotate-z="120" data-scale="10">
+            <span class="kicker" contentEditable="true">An active filesystem</span>
+            <p contentEditable="true">
+                A live <b>WebDAV</b> filesystem projects the image as files
+                &mdash; <i>/classes</i>, <i>/processes</i>, <i>/search</i>,
+                <i>/sessions</i>. Reading and writing has real side effects
+                in Smalltalk.
+            </p>
+        </div>
+
+        <!-- Roles & capabilities -->
+        <div id="roles" class="step" data-x="60000" data-y="40000" data-z="5000"
+             data-rotate-x="120" data-rotate-z="140" data-scale="10">
+            <span class="kicker" contentEditable="true">Safety by construction</span>
+            <p contentEditable="true">
+                <b>Roles</b> and <b>capabilities</b> scope what the agent may
+                do: <i>MethodCompilation</i>, <i>SharedVariableAccess</i>,
+                <i>AgenticMemoryAccess</i>. Permission is explicit, not
+                assumed.
+            </p>
+        </div>
+
+        <!-- Agentic memory -->
+        <div id="memory" class="step" data-x="65000" data-y="45000" data-z="0"
+             data-rotate-x="140" data-rotate-z="160" data-scale="10">
+            <span class="kicker" contentEditable="true">Externalized context</span>
+            <p contentEditable="true">
+                The agent's context is externalized into <i>agentic memory</i>
+                the image itself provides, so understanding of the system
+                <b>accumulates across sessions</b>.
+            </p>
+        </div>
+
+        <!-- Morphic -->
+        <div id="morphic" class="step" data-x="70000" data-y="50000" data-z="-5000"
+             data-rotate-x="160" data-rotate-z="180" data-scale="10">
+            <span class="kicker" contentEditable="true">It's all Morphic</span>
+            <p contentEditable="true">
+                The whole experience is <b>direct and tangible</b>. This deck
+                lives in a <i>morphic-window</i> right beside Caffeine &mdash;
+                drag its titlebar, resize it, and edit any slide in place.
+            </p>
+        </div>
+
+        <!-- Tools list -->
+        <div id="tools" class="step" data-x="75000" data-y="55000" data-z="-10000"
+             data-rotate-x="180" data-rotate-z="200" data-scale="10">
+            <span class="kicker" contentEditable="true">A few of the tools</span>
+            <p class="tools" contentEditable="true">
+                <code>evaluate</code> &middot; <code>compile</code> &middot;
+                <code>createClass</code> &middot; <code>addMethod</code><br>
+                <code>runTests</code> &middot; <code>getAllSenders</code> &middot;
+                <code>getAllImplementors</code><br>
+                <code>traceCallChain</code> &middot; <code>snapshotImage</code>
+                &hellip;
+            </p>
+        </div>
+
+        <!-- Questions -->
+        <div id="questions" class="step" data-x="80000" data-y="60000" data-z="-15000"
+             data-rotate-x="200" data-rotate-z="220" data-scale="10">
+            <p contentEditable="true">
+                Thank you! <i>Questions?</i>
+            </p>
+        </div>
+
+        <!-- Author -->
+        <div id="author" class="step" data-x="24000" data-y="18000" data-scale="20">
+            <span class="try">Craig Latta :: thiscontext.com</span>
+        </div>
+
+    </div>
+
+    <script src="js/impress.js"></script>
+    <script>
+      // Snapshot the pristine (authored) deck markup BEFORE impress mutates
+      // the DOM. The parent page's reload button uses this to persist any
+      // in-place text edits into clean markup — never impress's runtime DOM.
+      window.__deckPristineHTML = "<!DOCTYPE html>\n" + document.documentElement.outerHTML;
+      impress().init();
+
+      ( function () {
+          // The deck runs inside an <iframe> on the Orbit page. Grab keyboard
+          // focus whenever the viewer interacts with it, so key events land
+          // here rather than in the host page.
+          function grabFocus() { try { window.focus(); } catch ( e ) {} }
+          document.addEventListener( "pointerdown", grabFocus, true );
+          window.addEventListener( "focus", grabFocus );
+
+          // impress.js navigates to a step when you CLICK it: its delegated
+          // handler walks up to the nearest non-active .step and calls goto().
+          // Because the slides overlap in impress.js's 3D space, a click meant
+          // to place the caret in a slide's editable text can land on another
+          // step and fly the camera to a faraway point. Every slide here is
+          // edited by clicking its text, so suppress impress's click-to-navigate
+          // in the capture phase, before its document-level handlers run. We
+          // only stop propagation (not preventDefault), so caret placement and
+          // focus still work normally.
+          window.addEventListener( "click", function ( e ) {
+              e.stopImmediatePropagation();
+          }, true );
+
+          // Every slide's text is contentEditable, and impress.js's
+          // "block keyboard navigation" plugin stops arrow/space keys from
+          // reaching its navigation handler while an editable is focused
+          // (they move the text caret instead). We intercept navigation keys
+          // in the capture phase — before that plugin and before impress's own
+          // handler — and drive impress directly. BUT while a slide is being
+          // edited, arrows and space must do their normal text-editing job
+          // (caret movement, typing), so we leave them alone; only PageUp/
+          // PageDown still page through slides. Esc jumps to the first slide.
+          var PREV = { ArrowLeft: 1, ArrowUp: 1, PageUp: 1 };
+          var NEXT = { ArrowRight: 1, ArrowDown: 1, PageDown: 1 };
+          function navAction( e ) {
+              if ( e.metaKey || e.ctrlKey || e.altKey || e.shiftKey ) { return null; }
+              if ( e.key === "Escape" || e.key === "Esc" ) { return "first"; }
+              var editing = document.activeElement && document.activeElement.isContentEditable;
+              if ( editing ) {
+                  // Editing text: caret keys and typing stay native. Only the
+                  // page keys (not caret keys) still navigate slides.
+                  if ( e.key === "PageUp" ) { return "prev"; }
+                  if ( e.key === "PageDown" ) { return "next"; }
+                  return null;
+              }
+              if ( PREV[ e.key ] ) { return "prev"; }
+              if ( NEXT[ e.key ] ) { return "next"; }
+              if ( e.key === " " || e.key === "Spacebar" ) { return "next"; }
+              return null;
+          }
+          function firstStep() {
+              var steps = document.querySelectorAll( ".step" );
+              return steps.length ? steps[ 0 ].id : 0;
+          }
+          window.addEventListener( "keydown", function ( e ) {
+              if ( navAction( e ) ) { e.preventDefault(); e.stopImmediatePropagation(); }
+          }, true );
+          window.addEventListener( "keyup", function ( e ) {
+              var action = navAction( e );
+              if ( !action ) { return; }
+              e.preventDefault();
+              e.stopImmediatePropagation();
+              try {
+                  var api = impress();
+                  if ( action === "first" ) { api.goto( firstStep() ); }
+                  else { api[ action ](); }
+              } catch ( err ) {}
+          }, true );
+      } )();
+    </script>
+
+</body>
+
+</html>

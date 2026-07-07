@@ -315,6 +315,35 @@ app.put('/caffeine-bounds.json', (req, res) => {
   }
 });
 
+// Presentation deck persistence: the deck's reload button PUTs the
+// edited deck HTML here before reloading the iframe, so in-place slide
+// edits survive the reload. Written back to the same file express.static
+// serves at /presentation/deck.html. The destination is a fixed path
+// (no user-controlled path segment) to avoid traversal, and gated by the
+// standard bridge check (loopback, or a valid bearer from LAN callers)
+// since deck.html is executable page content.
+const DECK_FILE = path.join(__dirname, 'public', 'presentation', 'deck.html');
+app.put('/presentation/deck.html', (req, res) => {
+  if (!allowBridgeAccess(req, res)) return;
+  const chunks = [];
+  req.on('data', (chunk) => chunks.push(chunk));
+  req.on('end', () => {
+    const buf = Buffer.concat(chunks);
+    if (buf.length === 0) {
+      return res.status(400).json({ error: 'empty deck body' });
+    }
+    try {
+      fsmod.writeFileSync(DECK_FILE, buf);
+      res.json({ ok: true, size: buf.length });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+  req.on('error', (err) => {
+    res.status(500).json({ error: err.message });
+  });
+});
+
 // Mount point for routes registered later by the Orbit extension
 // (e.g. /mcp-events SSE). Mounted before the 404 catchall so
 // late-added routes still match.

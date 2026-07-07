@@ -73,13 +73,16 @@
     idoc.body.appendChild(ta);
 
     function refocus() {
-      // Don't grab focus if it currently belongs to outer-page UI (e.g. a
-      // <morphic-window> hosting a remote Smalltalk image). The hidden
-      // textarea is only useful when the user is interacting with the
-      // SqueakJS canvas inside this iframe.
+      // Only reclaim focus when THIS SqueakJS iframe is the focused frame.
+      // If focus belongs to outer-page UI (e.g. a <morphic-window> showing a
+      // remote Smalltalk image) or to a DIFFERENT iframe (e.g. the Orbit
+      // presentation deck), leave it alone -- otherwise we'd yank keyboard
+      // focus away from those frames and swallow their keystrokes. The hidden
+      // textarea is only useful while the user is driving THIS SqueakJS canvas.
       try {
         var topDoc = iwin.top && iwin.top.document;
-        if (topDoc && topDoc.activeElement && topDoc.activeElement.tagName !== 'IFRAME') return;
+        var ae = topDoc && topDoc.activeElement;
+        if (!ae || ae.tagName !== 'IFRAME' || ae.contentWindow !== iwin) return;
       } catch (_) { /* cross-origin: skip */ }
       try {
         ta.focus({ preventScroll: true });
@@ -255,11 +258,14 @@
       iwin.clearInterval(idoc.__orbitClipboardSafetyInterval);
     }
     idoc.__orbitClipboardSafetyInterval = iwin.setInterval(function () {
-      // window.top.document.activeElement is the outermost focused element;
-      // when focus is on something outside the iframe, it won't be the iframe.
+      // window.top.document.activeElement is the outermost focused element.
+      // Only reclaim focus when THIS SqueakJS iframe is the focused frame;
+      // when focus is elsewhere (outer-page UI, or another iframe such as the
+      // presentation deck) leave it alone.
       try {
         var topDoc = iwin.top && iwin.top.document;
-        if (topDoc && topDoc.activeElement && topDoc.activeElement.tagName !== 'IFRAME') return;
+        var ae = topDoc && topDoc.activeElement;
+        if (!ae || ae.tagName !== 'IFRAME' || ae.contentWindow !== iwin) return;
       } catch (_) { /* cross-origin: skip */ }
       if (idoc.activeElement !== ta) refocus();
     }, 500);

@@ -1,0 +1,141 @@
+/*
+ * orbit-talk.css — styling for the Orbit impress.js presentation deck.
+ * Loaded inside the deck iframe embedded in an Orbit <morphic-window>.
+ */
+
+:root {
+    --ink: #eef2fb;
+    --dim: #aab6d0;
+    --accent: #7fb2ff;
+    --accent-2: #ffd479;
+}
+
+html, body {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    /* The presentation stage. Fills the morphic-window's content area. */
+    background:
+        radial-gradient( 1200px 800px at 30% 20%, #2a3550 0%, transparent 60% ),
+        radial-gradient( 1000px 900px at 80% 90%, #1b2338 0%, transparent 55% ),
+        linear-gradient( 160deg, #10141f 0%, #070912 100% );
+    color: var( --ink );
+    font-family: "PT Sans", "Open Sans", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+}
+
+/* ---- impress.js stage ---- */
+
+#impress {
+    font-size: 44px;
+    line-height: 1.4;
+}
+
+.step {
+    position: relative;
+    box-sizing: border-box;
+    width: 900px;
+    padding: 40px 48px;
+    color: var( --ink );
+    text-align: left;
+    opacity: 0.18;
+    -webkit-transition: opacity 1s;
+    transition: opacity 1s;
+}
+
+.step.active { opacity: 1; }
+
+/*
+    Slides overlap heavily in impress.js's 3D space. Only the active slide
+    should catch clicks, otherwise an overlapping step intercepts the pointer
+    and the active slide's editable text can't be focused/edited.
+*/
+.step:not( .active ) { pointer-events: none; }
+.step.active { pointer-events: auto; }
+
+
+.step p {
+    margin: 0;
+    font-weight: 400;
+    text-shadow: 0 2px 12px rgba( 0, 0, 0, 0.6 );
+}
+
+.step b { color: var( --accent ); font-weight: 700; }
+.step i { color: var( --accent-2 ); font-style: italic; }
+
+[contentEditable="true"] { outline: none; }
+[contentEditable="true"]:focus {
+    outline: 1px dashed rgba( 127, 178, 255, 0.5 );
+    outline-offset: 8px;
+}
+
+/* Title slide */
+#title {
+    width: 1000px;
+    font-size: 70px;
+    line-height: 1.15;
+    font-weight: 300;
+    text-shadow: 0 4px 24px rgba( 0, 0, 0, 0.7 );
+}
+#title .brand {
+    display: block;
+    font-size: 128px;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    background: linear-gradient( 90deg, #8fc0ff, #cfa6ff 60%, #ffd479 );
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    margin-bottom: 8px;
+}
+#title .tag { display: block; white-space: nowrap; color: var( --dim ); font-size: 46px; }
+#title .qr {
+    display: block;
+    width: 320px;
+    height: 320px;
+    margin: 40px 0 0;
+    padding: 12px;
+    background: #fff;
+    border-radius: 10px;
+    box-shadow: 0 6px 24px rgba( 0, 0, 0, 0.5 );
+}
+
+/* Section kicker */
+.step .kicker {
+    display: block;
+    font-size: 22px;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var( --accent );
+    margin-bottom: 14px;
+}
+
+/* Monospace tool listing */
+.tools {
+    font-family: "PT Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: 30px;
+    line-height: 1.9;
+    color: var( --dim );
+}
+.tools code { color: var( --accent-2 ); }
+
+/* Author / try lines */
+.try {
+    font-size: 60px;
+    font-weight: 700;
+    color: var( --ink );
+}
+
+/* Fallback when impress is unsupported */
+.fallback-message {
+    display: none;
+    margin: 40px auto;
+    max-width: 640px;
+    padding: 24px;
+    color: var( --ink );
+}
+.impress-not-supported .fallback-message { display: block; }
+.impress-not-supported #impress { display: none; }
