@@ -21,6 +21,13 @@ html[data-dev-host] {
     background-image: url(../pictures/backgrounds/scenes/8.jpg);
 }
 
+/* While the presentation window (<morphic-window id="orbitTalk">) is
+   open, switch the page background to scene 8. Uses :has() so it tracks
+   the window's presence directly, with no JS. */
+html:has(#orbitTalk) {
+    background-image: url(../pictures/backgrounds/scenes/8.jpg);
+}
+
 blockquote {
     position: relative;
     display: inline-block;

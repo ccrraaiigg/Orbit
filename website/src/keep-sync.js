@@ -126,6 +126,113 @@ module.exports = function createKeepSync(vscode, {
     }
 
     // ──────────────────────────────────────────────────
+    // GitHub token resolution
+    // ──────────────────────────────────────────────────
+    //
+    // VS Code's built-in GitHub authentication provider routes through
+    // the org's conditional-access / device-compliance policy, which can
+    // refuse to issue a token on an unmanaged machine (e.g. a macOS
+    // device without the required MDM profile). To keep peer sync working
+    // there, resolve a `gist`-scoped token from non-interactive sources
+    // first, and only fall back to the VS Code auth provider.
+    //
+    // Resolution order:
+    //   1. env: ORBIT_KEEPSYNC_GITHUB_TOKEN, GITHUB_TOKEN, GH_TOKEN
+    //   2. secrets file: <workspace>/secrets/keep-sync-github-token[.txt]
+    //                    or ~/.orbit/keep-sync-github-token
+    //   3. `gh auth token` (the GitHub CLI's own credential)
+    //   4. VS Code GitHub auth provider (silent, then interactive)
+
+    async function findGhCli() {
+        const candidates = ['gh', '/opt/homebrew/bin/gh', '/usr/local/bin/gh'];
+        for (const cli of candidates) {
+            try {
+                await new Promise((resolve, reject) => {
+                    execFile(cli, ['--version'], { timeout: 8000 },
+                        (err) => err ? reject(err) : resolve());
+                });
+                return cli;
+            } catch (_) {}
+        }
+        return null;
+    }
+
+    async function ghAuthToken() {
+        const cli = await findGhCli();
+        if (!cli) return null;
+        try {
+            const out = await new Promise((resolve, reject) => {
+                execFile(cli, ['auth', 'token'], { timeout: 10000 },
+                    (err, stdout, stderr) => err
+                        ? reject(new Error(stderr || err.message))
+                        : resolve(stdout));
+            });
+            return (out || '').trim() || null;
+        } catch (e) {
+            log(`[keep-sync] gh auth token failed: ${e.message}`);
+            return null;
+        }
+    }
+
+    function readTokenFile() {
+        const os = require('os');
+        const auditDir = getAuditDir();
+        const candidates = [
+            path.join(auditDir, '..', 'secrets', 'keep-sync-github-token'),
+            path.join(auditDir, '..', 'secrets', 'keep-sync-github-token.txt'),
+            path.join(os.homedir(), '.orbit', 'keep-sync-github-token')
+        ];
+        for (const f of candidates) {
+            try {
+                const t = fs.readFileSync(f, 'utf8').trim();
+                if (t) return t;
+            } catch (_) {}
+        }
+        return null;
+    }
+
+    async function resolveGitHubToken() {
+        // 1. Environment
+        for (const name of ['ORBIT_KEEPSYNC_GITHUB_TOKEN', 'GITHUB_TOKEN', 'GH_TOKEN']) {
+            const v = process.env[name];
+            if (v && v.trim()) {
+                log(`[keep-sync] Using GitHub token from $${name}`);
+                return v.trim();
+            }
+        }
+        // 2. Secrets file
+        const fileToken = readTokenFile();
+        if (fileToken) {
+            log('[keep-sync] Using GitHub token from secrets file');
+            return fileToken;
+        }
+        // 3. gh CLI (holds its own credential, not subject to the VS Code
+        //    auth provider's device-compliance policy)
+        const gh = await ghAuthToken();
+        if (gh) {
+            log('[keep-sync] Using GitHub token from gh CLI');
+            return gh;
+        }
+        // 4. VS Code auth provider (may be blocked by device policy) —
+        //    try silently first so we never hang on an unsatisfiable prompt.
+        try {
+            let session = await vscode.authentication.getSession(
+                'github', ['gist'], { silent: true });
+            if (!session) {
+                session = await vscode.authentication.getSession(
+                    'github', ['gist'], { createIfNone: true });
+            }
+            if (session) {
+                log(`[keep-sync] Using GitHub token from VS Code auth (scopes: ${session.scopes.join(', ')})`);
+                return session.accessToken;
+            }
+        } catch (e) {
+            log(`[keep-sync] VS Code GitHub auth unavailable: ${e.message}`);
+        }
+        return null;
+    }
+
+    // ──────────────────────────────────────────────────
     // GitHub API helpers
     // ──────────────────────────────────────────────────
 
@@ -345,6 +452,16 @@ module.exports = function createKeepSync(vscode, {
         if (needsBootstrap && localConnectToken) {
             bootstrapToken = localConnectToken;
         }
+        // Request→push: advertise which peers we still lack a token for.
+        // A peer that sees its own machineId in our `wants` will PUSH its
+        // connect token to us (see poll()), connecting via the bootstrap
+        // token we publish above. Recovery therefore no longer depends on
+        // WHICH side lost the token — the system converges to "everyone can
+        // reach everyone" from any asymmetric state.
+        const wants = otherPeers
+            .filter(([_, p]) => !peerTokens[p.machineId])
+            .map(([_, p]) => p.machineId)
+            .filter((v, i, a) => v && a.indexOf(v) === i);
 
         const isNew = !existingPeers.has(sessionId);
         const currentTunnelUri = getTunnelUri() || null;
@@ -374,6 +491,7 @@ module.exports = function createKeepSync(vscode, {
             hostname: getHostname(),
             tunnelUri: effectiveTunnelUri || null,
             bootstrapToken: bootstrapToken,
+            wants: wants,
             keepSyncPath: '/keep-sync',
             lastSeen: new Date().toISOString(),
             version: extVersion,
@@ -412,9 +530,15 @@ module.exports = function createKeepSync(vscode, {
 
     // Handshake: use a peer's bootstrap token to connect and exchange
     // long-lived tokens. After exchange, both sides cache the peer's token.
-    async function handshakeWithPeer(peer) {
+    async function handshakeWithPeer(peer, opts = {}) {
         if (!peer.bootstrapToken || !peer.tunnelUri) return false;
-        if (peerTokens[peer.machineId]) return false; // already have their token
+        // We initiate for one of two reasons:
+        //   pull  — we lack the peer's token and want it, or
+        //   serve — the peer listed us in `wants`, so we PUSH our token to
+        //           them (the exchange delivers our token to their cache).
+        // When only serving, proceed even though we already hold their token.
+        const serveRequest = !!opts.serveRequest;
+        if (peerTokens[peer.machineId] && !serveRequest) return false;
 
         const baseUrl = peer.tunnelUri.replace(/\/$/, '');
         try {
@@ -437,7 +561,7 @@ module.exports = function createKeepSync(vscode, {
                 peerTokens[peer.machineId] = result.connectToken;
                 peerKnownUris[peer.machineId] = peer.tunnelUri;
                 savePeerTokens();
-                log(`[keep-sync] Handshake complete with ${peer.hostname} — tokens exchanged`);
+                log(`[keep-sync] Handshake complete with ${peer.hostname} (${serveRequest ? 'served request' : 'pulled token'}) — tokens exchanged`);
                 // Clear our bootstrap token from Gist now that exchange succeeded
                 await clearBootstrapToken();
                 return true;
@@ -516,11 +640,15 @@ module.exports = function createKeepSync(vscode, {
     // ──────────────────────────────────────────────────
 
     function invalidateTokenIfAuthError(peer, error) {
-        // If we got 302 (redirect to login) or 403, the cached token is stale.
-        // Delete it so the handshake logic re-engages on next poll.
-        if (/\b(302|403)\b/.test(error.message) && peerTokens[peer.machineId]) {
+        // If we got 302 (redirect to login), 401 (unauthorized), or 403
+        // (forbidden), the cached token is stale — e.g. it was issued for
+        // the peer's previous tunnel, or is a legacy token with no known
+        // URI so the tunnel-change check above can't detect the mismatch.
+        // Delete it so the handshake logic re-engages on the next poll.
+        if (/\b(302|401|403)\b/.test(error.message) && peerTokens[peer.machineId]) {
             log(`[keep-sync] Token for ${peer.hostname} rejected, clearing cached token`);
             delete peerTokens[peer.machineId];
+            delete peerKnownUris[peer.machineId];
             savePeerTokens();
         }
     }
@@ -775,10 +903,20 @@ module.exports = function createKeepSync(vscode, {
             const peers = await getPeers();
             log(`[keep-sync] Poll: ${peers.length} peer(s), ${countLocalLines() - lastPublishedLine} local ops not yet pushed`);
 
-            // Handshake with any peer that has a bootstrap token we haven't consumed
+            // Initiate a token exchange with any reachable peer that either
+            // (a) advertises a bootstrap token whose token we still need
+            //     [pull — we connect and take their token], or
+            // (b) has requested our token via `wants` [serve — we connect
+            //     using their bootstrap and push our token to them].
+            // (b) is what breaks the old deadlock: the peer that still HAS
+            // the other's token proactively re-delivers it on request.
+            const myMachine = vscode.env.machineId;
             for (const peer of peers) {
-                if (peer.bootstrapToken && !peerTokens[peer.machineId]) {
-                    await handshakeWithPeer(peer);
+                if (!peer.bootstrapToken) continue;
+                const wePull = !peerTokens[peer.machineId];
+                const theyRequested = Array.isArray(peer.wants) && peer.wants.includes(myMachine);
+                if (wePull || theyRequested) {
+                    await handshakeWithPeer(peer, { serveRequest: theyRequested });
                 }
             }
 
@@ -797,16 +935,15 @@ module.exports = function createKeepSync(vscode, {
     async function start() {
         if (running) return;
 
-        // Get GitHub token
-        try {
-            const session = await vscode.authentication.getSession(
-                'github', ['gist'], { createIfNone: true });
-            githubToken = session.accessToken;
-            log(`[keep-sync] GitHub auth OK (scopes: ${session.scopes.join(', ')})`);
-        } catch (e) {
-            log(`[keep-sync] GitHub auth failed: ${e.message}`);
+        // Get GitHub token. Prefer non-interactive sources (env / secrets
+        // file / gh CLI) so peer sync keeps working when VS Code's GitHub
+        // auth provider is blocked by device-management policy.
+        githubToken = await resolveGitHubToken();
+        if (!githubToken) {
+            log('[keep-sync] No GitHub token available (env, secrets file, gh CLI, and VS Code auth all failed); peer sync disabled. Run `gh auth login` (with gist scope) or set ORBIT_KEEPSYNC_GITHUB_TOKEN.');
             return;
         }
+        log('[keep-sync] GitHub token acquired');
 
         try {
             await ensureGist();

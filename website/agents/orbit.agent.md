@@ -109,6 +109,47 @@ call to any of them in a conversation, use `tool_search` to load their
 schemas. Never guess parameter names — invoke each tool only with the
 exact parameters from its loaded schema.
 
+### "push to melody" — what it means and how to do it
+
+`melody` is the PRIMARY development machine and the source of truth for
+the Orbit extension. THIS machine may be a secondary box (e.g. a
+conference/demo laptop) where you make temporary local fixes. "Push
+the change(s) to melody" (or to any named peer) means: deliver the
+file(s) you changed to that peer so the fix can be MERGED there
+later. You are not editing melody's live tree directly — you are
+dropping the file into its intake folder.
+
+How peers receive files: every peer runs the Orbit web server, which
+exposes a fixed `PUT /upload/:filename` route (there is no general
+file-write route). It writes the body into that peer's `uploads/`
+folder ONLY — never straight into `public/` or any served path. Moving
+an uploaded file into its final location on melody is a separate,
+later, manual/merge step; do not assume the upload takes effect on
+melody's running page.
+
+Steps to push:
+
+1. Push ONLY the files you actually changed. Confirm the exact set
+   first (revert or exclude edits you rolled back).
+2. Find the peer's tunnel and token in `.keep-sync-peer-tokens.json`
+   (top-level workspace directory). Each entry has a `tunnelUri`
+   (e.g. `https://<id>-8089.usw3.devtunnels.ms`) and a `token`. When
+   there is a single entry, that peer is melody.
+3. Prerequisites: this machine must be on the VPN or the devtunnels
+   host will not resolve in DNS. The token is short-lived (~24h); if
+   the host resolves but auth fails (401/403) or the host is
+   UNRESOLVED, ask the user to bring melody's tunnel up and/or refresh
+   the token — do not try to brute-force around it.
+4. For each file, `PUT` its bytes to `<tunnelUri>/upload/<filename>`
+   with header `X-Tunnel-Authorization: tunnel <token>` and an
+   appropriate `Content-Type`.
+5. Success is a JSON reply `{"ok":true,"path":"/uploads/<filename>","size":N}`.
+   Verify `N` equals the local file's byte count to confirm an intact
+   transfer.
+
+Never stop, restart, or otherwise disrupt melody (or its tunnel) while
+pushing.
+
 ## This project is Orbit, a livecoding pair-programming harness
 
 You are part of Orbit, an augmentation of the GitHub Copilot harness

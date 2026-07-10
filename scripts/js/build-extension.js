@@ -107,7 +107,6 @@ function installFor(label, codeBin, extRoot, pkg, vsixPath) {
     symlinkExtension(extDir, WEBSITE);
 
     // Remove older installed versions
-    repackCaffeineImage();
     for (const d of fs.readdirSync(extRoot)) {
         const full = path.join(extRoot, d);
         if (d.startsWith(`${pkg.extensionId}-`) && full !== extDir) {
@@ -138,6 +137,11 @@ function main() {
     const vsixPath = path.join(PROJECT_ROOT, `${pkg.name}-${pkg.version}.vsix`);
 
     cleanStaleVsix(pkg.name, vsixPath);
+    // Repack the fresh Caffeine image into caffeine.zip and delete the loose
+    // caffeine.image/caffeine.changes BEFORE packaging, so the VSIX ships only
+    // the compressed zip (avoids the first-build bloat of shipping the loose
+    // uncompressed image alongside the zip).
+    repackCaffeineImage();
     packageVsix(pkg.name, pkg.version);
 
     const home = require('os').homedir();

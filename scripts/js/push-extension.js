@@ -122,6 +122,87 @@ function getOurConnectToken() {
     }
 }
 
+// ─── Peer tunnel token minting (recover from stale/absent peer tokens) ───────
+
+// Find the devtunnel tunnelId whose forwarded port URI matches a peer's
+// tunnelUri. Returns the tunnelId (cluster-stripped) or null. Works only for
+// tunnels our own devtunnel account can see (e.g. same org).
+function findTunnelIdForUri(peerTunnelUri, peerHostname) {
+    let host;
+    try { host = new URL(peerTunnelUri).host; } catch (_) { return null; }
+
+    const listRes = spawnSync('devtunnel', ['list', '--json'],
+        { encoding: 'utf8', timeout: 10000 });
+    if (listRes.status !== 0) return null;
+    let tunnels;
+    try {
+        const data = JSON.parse(listRes.stdout);
+        tunnels = data.tunnels || data;
+    } catch (_) { return null; }
+
+    // Consider 'orbit' tunnels, preferring ones also labeled with the peer's
+    // hostname so we do the fewest `devtunnel show` calls.
+    const candidates = (tunnels || []).filter(t => (t.labels || []).includes('orbit'));
+    const ordered = peerHostname
+        ? candidates.slice().sort((a, b) =>
+            ((b.labels || []).includes(peerHostname) ? 1 : 0) -
+            ((a.labels || []).includes(peerHostname) ? 1 : 0))
+        : candidates;
+
+    for (const t of ordered) {
+        const tunnelId = (t.tunnelId || '').replace(/\.\w+$/, '');
+        if (!tunnelId) continue;
+        const showRes = spawnSync('devtunnel', ['show', tunnelId, '--json'],
+            { encoding: 'utf8', timeout: 10000 });
+        if (showRes.status !== 0) continue;
+        try {
+            const info = JSON.parse(showRes.stdout).tunnel || JSON.parse(showRes.stdout);
+            const ports = info.ports || [];
+            const match = ports.some(p => {
+                try { return new URL(p.portUri).host === host; } catch (_) { return false; }
+            });
+            if (match) return tunnelId;
+        } catch (_) {}
+    }
+    return null;
+}
+
+// Mint a fresh connect-scope token for a peer's tunnel. Returns the token
+// string or null (e.g. when we can't manage that tunnel).
+function mintConnectTokenForPeer(peerTunnelUri, peerHostname) {
+    const tunnelId = findTunnelIdForUri(peerTunnelUri, peerHostname);
+    if (!tunnelId) return null;
+    const res = spawnSync('devtunnel',
+        ['token', tunnelId, '--scope', 'connect', '--json'],
+        { encoding: 'utf8', timeout: 10000 });
+    if (res.status !== 0) return null;
+    try {
+        const parsed = JSON.parse(res.stdout);
+        return parsed.token || parsed.value || null;
+    } catch (_) { return null; }
+}
+
+// Probe a peer's /keep-sync/status with an optional tunnel token.
+// Returns true iff HTTP 200.
+function probePeerStatus(statusUrl, token) {
+    const probe = spawnSync('node', ['-e', `
+        const https = require('https');
+        const url = new URL(${JSON.stringify(statusUrl)});
+        const headers = {};
+        ${token ? `headers['X-Tunnel-Authorization'] = 'tunnel ' + ${JSON.stringify(token)};` : ''}
+        const req = https.get({
+            hostname: url.hostname, port: 443, path: url.pathname,
+            headers, timeout: 5000
+        }, res => {
+            res.on('data', () => {});
+            res.on('end', () => process.exit(res.statusCode === 200 ? 0 : 1));
+        });
+        req.on('timeout', () => { req.destroy(); process.exit(1); });
+        req.on('error', () => process.exit(1));
+    `], { encoding: 'utf8', timeout: 8000, stdio: ['pipe', 'pipe', 'pipe'] });
+    return probe.status === 0;
+}
+
 // ─── Stage and push ─────────────────────────────────────────────────────────
 
 function stageVsix(vsixPath) {
@@ -166,29 +247,29 @@ function pushToPeers(vsixPath) {
     const downloadUrl = `${myTunnelUri.replace(/\/$/, '')}/uploads/${vsixName}`;
 
     for (const peer of peers) {
-        const token = peerTokens[peer.machineId] || null;
+        let token = peerTokens[peer.machineId] || null;
 
-        // Liveness check — quick probe with 5s timeout
+        // Liveness check — quick probe with 5s timeout.
         const statusUrl = `${peer.tunnelUri.replace(/\/$/, '')}/keep-sync/status`;
-        const probe = spawnSync('node', ['-e', `
-            const https = require('https');
-            const url = new URL(${JSON.stringify(statusUrl)});
-            const headers = {};
-            ${token ? `headers['X-Tunnel-Authorization'] = 'tunnel ' + ${JSON.stringify(token)};` : ''}
-            const req = https.get({
-                hostname: url.hostname, port: 443, path: url.pathname,
-                headers,
-                timeout: 5000
-            }, res => {
-                let d = '';
-                res.on('data', c => d += c);
-                res.on('end', () => { process.stdout.write(d); process.exit(res.statusCode === 200 ? 0 : 1); });
-            });
-            req.on('timeout', () => { req.destroy(); process.exit(1); });
-            req.on('error', () => process.exit(1));
-        `], { encoding: 'utf8', timeout: 8000, stdio: ['pipe', 'pipe', 'pipe'] });
+        let reachable = probePeerStatus(statusUrl, token);
 
-        if (probe.status !== 0) {
+        // If the cached token is stale or absent (probe not 200), try minting
+        // a fresh connect token for the peer's tunnel. This recovers from a
+        // broken keep-sync handshake (e.g. a legacy token issued for the
+        // peer's previous tunnel) as long as our devtunnel account can manage
+        // the peer's tunnel.
+        if (!reachable) {
+            const fresh = mintConnectTokenForPeer(peer.tunnelUri, peer.hostname);
+            if (fresh) {
+                token = fresh;
+                reachable = probePeerStatus(statusUrl, token);
+                if (reachable) {
+                    console.log(`  Minted fresh connect token for ${peer.hostname || peer.machineId}`);
+                }
+            }
+        }
+
+        if (!reachable) {
             console.log(`  Skipping ${peer.hostname || peer.machineId}: unreachable`);
             continue;
         }

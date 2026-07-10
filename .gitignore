@@ -22,3 +22,6 @@ audit/
 .keep-sync-peer-tokens.json
 .keep-sync-machine-id
 .keep-sync-gist-id
+
+# Local secrets (e.g. keep-sync GitHub token) — never commit.
+secrets/

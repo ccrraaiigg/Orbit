@@ -3040,6 +3040,52 @@ module.exports = function (vscode) {
         }
     }
 
+    // Open (or focus) the Orbit presentation deck window on the page by
+    // invoking the Caffeine MCP tool `openPresentation`, which calls the
+    // page-side window.__orbitOpenPresentation() over the Squeak↔JS
+    // bridge (single-instance; restores a collapsed window). Mirrors
+    // openEvaluationsOnPage / openDigitalTwinOnPage.
+    async function startPresentationOnPage() {
+        const bridgeEp = bridgeEndpointFor(backendByName('Caffeine'));
+        if (!bridgeEp) {
+            orbitLog('[presentation] Caffeine bridge not available; skipping');
+            return;
+        }
+        const rpcBody = JSON.stringify({
+            jsonrpc: '2.0',
+            id: Date.now(),
+            method: 'tools/call',
+            params: { name: 'openPresentation', arguments: {} }
+        });
+        try {
+            await new Promise((resolve, reject) => {
+                const r = require('http').request({
+                    hostname: 'localhost',
+                    port: ORBIT_WEB_PORT,
+                    path: bridgeEp,
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Content-Length': Buffer.byteLength(rpcBody)
+                    }
+                }, (resp) => {
+                    let d = '';
+                    resp.on('data', c => { d += c; });
+                    resp.on('end', () => {
+                        if (resp.statusCode >= 200 && resp.statusCode < 300) resolve(d);
+                        else reject(new Error(`bridge ${resp.statusCode}: ${d.slice(0, 200)}`));
+                    });
+                });
+                r.on('error', reject);
+                r.write(rpcBody);
+                r.end();
+            });
+            orbitLog('[presentation] Presentation opened');
+        } catch (e) {
+            orbitLog(`[presentation] Failed to open presentation: ${e && e.message}`);
+        }
+    }
+
     // Replay Keep state from the Caffeine-managed IndexedDB audit log.
     // Called once on startup after the Caffeine MCP bridge is available.
     // The Caffeine image handles its own persistence via the keepReplayAudit
@@ -3810,6 +3856,12 @@ module.exports = function (vscode) {
     <button id="eval-open-btn" class="view-btn">open</button>
     <span class="name">evaluate-undo ledger</span>
   </div>
+  <hr id="hr-presentation">
+  <div id="presentation-section-label" class="section-label">presentation slides</div>
+  <div id="presentation-view-row" class="server">
+    <button id="presentation-start-btn" class="view-btn">start</button>
+    <span class="name">Orbit presentation</span>
+  </div>
   <hr id="hr-top">
   <div id="mcp-section-label" class="section-label">remote systems</div>
   <div id="servers"></div>
@@ -3847,6 +3899,10 @@ module.exports = function (vscode) {
     vscode.postMessage({ type: 'openEvaluations' });
   });
 
+  document.getElementById('presentation-start-btn').addEventListener('click', () => {
+    vscode.postMessage({ type: 'startPresentation' });
+  });
+
   function render(state) {
     toggleBtn.textContent = state.orbitRunning ? 'Stop Orbit' : 'Start Orbit';
     webdavCb.checked = !!state.webdavEnabled && !state.singleRoot;
@@ -3871,6 +3927,10 @@ module.exports = function (vscode) {
     document.getElementById('hr-eval').style.display = showEval ? '' : 'none';
     document.getElementById('eval-section-label').style.display = showEval ? '' : 'none';
     document.getElementById('eval-view-row').style.display = showEval ? '' : 'none';
+    const showPresentation = !!state.orbitRunning;
+    document.getElementById('hr-presentation').style.display = showPresentation ? '' : 'none';
+    document.getElementById('presentation-section-label').style.display = showPresentation ? '' : 'none';
+    document.getElementById('presentation-view-row').style.display = showPresentation ? '' : 'none';
     const hasServers = state.orbitRunning && state.servers && state.servers.length > 0;
     document.getElementById('hr-top').style.display = hasServers ? '' : 'none';
     document.getElementById('mcp-section-label').style.display = hasServers ? '' : 'none';
@@ -4044,6 +4104,11 @@ module.exports = function (vscode) {
                         if (msg.type === 'openEvaluations') {
                             openEvaluationsOnPage().catch(e =>
                                 orbitLog(`[evaluations] Panel open failed: ${e && e.message}`));
+                            return;
+                        }
+                        if (msg.type === 'startPresentation') {
+                            startPresentationOnPage().catch(e =>
+                                orbitLog(`[presentation] Panel open failed: ${e && e.message}`));
                             return;
                         }
                     });
