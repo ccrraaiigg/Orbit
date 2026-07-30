@@ -3086,9 +3086,9 @@ module('users.bert.SqueakJS.vm').requires().toRun(function() {
 				}
 			    }, this);
 			    // Pharo
-			    if (this.findMethod("PharoClassInstaller>>initialize")) {
-				Squeak.platformName = "unix";
-			    }
+			    // if (this.findMethod("PharoClassInstaller>>initialize")) {
+//				Squeak.platformName = "unix";
+//			    }
 			},
 		    },
 		    'interpreting', {

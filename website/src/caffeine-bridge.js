@@ -38,6 +38,10 @@ const { readBearer, isLoopback, bearerHeaderMatches } = require('./bearer');
 
 const FAILURE = -1337;
 
+// The object-memory name of the initial (primary) image. Servers hosted
+// by a page running any other image get named after that image.
+const PRIMARY_MEMORY = 'caffeine';
+
 // Keep tools that mutate the store. Calls to these are mirrored to the
 // filesystem op-log + Markdown projection via the onKeepMutation hook
 // (see designs/keep-fs-persistence.md). Read tools (keepGet, keepQuery,
@@ -112,8 +116,42 @@ class CaffeineBridge {
         this.log           = opts.log   || ((...a) => console.log('[caffeine-bridge]', ...a));
         this.error         = opts.error || ((...a) => console.error('[caffeine-bridge]', ...a));
 
-        // endpoint -> tether
+        // httpPath -> tether. The key is the HTTP path VS Code POSTs
+        // to. Usually it equals the endpoint the image announced, but
+        // when a second object memory (a second /orbit-tether tab)
+        // announces an endpoint already owned by another tether, the
+        // bridge de-collides by exposing a namespaced path (e.g.
+        // /mcp/smalltalk@ableton). See _handleControlMessage.
         this.mcpServers = new Map();
+
+        // httpPath -> the endpoint string the owning image expects in
+        // serviceExternalMessage: (Tether class>>serverAt:). Equal to
+        // the httpPath except for de-collided paths, where it is the
+        // original (un-suffixed) endpoint the image announced.
+        this.mcpImageEndpoint = new Map();
+
+        // tether -> object-memory name (from the providing-frame's
+        // `memory` field, derived in-image from Smalltalk imageName).
+        // Used to name de-collided servers and to report which local
+        // object memories are currently live (liveMemories()).
+        this.tetherMemory = new Map();
+
+        // Object-memory name to attach to the NEXT tether that connects.
+        // Set by the extension (labelNextTether) just before it opens a
+        // secondary object memory's Integrated Browser tab, so the tab's
+        // running state is reflected even when the image's announce
+        // frame doesn't carry a `memory` field.
+        this.pendingTetherLabel = null;
+
+        // httpPath -> serverInfo.name announced by the page. The page
+        // announces one providing-frame per registered MCPServer
+        // subclass (see Tether>>provideSmalltalkMCPService), each
+        // carrying a `name`. The bridge reports that name in the
+        // endpoint's MCP `initialize` response so VS Code gives each
+        // server a distinct tool prefix. Defaults to 'Caffeine' for
+        // the historical /mcp/smalltalk endpoint; de-collided servers
+        // get the memory name appended (e.g. 'Caffeine-ableton').
+        this.mcpServerNames = new Map();
 
         // Called whenever the set of providing tethers changes.
         // Hook used by extension-impl to refire VS Code's MCP
@@ -192,6 +230,15 @@ class CaffeineBridge {
         tether.expose(tether);
         this.tethers.set(ws, tether);
 
+        // If the extension told us the next tether belongs to a named
+        // object memory (it just opened that memory's tab), attribute
+        // this tether to it. A `memory` field in the announce frame
+        // will override this if present.
+        if (this.pendingTetherLabel) {
+            this.tetherMemory.set(tether, this.pendingTetherLabel);
+            this.pendingTetherLabel = null;
+        }
+
         ws.on('message', (data, isBinary) => this._onMessage(ws, tether, data, isBinary));
         ws.on('close',   () => this._onClose(ws, tether));
         ws.on('error',   (e) => this.error('ws error:', e.message));
@@ -209,11 +256,14 @@ class CaffeineBridge {
 
     _onClose(ws, tether) {
         this.tethers.delete(ws);
+        this.tetherMemory.delete(tether);
         let removed = false;
-        for (const [endpoint, t] of this.mcpServers) {
+        for (const [httpPath, t] of this.mcpServers) {
             if (t === tether) {
-                this.mcpServers.delete(endpoint);
-                this.lastInitializeAt.delete(endpoint);
+                this.mcpServers.delete(httpPath);
+                this.mcpImageEndpoint.delete(httpPath);
+                this.mcpServerNames.delete(httpPath);
+                this.lastInitializeAt.delete(httpPath);
                 removed = true;
             }
         }
@@ -293,15 +343,55 @@ class CaffeineBridge {
 
     _handleControlMessage(ws, tether, msg) {
         if (msg.mcp && msg.mcp.providing) {
-            const existing = this.mcpServers.get(msg.mcp.endpoint);
-            const isNew = existing !== tether;
-            this.mcpServers.set(msg.mcp.endpoint, tether);
-            this.log('tether providing MCP at ' + msg.mcp.endpoint
+            const imageEndpoint = msg.mcp.endpoint;
+            const memory = msg.mcp.memory || null;
+            if (memory) this.tetherMemory.set(tether, memory);
+            let name = msg.mcp.name || 'Caffeine';
+
+            // A page running a secondary object memory always names its
+            // servers after that image (e.g. 'Caffeine-ableton'), not
+            // just when it has to de-collide with the primary caffeine
+            // page's endpoint — that page may not even be open.
+            if (memory && memory !== PRIMARY_MEMORY) name = name + '-' + memory;
+
+            // Determine the HTTP path VS Code will POST to. Normally it
+            // is the endpoint the image announced. But if that endpoint
+            // is already owned by a DIFFERENT tether (a second object
+            // memory exposing, say, its own /mcp/smalltalk), de-collide
+            // by suffixing a namespace so both coexist as distinct VS
+            // Code MCP servers. The image still sees its own endpoint
+            // (mcpImageEndpoint) when we forward requests.
+            let httpPath = imageEndpoint;
+            const owner = this.mcpServers.get(httpPath);
+            if (owner && owner !== tether) {
+                let suffix = memory;
+                if (!suffix) {
+                    let n = 2;
+                    while (this.mcpServers.has(imageEndpoint + '@' + n)) n++;
+                    suffix = String(n);
+                }
+                httpPath = imageEndpoint + '@' + suffix;
+                // Ensure the suffixed path is free (or already ours).
+                let n = 2;
+                while (this.mcpServers.has(httpPath)
+                       && this.mcpServers.get(httpPath) !== tether) {
+                    httpPath = imageEndpoint + '@' + suffix + '-' + (n++);
+                }
+                if (!name.endsWith('-' + suffix)) name = name + '-' + suffix;
+            }
+
+            const isNew = this.mcpServers.get(httpPath) !== tether;
+            this.mcpServers.set(httpPath, tether);
+            this.mcpImageEndpoint.set(httpPath, imageEndpoint);
+            this.mcpServerNames.set(httpPath, name);
+            this.log('tether providing MCP: image ' + imageEndpoint
+                + ' -> path ' + httpPath + ' as "' + name + '"'
+                + (memory ? ' (memory ' + memory + ')' : '')
                 + (isNew ? '' : ' (re-announce, ignoring)'));
-            // Only fire when this endpoint isn't already bound to
-            // this tether. Repeated identical announces would
-            // otherwise re-trigger VS Code's "new tools" trust
-            // prompt every time the page re-announces.
+            // Only fire when this path isn't already bound to this
+            // tether. Repeated identical announces would otherwise
+            // re-trigger VS Code's "new tools" trust prompt every
+            // time the page re-announces.
             if (isNew) {
                 try { this.onProvidersChanged(); } catch (e) { this.error(e); }
             }
@@ -314,11 +404,53 @@ class CaffeineBridge {
         }
     }
 
-    // Return the singleton page-side Tether (the SqueakJS webapp
-    // opens exactly one /orbit-tether connection).
+    // Return the primary (Caffeine) page-side Tether: the one owning
+    // the historical /mcp/smalltalk endpoint. Used for snapshot,
+    // mirroring, undo, and WebDAV, which target the main Caffeine
+    // object memory even when additional memories are also connected.
     pageTether() {
+        const primary = this.mcpServers.get('/mcp/smalltalk');
+        if (primary) return primary;
         for (const t of this.tethers.values()) return t;
         return null;
+    }
+
+    // The announced serverInfo.name for an httpPath (or 'Caffeine').
+    mcpServerNameFor(httpPath) {
+        return this.mcpServerNames.get(httpPath) || 'Caffeine';
+    }
+
+    // The names of local object memories that currently have a live
+    // tether announcing MCP servers. 'caffeine' (the primary) counts as
+    // live only while a tether of its own is connected — its page can
+    // be closed like any other, and another memory's page may then own
+    // the historical endpoint.
+    liveMemories() {
+        const names = new Set();
+        for (const m of this.tetherMemory.values()) if (m) names.add(m);
+        // Older images announce no `memory` field; treat the tether
+        // owning the historical endpoint as the primary in that case.
+        const primary = this.mcpServers.get('/mcp/smalltalk');
+        if (primary && !this.tetherMemory.get(primary)) names.add(PRIMARY_MEMORY);
+        return Array.from(names);
+    }
+
+    // Attribute the NEXT tether that connects to a named object memory.
+    // Called by the extension right before it opens that memory's
+    // Integrated Browser tab.
+    labelNextTether(memory) {
+        this.pendingTetherLabel = memory || null;
+    }
+
+    // Dynamically discovered bridge MCP servers: one { endpoint, name }
+    // per providing-frame the page announced. The Orbit extension uses
+    // this to register a distinct VS Code MCP server per in-image
+    // MCPServer subclass. See extension-impl.js discoveredBridgeBackends().
+    discoveredEndpoints() {
+        return Array.from(this.mcpServers.keys()).map((endpoint) => ({
+            endpoint,
+            name: this.mcpServerNameFor(endpoint)
+        }));
     }
 
     // Fire-and-forget message-send to the page-side Tether (selector
@@ -372,6 +504,47 @@ class CaffeineBridge {
         const tether = this.pageTether();
         if (!tether) throw new Error('no page tether; cannot snapshot');
         return this.forwardCall(tether, 'snapshot', []);
+    }
+
+    // Enable or disable mirroring of this image's windows onto the Orbit
+    // page, by sending SnowglobeMorphicService the unary message
+    // #enableMirroring or #disableMirroring. Drives the "Caffeine
+    // mirroring" panel checkbox. Resolves once the send completes; throws
+    // if no page tether is connected or the class isn't present.
+    async setCaffeineMirror(enabled) {
+        const tether = this.pageTether();
+        if (!tether) throw new Error('no page tether; cannot toggle Caffeine mirroring');
+        const classAnswer = await this.forwardCall(
+            tether, 'classNamed:', ['SnowglobeMorphicService']);
+        const cls = objectRefFromTetherAnswer(classAnswer);
+        if (!cls) {
+            throw new Error("classNamed: 'SnowglobeMorphicService' did not answer a class");
+        }
+        return tether.sendMessage(
+            cls,
+            enabled ? 'enableMirroring' : 'disableMirroring',
+            [],
+            { timeoutMs: 30000 });
+    }
+
+    // ---- WebDAV over the tether ---------------------------------------------
+    // Forward a WebDAV HTTP request to the page's SqueakJS WebDAVServer over the
+    // tether, mirroring the MCP JSON-RPC forwarding. The page registers a Tether
+    // server at endpoint '/webdav/caffeine' whose serviceExternalMessage:
+    // dispatches action 'webdav' (+ the request dict) to
+    // `WebDAVServer class>>webdav:`, which answers a { status, headers, body }.
+    //   reqObj = { method, path, headers, content }
+    async forwardWebdav(reqObj) {
+        const tether = this.pageTether();
+        if (!tether) {
+            const e = new Error('no caffeine page tether');
+            e.code = 'NO_TETHER';
+            throw e;
+        }
+        const r = await this._forwardRequest(tether, {
+            endpoint: '/webdav/caffeine', action: 'webdav', data: reqObj
+        });
+        return objectFromTetherEncodedJSON(r);
     }
 
     // ---- SSE plumbing -------------------------------------------------------
@@ -436,7 +609,12 @@ class CaffeineBridge {
     async _handleHttpRpc(endpoint, msg) {
         const { id, method, params } = msg;
         const tether = this.mcpServers.get(endpoint);
-        this.log('MCP method:', method, 'id:', id);
+        // The endpoint the owning image expects (equals `endpoint`
+        // except for de-collided paths). Forwarded requests must carry
+        // this so the image's serviceExternalMessage: finds its server.
+        const imageEndpoint = this.mcpImageEndpoint.get(endpoint) || endpoint;
+        this.log('MCP method:', method, 'id:', id, 'path:', endpoint,
+            'image:', imageEndpoint);
 
         switch (method) {
         case 'initialize':
@@ -450,29 +628,36 @@ class CaffeineBridge {
                     stream:    true,
                     sampling:  {}
                 },
-                serverInfo: { name: 'Caffeine', version: '0.1.0' },
+                // Report the path's announced name so multiple in-image
+                // MCPServer subclasses — and servers from distinct
+                // object memories — get distinct tool prefixes in VS
+                // Code. Defaults to 'Caffeine'.
+                serverInfo: {
+                    name: this.mcpServerNames.get(endpoint) || 'Caffeine',
+                    version: '0.1.0'
+                },
                 instructions: 'This MCP server has notifications to send. ' +
                               'Please request an SSE stream with HTTP GET.'
             });
 
         case 'resources/list': {
             const r = await this._forwardRequest(tether,
-                { endpoint, action: 'resources/list' });
+                { endpoint: imageEndpoint, action: 'resources/list' });
             return result(id, objectFromTetherEncodedJSON(r));
         }
         case 'resources/read': {
             const r = await this._forwardRequest(tether,
-                { endpoint, action: 'resources/read', data: params });
+                { endpoint: imageEndpoint, action: 'resources/read', data: params });
             return result(id, objectFromTetherEncodedJSON(r));
         }
         case 'resources/subscribe': {
             const r = await this._forwardRequest(tether,
-                { endpoint, action: 'resources/subscribe', data: params });
+                { endpoint: imageEndpoint, action: 'resources/subscribe', data: params });
             return output(id, objectFromTetherEncodedJSON(r));
         }
         case 'tools/list': {
             const r = await this._forwardRequest(tether,
-                { endpoint, action: 'tools/list' });
+                { endpoint: imageEndpoint, action: 'tools/list' });
             this.log('tools/list response from tether:',
                 typeof r, r && r.length);
             return result(id, objectFromTetherEncodedJSON(r));
@@ -487,7 +672,7 @@ class CaffeineBridge {
                 catch (e) { this.error('onEvaluateCall failed:', e && e.message); }
             }
             const r = await this._forwardRequest(tether,
-                { endpoint, action: 'tools/call', data: params });
+                { endpoint: imageEndpoint, action: 'tools/call', data: params });
             const decoded = objectFromTetherEncodedJSON(r);
             // Mirror Keep mutations to the on-disk op-log + Markdown
             // projection (see designs/keep-fs-persistence.md). Reads

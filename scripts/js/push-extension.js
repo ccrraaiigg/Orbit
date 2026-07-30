@@ -247,7 +247,11 @@ function pushToPeers(vsixPath) {
     const downloadUrl = `${myTunnelUri.replace(/\/$/, '')}/uploads/${vsixName}`;
 
     for (const peer of peers) {
-        let token = peerTokens[peer.machineId] || null;
+        // Cached peer tokens are stored in the modern object form
+        // ({ token, tunnelUri }); older files used a bare token string.
+        // Normalize to the token string so the auth header is well-formed.
+        const cached = peerTokens[peer.machineId];
+        let token = (cached && typeof cached === 'object') ? (cached.token || null) : (cached || null);
 
         // Liveness check — quick probe with 5s timeout.
         const statusUrl = `${peer.tunnelUri.replace(/\/$/, '')}/keep-sync/status`;

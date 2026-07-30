@@ -22,6 +22,19 @@
 - After patching `initializeTools`, call `SmalltalkMCPServer initializeTools` to re-run it; this rebuilds `tools` and calls `Webpage current tether notifyOfToolsListChange`. The MCP client picks up new tools without reconnecting; `tool_search` finds them on the next call.
 - Type strings used: `'string'`, `'integer'`, `'boolean'`. Optional params: `required: false`.
 
+## `prepareForRelease` (added 2026-07-29)
+
+`SmalltalkMCPServer>>prepareForRelease` — no parameters. Clears the
+`AIToolCall` `Calls` cache (`AIToolCall initialize`) and removes every
+`AgentSession` subclass except `self currentSession class`. Answers
+`{clearedToolCalls, keptSessionClass, removedSessionClasses}`.
+
+Motivation: `AIToolCall<<Calls` retains the whole argument/result graph of
+every past tool call, and each conversation leaves an
+`AgentSession_<conversationId>` subclass behind — both pin objects that look
+like leaks and both carry conversation history into an exported image. Run
+this before exporting `caffeine.image` for release.
+
 ## Return-shape contract (strict)
 
 Tool methods **must answer either a `Dictionary` or a simple collection of `Association`s** (e.g. `{ #k1 -> v1. #k2 -> v2 }`). Returning a bare `OrderedCollection`/`Array` of Dictionaries breaks the serializer — wrap as `Dictionary at: 'notes' put: array; yourself`. Returning `nil` is fine inside a Dictionary value (`at: 'note' put: nil`) but not as the top-level result; wrap as `{ #note -> nil }`.

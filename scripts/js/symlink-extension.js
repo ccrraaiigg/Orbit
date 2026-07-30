@@ -27,7 +27,7 @@ function symlinkExtension(extDir, website) {
         symlink(path.join(srcComponents, f), path.join(dstComponents, f), `components/${f}`);
     }
 
-    for (const f of ['orbit-paste.js', 'orbit-clipboard.js', 'orbit-mcp-events.js', 'caffeine.js', 'orbit-version-check.js']) {
+    for (const f of ['orbit-paste.js', 'orbit-clipboard.js', 'orbit-mcp-events.js', 'orbit-object-memories.js', 'caffeine.js', 'orbit-version-check.js']) {
         symlink(path.join(srcJs, f), path.join(dstJs, f), `js/${f}`);
     }
 

@@ -1,0 +1,141 @@
+<html>
+  <head id="magic">
+
+    <title>Orbit: agentic pair programming in Smalltalk</title>
+
+    <!-- Server-rendered: defines window.__ORBIT_BRIDGE_BEARER__, the
+         per-process token the page sends as Authorization: Bearer …
+         to /clipboard and /workspace-fs/*. Must load before any
+         script that calls those endpoints. -->
+    <script src="/orbit-bridge-config.js"></script>
+
+    <script>
+      // Mark the document for dev-host styling before caffeine.css
+      // parses, so the background image rule resolves correctly on
+      // first paint. The Orbit extension only adds
+      // ?backend=192.168.1.140 when serving the page on the dev
+      // hosts (melody, rhythm). See orbitUrl() in
+      // website/src/extension-impl.js.
+      try {
+        if (new URLSearchParams(location.search).get('backend') === '192.168.1.140') {
+          document.documentElement.setAttribute('data-dev-host', '');
+        }
+      } catch (_) {}
+    </script>
+
+    <link rel="stylesheet"
+	  href="css/caffeine.css">
+
+    <script src="js/caffeine.js"></script>
+    <!-- <script type="module" src="https://unpkg.com/deep-chat@2.1.1/dist/deepChat.bundle.js"></script> -->
+    <script type="module" src="js/components/morphic-window.js"></script>
+    <script type="module" src="js/components/transient-window.js"></script>
+    <script type="module" src="js/components/icon-manager.js"></script>
+    <script type="module" src="js/components/markdown-viewer.js"></script>
+    <script src="js/components/lam2300-vr.js"></script>
+    <script src="js/orbit-open-digital-twin.js"></script>
+    <script src="js/orbit-open-presentation.js"></script>
+    <script src="js/components/orbit-task-mirror.js"></script>
+    <script src="js/components/orbit-onboarding.js"></script>
+    <script src="js/components/evaluate-ledger.js"></script>
+    <script src="js/orbit-paste.js"></script>
+    <script src="js/orbit-clipboard.js"></script>
+    <script src="js/orbit-chat.js"></script>
+    <script src="js/orbit-mcp-events.js"></script>
+    <script src="js/orbit-object-memories.js"></script>
+    <script src="js/caffeine-bounds-persist.js"></script>
+    <script src="js/page-mouse-position.js"></script>
+    <script src="js/agent-mouse-cursor.js"></script>
+    <script src="js/components/system-browser/system-browser.js"></script>
+    <script src="js/components/system-browser/system-browser-launcher.js"></script>
+    <script src="js/keep-audit.js"></script>
+
+    <script>
+      document.addEventListener('keydown', function(e) {
+        if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Tab', ' '].indexOf(e.key) !== -1) {
+          e.preventDefault();
+        }
+      }, { passive: false });
+    </script>
+
+  </head>
+
+  <body bgcolor="black"
+	style="margin: 0px;">
+
+    <br>
+
+    <!--
+	
+	This is version 1.0 of the Orbit webapp. During a session, a
+	remote Smalltalk system and my window system collaborate, so
+	that the remote Smalltalk can manipulate this web page, and
+	the window system can manipulate the remote Smalltalk. Along
+	with the Orbit module in the remote Smalltalk, I'm part of the
+	Orbit extension for Visual Studio Code. That extension also
+	configures access to a MCP server hosted by the remote
+	Smalltalk, and that server has tools supporting managed remote
+	method execution. Finally, the Orbit bundle also provides a
+	WebDAV virtual filesystem, with which an agent can invoke
+	actions, access information about classes and methods, and
+	share agentic memory with itself, other agents, and human
+	pair-programmers.
+
+	The webapp has its own window, providing a webdev IDE, which
+	can be collapsed like any other window.
+
+	The window system is implemented with Caffeine
+	(caffeine.js.org), a webapp framework powered by SqueakJS
+	(squeak.js.org).
+    
+	Craig Latta
+	Black Page Digital
+	1 May 2026
+	
+      -->
+
+    <morphic-window id="embeddedSqueak"
+		    caption="Caffeine"
+		    style="pointer-events: all;
+			   top: 280;
+			   left: 120;
+			   opacity: 1;">
+
+      <center>
+	<iframe style="overflow: hidden;"
+		src="squeak.html"
+		id="Caffeine"
+		marginheight="0"
+		marginwidth="0"
+		width="1000"
+		height="400"
+		frameborder="0"
+		scrolling="no"
+		allowfullscreen></iframe></center></morphic-window>
+
+    <div id="dashboard"
+	 style="position: fixed;
+		right: 10px;
+		bottom: 10px;
+		z-index: 2147483647;
+		opacity: 0;
+		transition: opacity 2000ms;">
+
+      <div id="sqSpinner"
+	   style="position: absolute;
+		  right: 0px;
+		  bottom: 0px;
+		  width: 50px;
+		  height: 50px;
+		  opacity: 0;
+		  transition: opacity 500ms;">
+
+	<!-- no "spokes" div, so the spinner just glows -->
+
+      </div>
+
+      <icon-manager></icon-manager>
+
+    </div>
+  </body>
+</html>

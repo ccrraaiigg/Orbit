@@ -5,7 +5,8 @@
 NEVER — with one exception. When the user asks you to rebuild the
 extension, make exactly one snapshot just before exporting
 `caffeine.image` and `caffeine.changes` from the SqueakJS IndexedDB,
-via the `orbit.caffeineSnapshot` VSCode command (see "always refresh
+via the `orbit.caffeineSnapshot` VSCode command, having first called
+the `mcp_caffeine_prepareForRelease` MCP tool (see "always refresh
 the Caffeine memory before building"). That is the only snapshot you
 may ever make, and only on an explicit rebuild request — never when
 rebuilding for any other reason. Outside that one step, NEVER.
@@ -108,6 +109,16 @@ family) are deferred: only their names appear in
 call to any of them in a conversation, use `tool_search` to load their
 schemas. Never guess parameter names — invoke each tool only with the
 exact parameters from its loaded schema.
+
+If `tool_search` returns a tool's full schema, that tool IS callable —
+just invoke it. Do NOT gate on whether the tool also appears in the
+static `<availableDeferredTools>` enumeration: that list can be
+incomplete (e.g. the `mcp_caffeine_*` tools — `onboarding`, `evaluate`,
+`keep*`, etc. — may be absent from it while still being fully loadable
+and callable). Never tell the user an MCP server "isn't connected"
+based on the enumeration alone; if a call is warranted, make it. If a
+call unexpectedly fails, a plain retry is usually the right next step
+before concluding anything is wrong.
 
 ### "push to melody" — what it means and how to do it
 
@@ -616,7 +627,16 @@ Browser's IndexedDB (`squeak` database, `files` object store, keys
 `/caffeine.image` and `/caffeine.changes`, each value a raw
 `ArrayBuffer`), reachable only via JS at that origin.
 
-Before you export those bytes, make a snapshot so the exported image
+Before you snapshot, call the `mcp_caffeine_prepareForRelease` MCP tool
+(no parameters). It clears the `AIToolCall` `Calls` cache and removes
+every per-conversation `AgentSession` subclass except the one servicing
+this conversation. Both of those retain the argument/result graph of
+past tool calls, so skipping this bakes conversation history — and a
+lot of otherwise-collectable garbage — into the released image. Call it
+every time, immediately before `orbit.caffeineSnapshot`; it is
+idempotent and never removes the session class you are using.
+
+Then make a snapshot so the exported image
 is current: invoke the `orbit.caffeineSnapshot` command via
 `run_vscode_command` (with `skipCheck: true`, no arguments). The
 extension owns this command; it sends `snapshot` to the page tether in
@@ -648,8 +668,19 @@ browser download. Instead:
    out-of-band diagnostics channel — handy because the page snapshot /
    `read_page` does NOT reliably surface `console.*` output.
 2. In the page context (`page.evaluate`), open the `squeak` IndexedDB,
-   read each `ArrayBuffer`, and `fetch`-POST it to the sink (the page
-   *does* have `fetch`, unlike the sandbox).
+   read an `ArrayBuffer`, and `fetch`-POST it to the sink (the page
+   *does* have `fetch`, unlike the sandbox). Export the two files **one
+   at a time, in separate `page.evaluate` calls** — do `caffeine.image`
+   first, let that call fully return, then do `caffeine.changes`. The
+   image is large (~45 MB); reading both buffers at once, or firing any
+   second `page.evaluate` (even a tiny diagnostic `fetch`) while a
+   read/POST is still in flight, has crashed the renderer with an OOM
+   (`page.evaluate: Target crashed`), which kills the SqueakJS VM and
+   forces a page reload. So keep peak memory to a single buffer: within
+   each call read one key, POST it, and don't retain the reference;
+   `db.close()` when done; never run a concurrent page call during the
+   export; and poll the deferred result patiently instead of prodding
+   the page.
 3. Verify the on-disk byte counts match the source `ArrayBuffer`
    lengths, then kill the sink and remove any temporary DOM/blob
    elements you injected. Leave the sink *script* on disk for next

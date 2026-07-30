@@ -21,6 +21,11 @@
  *   el.setStatus(jsonString);              // push latest status
  *   el.teardown();                         // remove the window
  *
+ * User cancellation: when the embedded card's Cancel button sends a
+ * tools/call for "cancelEvaluation", the host records the request and
+ * setStatus() returns 'cancel' exactly once, telling the Squeak poller
+ * to perform the actual cancellation (it owns the image/tether access).
+ *
  * Events dispatched (bubbling, composed):
  *   orbit-mirror-closed { taskId }  — the user closed the window. The
  *                                     mirror does NOT auto-close when the
@@ -58,6 +63,8 @@
       this._statusJSON = RUNNING_PLACEHOLDER;
       this._wasAlive = false;    // saw a non-unknown status at least once
       this._tornDown = false;
+      this._cancelRequested = false; // the user clicked the card's Cancel button
+      this._cancelDelivered = false; // 'cancel' already returned to the poller
       this._onMessage = this._handleMessage.bind(this);
     }
 
@@ -89,6 +96,8 @@
 
     // Push the latest status JSON (a String). Returns one of:
     //   'ok'       keep polling
+    //   'cancel'   the user asked to cancel the task; the poller should
+    //              perform the cancellation, then keep polling
     //   'done'     task left the registry; stop polling but KEEP the
     //              window — the user closes it when ready
     //   'tornDown' the user already closed the window
@@ -102,16 +111,32 @@
 
       // The task has left the remote registry (both observers saw it,
       // so the conversation card is gone). Do NOT tear down — leave the
-      // window for the user to close, and keep displaying the last live
-      // status (typically "Evaluation complete") rather than letting the
-      // App fall back to "No matching evaluation found". Just tell the
-      // poller to stop.
+      // window for the user to close, and stop polling. Normally we keep
+      // displaying the last live status (typically "Evaluation complete").
+      // But if the only live status we ever observed was "running" (e.g. a
+      // CPU-bound eval starved this poller so it never saw a clean terminal
+      // status before the dual-observer lifecycle forgot the task), replace
+      // the stale "running" with a synthesized completed status so the card
+      // renders "Evaluation complete." rather than a stuck spinner.
       if (this._wasAlive && s === 'unknown') {
+        var last = null;
+        try { last = JSON.parse(this._statusJSON); } catch (_) { last = null; }
+        var lastS = last && (last.status || (last.finished ? 'finished' : 'running'));
+        if (!last || lastS == null || lastS === 'running') {
+          // A cancel-requested task that vanished was cancelled, not completed.
+          this._statusJSON = JSON.stringify(this._cancelRequested
+            ? { taskId: this.taskId, status: 'cancelled', finished: true, result: '' }
+            : { taskId: this.taskId, status: 'finished', finished: true, result: '' });
+        }
         return 'done';
       }
 
       this._statusJSON = incoming;
       if (s && s !== 'unknown') this._wasAlive = true;
+      if (this._cancelRequested && !this._cancelDelivered) {
+        this._cancelDelivered = true;
+        return 'cancel';
+      }
       return 'ok';
     }
 
@@ -139,12 +164,22 @@
       mw.useCutout = false;
 
       // Open with the window origin (top-left) near the current mouse
-      // point. __pageMouse tracks the outer page's pointer (clientX/Y);
-      // morphic-window clamps the position into the viewport on connect.
+      // point. __pageMouse tracks the outer page's pointer (clientX/Y).
+      // Cap the origin so the window's declared content box (the iframe's
+      // 420x240) still fits within the viewport: otherwise a mouse near the
+      // right/bottom edge would pin the top-left corner there with no room,
+      // and since _clampToViewport measures the window on connect (before
+      // the iframe's srcdoc has laid out) it would lock in that crushed
+      // width instead of re-expanding once the content arrives.
       var mp = (typeof window.__pageMouse === 'function') ? window.__pageMouse() : null;
       if (mp && (mp.x || mp.y)) {
-        mw.style.left = Math.max(0, Math.round(mp.x)) + 'px';
-        mw.style.top = Math.max(0, Math.round(mp.y)) + 'px';
+        var EXPECTED_W = 420, EXPECTED_H = 240;
+        var maxLeft = Math.max(0, window.innerWidth - EXPECTED_W);
+        var maxTop = Math.max(0, window.innerHeight - EXPECTED_H);
+        var left = Math.min(Math.max(0, Math.round(mp.x)), maxLeft);
+        var top = Math.min(Math.max(0, Math.round(mp.y)), maxTop);
+        mw.style.left = left + 'px';
+        mw.style.top = top + 'px';
       }
 
       var center = document.createElement('center');
@@ -202,11 +237,22 @@
           reply({});
           break;
         }
-        case 'tools/call':
+        case 'tools/call': {
+          var toolName = msg.params && msg.params.name;
+          if (toolName === 'cancelEvaluation') {
+            // The card's Cancel button. Flag the request; the Squeak
+            // poller sees setStatus() answer 'cancel' and performs the
+            // actual cancellation.
+            this._cancelRequested = true;
+            reply({ content: [{ type: 'text', text: JSON.stringify(
+              { taskId: this.taskId, outcome: 'requested' }) }] });
+            break;
+          }
           // The App polls createTaskProgressApp; answer with our
           // tether-fed status, shaped like an MCP tool result.
           reply({ content: [{ type: 'text', text: this._statusJSON }] });
           break;
+        }
         default:
           reply({});
       }

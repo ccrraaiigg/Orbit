@@ -27,8 +27,8 @@
     <script src="js/html/utilities.js"></script>
     <script src="js/zlib/bower_components/pako/dist/pako_inflate.min.js"></script>
     <script src="js/orbit-version-check.js"></script>
+    <script src="js/orbit-vscode-file.js"></script>
     <script src="js/orbit-workspace-fs.js"></script>
-    <script src="js/orbit-loopback-input.js"></script>
 
     <script>
       window.top.timedOutCallbacks = []
@@ -61,6 +61,15 @@
 	  imageName = base || "caffeine"
 	  windowTitle = imageName
 	  isCustomSnapshot = true
+	} else if (urlParams.has('image')) {
+	  // Boot a named local object memory already present in the
+	  // page's IndexedDB (e.g. ?image=ableton). No zip is fetched
+	  // when the image is already stored; the name doubles as the
+	  // window title. Treated as a custom snapshot so the bundled
+	  // caffeine.zip version check is skipped for non-caffeine images.
+	  imageName = urlParams.get('image') || "caffeine"
+	  windowTitle = imageName
+	  isCustomSnapshot = imageName !== "caffeine"
 	}
 
 	// Reflect the snapshot's name in the embedding window's titlebar.
@@ -76,6 +85,11 @@
 	  try {await window.orbitCheckCaffeineZipVersion()}
 	  catch (e) {console.warn('orbit version check failed', e)}
 	}
+
+	// Record the Orbit webserver's port where the booting image can
+	// read it. After the version check, which may erase the database.
+	try {await window.orbitWriteVSCodeFile()}
+	catch (e) {console.warn('could not write the vscode file', e)}
 
 	console.log('Starting Snowglobe')
 

@@ -2,7 +2,7 @@
     "name": "orbit-agentic-pair-programming-for-smalltalk",
     "displayName": "Orbit: Agentic Pair Programming for Smalltalk",
     "description": "A livecoding pair-programming harness for Smalltalk.",
-    "version": "1.232.0",
+    "version": "1.254.0",
     "publisher": "BlackPageDigital",
     "icon": "public/pictures/icons/participant/orbit.jpg",
     "engines": {
@@ -38,8 +38,6 @@
         "onCommand:orbit.keepSync.getPeerInfo",
         "onMcpServerDefinitionProvider:orbitBackend",
         "onChatParticipant:orbit.orbit",
-        "onChatParticipant:orbit.orbit-2300-backend",
-        "onChatParticipant:orbit.orbit-2300-ui",
         "onView:orbit.status"
     ],
     "contributes": {
@@ -80,6 +78,11 @@
                     "type": "number",
                     "default": 60000,
                     "description": "How often (in milliseconds) to poll peers for new Keep operations. Default 1 minute."
+                },
+                "orbit.caffeineMirror": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Mirror the in-page Caffeine (SqueakJS) image's windows onto the Orbit page as pixel-backed web components. Enabling starts SnowglobeMorphicService; disabling stops it and removes the mirror windows. Controlled by the 'Caffeine mirroring' checkbox in the Orbit view."
                 }
             }
         },
@@ -167,20 +170,6 @@
                 "fullName": "Orbit",
                 "name": "orbit",
                 "description": "Orbit livecoding pair-programming agent for Smalltalk",
-                "isSticky": true
-            },
-            {
-                "id": "orbit.orbit-2300-backend",
-                "fullName": "Orbit (2300-backend)",
-                "name": "orbit-2300-backend",
-                "description": "Orbit pair-programming agent restricted to the 2300-backend Smalltalk MCP server",
-                "isSticky": true
-            },
-            {
-                "id": "orbit.orbit-2300-ui",
-                "fullName": "Orbit (2300-ui)",
-                "name": "orbit-2300-ui",
-                "description": "Orbit pair-programming agent restricted to the 2300-ui Smalltalk MCP server",
                 "isSticky": true
             }
         ],

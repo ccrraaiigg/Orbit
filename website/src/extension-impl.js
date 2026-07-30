@@ -77,7 +77,23 @@ module.exports = function (vscode) {
     // Reachability is "is there a tether currently registered with
     // the bridge?", and the MCP URL is the bridge's HTTP endpoint on
     // the local Orbit webserver port (8089).
-    const ORBIT_WEB_PORT = 8089;
+    //
+    // To let Orbit run under stable VS Code and VS Code Insiders at the
+    // same time (each activates its own copy of the extension, each
+    // wanting to bind the webserver port), Insiders uses a distinct
+    // port so the two don't collide. vscode.env.appName is
+    // "Visual Studio Code - Insiders" on Insiders builds.
+    const isInsiders = (() => {
+        try { return /insiders/i.test(vscode.env.appName || ''); }
+        catch (_) { return false; }
+    })();
+    const ORBIT_WEB_PORT = isInsiders ? 8090 : 8089;
+    // The endpoint of the primary (historical) Caffeine MCP server,
+    // hosted by SmalltalkMCPServer in the page's SqueakJS image. The
+    // static "Caffeine" bridge backend below is the stable anchor for
+    // this endpoint; additional MCPServer subclasses the page announces
+    // are surfaced dynamically (see discoveredBridgeBackends()).
+    const PRIMARY_BRIDGE_ENDPOINT = '/mcp/smalltalk';
     const BACKENDS = [
         { name: '2300-backend', kind: 'tcp',    mcpPort: 15072, webdavPort: 19072, toolPrefix: '2300-backend', proxyPort: 15172 },
         { name: '2300-ui',      kind: 'tcp',    mcpPort: 15070, webdavPort: 19070, toolPrefix: '2300-ui',      proxyPort: 15170 },
@@ -90,7 +106,7 @@ module.exports = function (vscode) {
     let currentApp = null;
 
     function backendByName(name) {
-        return BACKENDS.find(b => b.name === name);
+        return allBackends().find(b => b.name === name);
     }
 
     // --- evaluate-call markers + undo --------------------------------
@@ -543,13 +559,70 @@ module.exports = function (vscode) {
         orbitLog('[orbit] evaluate marker commands armed' + (file ? ' on ' + file : ''));
     }
 
-    // Pick the bridge endpoint that backs the Caffeine MCP server.
-    // Currently we assume the page registers exactly one endpoint;
-    // if multiple endpoints are ever announced, the first one wins.
+    // Resolve the bridge endpoint that backs a given bridge-kind
+    // backend. Multi-endpoint aware: the page announces one MCP
+    // endpoint per registered MCPServer subclass in its SqueakJS image
+    // (see Tether>>provideSmalltalkMCPService). A dynamically-discovered
+    // backend descriptor carries its own `endpoint`; we return it once
+    // the bridge has actually seen the page announce it. The static
+    // "Caffeine" anchor backend carries no endpoint, so it resolves to
+    // the primary SmalltalkMCPServer endpoint (falling back to the
+    // first announced endpoint for older images).
     function bridgeEndpointFor(backend) {
         if (!currentApp || !currentApp.mcpBridge) return null;
-        const endpoints = Array.from(currentApp.mcpBridge.mcpServers.keys());
-        return endpoints[0] || null;
+        const announced = Array.from(currentApp.mcpBridge.mcpServers.keys());
+        if (backend && backend.endpoint) {
+            return announced.includes(backend.endpoint) ? backend.endpoint : null;
+        }
+        if (announced.includes(PRIMARY_BRIDGE_ENDPOINT)) return PRIMARY_BRIDGE_ENDPOINT;
+        return announced[0] || null;
+    }
+
+    // Turn an endpoint path into a stable, prefix-safe backend name for
+    // any non-primary MCP server the page announces, e.g.
+    // '/mcp/inventory' -> 'Caffeine-inventory'.
+    function bridgeBackendNameFromEndpoint(endpoint) {
+        const tail = String(endpoint).replace(/^\/+/, '').split('/').pop() || 'server';
+        return 'Caffeine-' + tail.replace(/[^A-Za-z0-9_-]/g, '-');
+    }
+
+    // Dynamically discover the extra bridge-kind backends the page has
+    // announced beyond the primary Caffeine server. Each announced
+    // endpoint corresponds to an MCPServer subclass in the image; the
+    // primary endpoint (/mcp/smalltalk) is represented by the static
+    // "Caffeine" backend, so it is skipped here. The rest become extra
+    // bridge backends whose name comes from the serverInfo the image
+    // supplied with its providing-frame (falling back to a name derived
+    // from the endpoint path).
+    function discoveredBridgeBackends() {
+        if (!currentApp || !currentApp.mcpBridge) return [];
+        const bridge = currentApp.mcpBridge;
+        if (typeof bridge.discoveredEndpoints !== 'function') return [];
+        const out = [];
+        for (const { endpoint, name } of bridge.discoveredEndpoints()) {
+            if (endpoint === PRIMARY_BRIDGE_ENDPOINT) continue;
+            const serverName = name || bridgeBackendNameFromEndpoint(endpoint);
+            out.push({
+                name: serverName,
+                kind: 'bridge',
+                endpoint,
+                // VS Code names an MCP server's tools from its
+                // serverInfo.name, normalizing non-alphanumeric chars
+                // to '_'. Mirror that so isMcpServerActuallyRunning's
+                // prefix match works for discovered servers.
+                toolPrefix: serverName.replace(/[^A-Za-z0-9]/g, '_')
+            });
+        }
+        return out;
+    }
+
+    // The full set of backends: the static ones plus any dynamically
+    // discovered bridge servers. Used by everything that must react to
+    // servers the page adds at runtime (reachability probes, the MCP
+    // definition provider, activation). The activity-bar UI machinery
+    // continues to key off the static BACKENDS array.
+    function allBackends() {
+        return BACKENDS.concat(discoveredBridgeBackends());
     }
 
     // Whether VS Code's MCP client has actually contacted the bridge
@@ -588,7 +661,15 @@ module.exports = function (vscode) {
     }
 
     function webdavUrlFor(backend) {
-        if (backend.kind === 'bridge') return null;
+        if (backend.kind === 'bridge') {
+            // Caffeine has no listening HTTP WebDAV port; its WebDAVServer is
+            // reached over the CaffeineBridge tether, proxied same-origin at the
+            // Orbit webserver's /webdav route (see app-impl.js). Only usable once
+            // the page tether has announced itself.
+            return bridgeEndpointFor(backend)
+                ? `http://localhost:${ORBIT_WEB_PORT}/webdav`
+                : null;
+        }
         return `http://${backendHost}:${backend.webdavPort}/webdav`;
     }
 
@@ -630,15 +711,17 @@ module.exports = function (vscode) {
 
     // Probe all backends in parallel for either 'mcp' or 'webdav'
     // service. Returns an array of {backend, reachable}. Bridge-kind
-    // backends only support 'mcp' (their reachability is "is there a
-    // tether registered with the Orbit CaffeineBridge?"); they are always
-    // unreachable for 'webdav'.
+    // backends serve both 'mcp' and 'webdav' over the tether (their
+    // reachability is "is there a tether registered with the Orbit
+    // CaffeineBridge?"); they are reachable for either kind once the
+    // page tether has announced.
     async function probeBackends(kind) {
-        const probes = BACKENDS.map(async (b) => {
+        const probes = allBackends().map(async (b) => {
             let reachable;
             if (b.kind === 'bridge') {
-                reachable = (kind === 'mcp')
-                    && !!bridgeEndpointFor(b);
+                // Caffeine now serves both MCP and WebDAV over the bridge tether, so it
+                // is reachable for either kind whenever the page tether has announced.
+                reachable = !!bridgeEndpointFor(b);
             } else {
                 const port = kind === 'mcp' ? b.mcpPort : b.webdavPort;
                 const host = kind === 'mcp' ? mcpHost : backendHost;
@@ -865,6 +948,23 @@ module.exports = function (vscode) {
         return isDevHost ? `${base}?backend=192.168.1.140` : base;
     }
 
+    // URL for booting a specific local object memory (a *.image in the
+    // page's IndexedDB) in its own Integrated Browser tab. squeak.html
+    // reads the `image` query param and boots that image. The primary
+    // "caffeine" memory uses the plain orbitUrl. No `backend` param:
+    // a secondary memory is unlikely to pair with a remote Smalltalk.
+    function orbitUrlForMemory(port, memory) {
+        if (!memory || memory === 'caffeine') return orbitUrl(port);
+        const base = `http://localhost:${port}/orbit.html`;
+        return `${base}?image=${encodeURIComponent(memory)}`;
+    }
+
+    // Object memories (*.image files) the page has reported present in
+    // its IndexedDB. Reported by public/js/orbit-object-memories.js via
+    // POST /object-memories. 'caffeine' (the primary) is always
+    // considered available even before the first report.
+    let reportedObjectMemories = [];
+
     let server = null;
     // The tunnel URI for this instance's HTTP server, discovered via
     // the devtunnel CLI. null when no tunnel is active. Other Orbit
@@ -996,65 +1096,98 @@ module.exports = function (vscode) {
     // when the user starts the server again (or on orbit.start/stop).
     const mcpUserStopped = new Set();
 
-    const mcpServers = BACKENDS.map((b) => ({
-        name: b.name,
-        getRunning: () => !!mcpRunning[b.name],
-        setRunning: async (running) => {
-            const id = mcpServerIdFor(b.name);
-            if (running) {
-                // User intent: keep this server running. Re-enable the
-                // auto-reconnect machinery for it.
-                mcpUserStopped.delete(b.name);
-                try {
-                    await vscode.commands.executeCommand(
-                        'workbench.mcp.startServer',
-                        id,
-                        { autoTrustChanges: true }
-                    );
-                } catch (e) {
-                    orbitError(`[orbit] MCP startServer ${b.name} failed:`, e && e.message);
-                    return;
-                }
-                // Confirm via an actual echoMessage tool invocation
-                // that VS Code is connected to the server before
-                // flipping the UI flag. workbench.mcp.startServer
-                // resolves before any tools have been negotiated,
-                // and vscode.lm.tools can hold stale entries from a
-                // previous session, so we round-trip a real call.
-                // If verification fails, leave the flag false so
-                // the periodic retry tick re-issues the start.
-                let verified = false;
-                for (let i = 0; i < 24; i++) {
-                    if (await isMcpServerConnected(b.name)) { verified = true; break; }
-                    await new Promise(r => setTimeout(r, 250));
-                }
-                mcpRunning[b.name] = verified;
-                if (!verified) {
-                    orbitError(`[orbit] MCP startServer ${b.name}: resolved but no tools appeared`);
-                }
-            } else {
-                try {
-                    await vscode.commands.executeCommand(
-                        'workbench.mcp.stopServer',
-                        id
-                    );
-                    mcpRunning[b.name] = false;
-                    // User intent: keep this server stopped. Suppress
-                    // auto-reconnect until the user starts it again.
-                    mcpUserStopped.add(b.name);
-                } catch (e) {
-                    orbitError(`[orbit] MCP stopServer ${b.name} failed:`, e && e.message);
+    // Per-server control objects backing the Orbit panel checkboxes.
+    // Built lazily and cached by name so that dynamically-discovered
+    // bridge servers (extra MCPServer subclasses the page announces)
+    // get a checkbox row too — not just the static BACKENDS. Each
+    // control's setRunning() asks VS Code to start/stop that specific
+    // MCP server and mirrors the user's intent into mcpRunning /
+    // mcpUserStopped.
+    const mcpServerControlCache = new Map();
+    function makeServerControl(name) {
+        return {
+            name,
+            getRunning: () => !!mcpRunning[name],
+            setRunning: async (running) => {
+                const id = mcpServerIdFor(name);
+                if (running) {
+                    // User intent: keep this server running. Re-enable the
+                    // auto-reconnect machinery for it.
+                    mcpUserStopped.delete(name);
+                    try {
+                        await vscode.commands.executeCommand(
+                            'workbench.mcp.startServer',
+                            id,
+                            { autoTrustChanges: true }
+                        );
+                    } catch (e) {
+                        orbitError(`[orbit] MCP startServer ${name} failed:`, e && e.message);
+                        return;
+                    }
+                    // Confirm via an actual echoMessage/tool round-trip
+                    // that VS Code is connected before flipping the UI
+                    // flag. workbench.mcp.startServer resolves before any
+                    // tools have been negotiated, and vscode.lm.tools can
+                    // hold stale entries from a previous session, so we
+                    // round-trip a real call. If verification fails,
+                    // leave the flag false so the periodic retry tick
+                    // re-issues the start.
+                    let verified = false;
+                    for (let i = 0; i < 24; i++) {
+                        if (await isMcpServerConnected(name)) { verified = true; break; }
+                        await new Promise(r => setTimeout(r, 250));
+                    }
+                    mcpRunning[name] = verified;
+                    if (!verified) {
+                        orbitError(`[orbit] MCP startServer ${name}: resolved but no tools appeared`);
+                    }
+                } else {
+                    try {
+                        await vscode.commands.executeCommand(
+                            'workbench.mcp.stopServer',
+                            id
+                        );
+                        mcpRunning[name] = false;
+                        // User intent: keep this server stopped. Suppress
+                        // auto-reconnect until the user starts it again.
+                        mcpUserStopped.add(name);
+                    } catch (e) {
+                        orbitError(`[orbit] MCP stopServer ${name} failed:`, e && e.message);
+                    }
                 }
             }
-        }
-    }));
+        };
+    }
+    function mcpServerControlFor(name) {
+        let c = mcpServerControlCache.get(name);
+        if (!c) { c = makeServerControl(name); mcpServerControlCache.set(name, c); }
+        return c;
+    }
+    // Like mcpServerControlFor, but only for a currently-known backend
+    // (static or dynamically discovered). Returns null for an unknown
+    // name so callers don't conjure controls for servers that no longer
+    // exist.
+    function mcpServerControlIfKnown(name) {
+        return allBackends().some(b => b.name === name)
+            ? mcpServerControlFor(name)
+            : null;
+    }
+    // The panel's per-server controls: the static backends plus any
+    // dynamically discovered bridge servers, in a stable order.
+    function mcpServerControls() {
+        return allBackends().map(b => mcpServerControlFor(b.name));
+    }
 
     // Subscribers (page SSE clients + view refresher) listening for
     // MCP server state changes. Each subscriber is a function taking
     // { name, running }.
     const mcpStateSubscribers = new Set();
     function notifyMcpState(name, running) {
-        const payload = { name, running };
+        notifyPageEvent({ name, running });
+    }
+    // Broadcast an arbitrary payload on the same channel (used for
+    // non-server events such as { closeMemory }).
+    function notifyPageEvent(payload) {
         for (const fn of mcpStateSubscribers) {
             try { fn(payload); } catch (e) { orbitError('[orbit] mcp subscriber failed:', e && e.message); }
         }
@@ -1727,7 +1860,7 @@ module.exports = function (vscode) {
         // whose backend is no longer reachable, or with an unknown
         // authority) is removed first.
         const reachable = await reachableBackends('webdav');
-        const reachableNames = new Set(reachable.map(b => b.name));
+        const reachableNames = new Set(reachable.map(b => b.name.toLowerCase()));
         orbitLog('[orbit] addWebdavWorkspaceFolders: reachable=' +
             JSON.stringify(Array.from(reachableNames)));
 
@@ -1736,7 +1869,7 @@ module.exports = function (vscode) {
         const existing = findWebdavFolderIndices();
         for (let k = existing.length - 1; k >= 0; k--) {
             const f = existing[k].folder;
-            const auth = f.uri.authority;
+            const auth = String(f.uri.authority || '').toLowerCase();
             if (!reachableNames.has(auth)) {
                 const ok = vscode.workspace.updateWorkspaceFolders(
                     existing[k].index, 1
@@ -1748,9 +1881,9 @@ module.exports = function (vscode) {
 
         // Compute which reachable backends still need a folder.
         const present = new Set(
-            findWebdavFolderIndices().map(e => e.folder.uri.authority)
+            findWebdavFolderIndices().map(e => String(e.folder.uri.authority || '').toLowerCase())
         );
-        const toAdd = reachable.filter(b => !present.has(b.name));
+        const toAdd = reachable.filter(b => !present.has(b.name.toLowerCase()));
         if (toAdd.length === 0) {
             orbitLog('[orbit] addWebdavWorkspaceFolders: nothing to add');
             return true;
@@ -1928,11 +2061,15 @@ module.exports = function (vscode) {
     // restored from the previous window get re-pointed at the freshly
     // started server, rather than left to rot beside a new tab.
     async function showOrbitBrowser(url) {
+        // Booting the primary memory's page; count it as running until
+        // its tether connects (or the grace window elapses).
+        startedObjectMemories.set('caffeine', Date.now());
         try {
             await vscode.commands.executeCommand(
                 'workbench.action.browser.open',
                 { url, reuseUrlFilter: url }
             );
+            rememberObjectMemoryTab('caffeine');
             return;
         } catch (e) {
             orbitError('[orbit] workbench.action.browser.open failed; falling back to simpleBrowser.show:',
@@ -1940,9 +2077,116 @@ module.exports = function (vscode) {
         }
         try {
             await vscode.commands.executeCommand('simpleBrowser.show', url);
+            rememberObjectMemoryTab('caffeine');
         } catch (e) {
             orbitError('[orbit] simpleBrowser.show failed:', e && e.message);
         }
+    }
+    // Object memories the user has started in an Integrated Browser
+    // tab, mapped to the time we opened them. Used only as an optimistic
+    // "running" hint during the boot window; once a memory's tether
+    // connects, liveObjectMemories() (tether presence) is authoritative.
+    const startedObjectMemories = new Map();
+    const OBJECT_MEMORY_BOOT_GRACE_MS = 25000;
+
+    // The Integrated Browser tab we opened for each object memory. VS
+    // Code doesn't expose a browser tab's URL (tab.input is null on
+    // those tabs) and every memory's page carries the same title, so
+    // remembering the tab object is the only way to close the right
+    // one later.
+    const objectMemoryTabs = new Map();
+
+    function rememberObjectMemoryTab(memory) {
+        try {
+            const group = vscode.window.tabGroups.activeTabGroup;
+            const tab = group && group.activeTab;
+            if (tab) objectMemoryTabs.set(memory, tab);
+        } catch (_) {}
+    }
+
+    // Close the browser tab hosting `memory`, if we still know it. A
+    // page inside the Integrated Browser's cross-origin iframe can't
+    // close its own tab, so the extension has to do it.
+    async function closeObjectMemoryBrowserTab(memory) {
+        const tab = objectMemoryTabs.get(memory);
+        objectMemoryTabs.delete(memory);
+        if (!tab) return false;
+        let stillOpen = false;
+        try {
+            for (const group of vscode.window.tabGroups.all) {
+                if (group.tabs.indexOf(tab) !== -1) { stillOpen = true; break; }
+            }
+        } catch (_) {}
+        if (!stillOpen) return false;
+        try {
+            await vscode.window.tabGroups.close(tab, true);
+            return true;
+        } catch (e) {
+            orbitError(`[orbit] closing ${memory} browser tab failed:`, e && e.message);
+            return false;
+        }
+    }
+
+    // Names of local object memories currently running, per the
+    // CaffeineBridge (a live tether announcing MCP servers), including
+    // 'caffeine' (the primary) while its page is open.
+    function liveObjectMemories() {
+        const bridge = currentApp && currentApp.mcpBridge;
+        if (bridge && typeof bridge.liveMemories === 'function') {
+            try { return bridge.liveMemories(); } catch (_) {}
+        }
+        return [];
+    }
+
+    // Whether a memory should render as running: it has a live tether,
+    // or we opened its tab recently and it's still booting.
+    function objectMemoryRunning(name, liveSet) {
+        if (liveSet.has(name)) return true;
+        const at = startedObjectMemories.get(name);
+        return !!at && (Date.now() - at) < OBJECT_MEMORY_BOOT_GRACE_MS;
+    }
+
+    // Start a secondary object memory in its own Integrated Browser tab.
+    //
+    // Opened the usual way, via `workbench.action.browser.open`. The
+    // apparent "clobber" of Caffeine in earlier attempts was actually
+    // the extension's own tab-dedup closing the primary tab (it matched
+    // Orbit tabs by title, not URI); with dedup now keyed strictly on
+    // URI, a normal open coexists with the primary. We also tell the
+    // bridge to attribute the next new tether to this memory so its
+    // running state is reflected.
+    async function openObjectMemoryTab(memory) {
+        const url = orbitUrlForMemory(ORBIT_WEB_PORT, memory);
+        try {
+            const bridge = currentApp && currentApp.mcpBridge;
+            if (bridge && bridge.labelNextTether) bridge.labelNextTether(memory);
+        } catch (_) {}
+        startedObjectMemories.set(memory, Date.now());
+        try {
+            await vscode.commands.executeCommand(
+                'workbench.action.browser.open', { url });
+        } catch (e) {
+            orbitError(`[orbit] open object memory ${memory} failed:`, e && e.message);
+            try { await vscode.commands.executeCommand('simpleBrowser.show', url); }
+            catch (_) {}
+        }
+        rememberObjectMemoryTab(memory);
+        // Re-evaluate the checkbox once the boot grace elapses, in case
+        // the memory never connected a tether.
+        setTimeout(() => {
+            if (orbitTreeChangeFire) { try { orbitTreeChangeFire(); } catch (_) {} }
+        }, OBJECT_MEMORY_BOOT_GRACE_MS + 500);
+    }
+
+    // Stop a secondary object memory. The extension can't map a memory
+    // to its Integrated Browser tab, so we broadcast a close request the
+    // memory page obeys (public/js/orbit-object-memories.js closes its
+    // own window). Its tether then drops and it stops being listed.
+    async function closeObjectMemoryTab(memory) {
+        startedObjectMemories.delete(memory);
+        try { notifyPageEvent({ closeMemory: memory }); } catch (_) {}
+        try { await closeObjectMemoryBrowserTab(memory); } catch (_) {}
+        if (orbitTreeChangeFire) { try { orbitTreeChangeFire(); } catch (_) {} }
     }
 
     function startServer(context, openBrowser) {
@@ -2038,9 +2282,29 @@ module.exports = function (vscode) {
                 // channel so we can see incoming HTTP requests.
                 app.mcpBridge.log = (...a) => orbitLog('[caffeine-bridge]', ...a);
                 app.mcpBridge.error = (...a) => orbitError('[caffeine-bridge]', ...a);
+                // Reapply the saved "Caffeine mirroring" checkbox state to the
+                // (re)connected page, so the toggle is authoritative across page
+                // reloads. Both enable and disable are idempotent in the image;
+                // if the page tether isn't ready yet the send rejects harmlessly
+                // and a later providers-change retries.
+                const applyCaffeineMirrorConfig = () => {
+                    const desired = vscode.workspace
+                        .getConfiguration('orbit').get('caffeineMirror', false);
+                    if (!app.mcpBridge || !app.mcpBridge.setCaffeineMirror) return;
+                    app.mcpBridge.setCaffeineMirror(desired).catch((e) => {
+                        orbitLog(`[orbit] caffeineMirror apply deferred: ${e && e.message}`);
+                    });
+                };
                 app.mcpBridge.onProvidersChanged = () => {
                     orbitLog('[orbit] CaffeineBridge providers changed; refiring MCP definitions');
                     try { mcpDefinitionsChanged.fire(); } catch (_) {}
+                    // Refresh the Orbit panel immediately so a newly
+                    // announced bridge server (an extra MCPServer
+                    // subclass) gets its checkbox row without waiting
+                    // for the async activation pass below to finish.
+                    if (orbitTreeChangeFire) {
+                        try { orbitTreeChangeFire(); } catch (_) {}
+                    }
                     activateReachableBackends().catch((e) => {
                         orbitError('[orbit] activateReachableBackends after bridge change failed:',
                             e && e.message);
@@ -2049,6 +2313,7 @@ module.exports = function (vscode) {
                     // (e.g. the 2300 backends had already settled
                     // as "all up" before Caffeine showed up).
                     scheduleBackendActivationRetries();
+                    applyCaffeineMirrorConfig();
                 };
                 // Record an evaluate-ledger marker for every Caffeine
                 // `evaluate` tools/call so it shows up in the Evaluate
@@ -2085,6 +2350,26 @@ module.exports = function (vscode) {
                         '[orbit] Keep mirror failed:', e && e.message); }
                 };
             }
+            // The Orbit page reports which object memories (*.image
+            // files) exist in its IndexedDB here, so the panel's
+            // "local object memories" section can list them. Body:
+            // { memories: ["caffeine", "ableton", ...] }.
+            (app.extensionRoutes || app).post('/object-memories', (req, res) => {
+                try {
+                    const body = req.body || {};
+                    const list = Array.isArray(body.memories) ? body.memories : [];
+                    reportedObjectMemories = list
+                        .map(n => String(n || '').trim())
+                        .filter(Boolean);
+                    if (orbitTreeChangeFire) {
+                        try { orbitTreeChangeFire(); } catch (_) {}
+                    }
+                    res.status(200).json({ ok: true, count: reportedObjectMemories.length });
+                } catch (e) {
+                    orbitError('[orbit] /object-memories failed:', e && e.message);
+                    res.status(400).json({ ok: false });
+                }
+            });
             // Server-Sent Events endpoint that streams MCP server
             // state changes to the Orbit webapp. The page subscribes
             // via EventSource and dispatches each event to
@@ -2100,7 +2385,7 @@ module.exports = function (vscode) {
                 });
                 // Initial snapshot so newly-connected clients can
                 // sync without waiting for the next change.
-                for (const s of mcpServers) {
+                for (const s of mcpServerControls()) {
                     res.write(`data: ${JSON.stringify({ name: s.name, running: !!s.getRunning() })}\n\n`);
                 }
                 const subscriber = (payload) => {
@@ -2627,7 +2912,7 @@ module.exports = function (vscode) {
                 catch (e) { orbitError('[orbit] attachSnowglobeServer failed:', e && e.message); }
             }
 
-            server.listen(8089, async () => {
+            server.listen(ORBIT_WEB_PORT, async () => {
                 const addr = server.address();
                 setRunningContext(true);
                 vscode.window.showInformationMessage(`Orbit running on port ${addr.port}`);
@@ -2737,32 +3022,32 @@ module.exports = function (vscode) {
     // authoritative answer.
     function isMcpServerActuallyRunning(name) {
         try {
-            // "Running" means VS Code has surfaced at least one
-            // tool for this MCP server. Bridge-kind backends
-            // (Caffeine) additionally require that VS Code's MCP
-            // client has actually contacted the bridge endpoint
-            // (i.e. POSTed initialize) — otherwise we'd be fooled
-            // by stale vscode.lm.tools entries cached from a
-            // previous session.
-            const tools = (vscode.lm && vscode.lm.tools) || [];
-            // VS Code names tools using the server's serverInfo.name
-            // (normalized: non-word chars → '_'), not the definition
-            // name we pass to McpHttpServerDefinition. Use the
-            // backend's toolPrefix when available.
             const backend = backendByName(name);
-            const prefix = backend && backend.toolPrefix
-                ? `mcp_${backend.toolPrefix}_`.toLowerCase()
-                : `mcp_${name}_`.toLowerCase();
-            let hasTool = false;
-            for (const t of tools) {
-                const n = ((t && t.name) || '').toLowerCase();
-                if (n.startsWith(prefix)) { hasTool = true; break; }
-            }
-            if (!hasTool) return false;
+            // Bridge-kind backends (Caffeine and the object-memory
+            // servers): the authoritative "VS Code's MCP client is
+            // connected" signal is that it POSTed `initialize` to the
+            // endpoint (bridgeVscodeConnected, tracked per-endpoint in
+            // the CaffeineBridge). We deliberately do NOT gate on a
+            // computed tool prefix here: VS Code derives tool-name
+            // prefixes from a lowercased-and-truncated serverInfo.name
+            // (e.g. "Caffeine-ableton" → tools "mcp_caffeine-able_…"),
+            // which we can't reliably predict — so a prefix check gives
+            // false "stopped" readings for de-collided/secondary
+            // servers.
             if (backend && backend.kind === 'bridge') {
                 return bridgeVscodeConnected(backend);
             }
-            return true;
+            // TCP backends: "running" means VS Code has surfaced at
+            // least one tool under the expected prefix.
+            const tools = (vscode.lm && vscode.lm.tools) || [];
+            const prefix = backend && backend.toolPrefix
+                ? `mcp_${backend.toolPrefix}_`.toLowerCase()
+                : `mcp_${name}_`.toLowerCase();
+            for (const t of tools) {
+                const n = ((t && t.name) || '').toLowerCase();
+                if (n.startsWith(prefix)) return true;
+            }
+            return false;
         } catch (_) { return false; }
     }
 
@@ -2827,7 +3112,7 @@ module.exports = function (vscode) {
         // just vscode.lm.tools presence (which retains stale entries
         // after a window reload). If echoMessage succeeds, VS Code
         // genuinely has an active MCP client connection.
-        for (const b of BACKENDS) {
+        for (const b of allBackends()) {
             if (mcpRunning[b.name]) continue;
             if (mcpUserStopped.has(b.name)) continue;
             if (b.kind === 'bridge') continue;
@@ -2838,7 +3123,7 @@ module.exports = function (vscode) {
                 orbitLog(`[orbit] activateReachableBackends: ${b.name} running=true (reconciled via echoMessage)`);
             }
         }
-        const probes = await Promise.all(BACKENDS.map(async (b) => {
+        const probes = await Promise.all(allBackends().map(async (b) => {
             let mcp;
             if (mcpRunning[b.name]) mcp = true;
             else if (b.kind === 'bridge') mcp = !!bridgeEndpointFor(b);
@@ -2899,7 +3184,7 @@ module.exports = function (vscode) {
         if (orbitTreeChangeFire) {
             try { orbitTreeChangeFire(); } catch (_) {}
         }
-        return BACKENDS.every(b => mcpRunning[b.name] || mcpUserStopped.has(b.name));
+        return allBackends().every(b => mcpRunning[b.name] || mcpUserStopped.has(b.name));
     }
 
     // Periodically retry activateReachableBackends so a backend that
@@ -3250,7 +3535,9 @@ module.exports = function (vscode) {
             const createWebdavFs = require('./webdav-fs');
             const { provider, scheme } = createWebdavFs(vscode, {
                 getBaseUrl: (authority) => {
-                    const b = backendByName(authority);
+                    const a = String(authority || '').toLowerCase();
+                    const b = backendByName(authority)
+                        || BACKENDS.find(x => x.name.toLowerCase() === a);
                     return b ? webdavUrlFor(b) : null;
                 },
                 getAuthHeader: () => {
@@ -3546,6 +3833,19 @@ module.exports = function (vscode) {
         });
         context.subscriptions.push(openSteeringCmd);
 
+        // Programmatic open/close of a local object memory in its own
+        // Integrated Browser tab (same path the panel checkbox uses).
+        // Useful for agents/scripts and for verifying the open behavior.
+        const openMemoryCmd = vscode.commands.registerCommand(
+            'orbit.openObjectMemory', async (memory) => {
+                if (memory) await openObjectMemoryTab(String(memory));
+            });
+        const closeMemoryCmd = vscode.commands.registerCommand(
+            'orbit.closeObjectMemory', async (memory) => {
+                if (memory) await closeObjectMemoryTab(String(memory));
+            });
+        context.subscriptions.push(openMemoryCmd, closeMemoryCmd);
+
         // Command to add a folder served via the in-process WebDAV
         // FileSystemProvider to the current workspace. Uses the
         // orbit-webdav:// scheme registered above; no host-OS WebDAV
@@ -3632,17 +3932,37 @@ module.exports = function (vscode) {
                 if (!server) return;
                 const tabs = findOrbitTabs();
                 if (tabs.length < 2) return;
-                // Prefer the active tab; otherwise keep the last in
-                // iteration order (most recently created).
-                let keep = tabs.find(t => t.isActive);
-                if (!keep) keep = tabs[tabs.length - 1];
-                const drop = tabs.filter(t => t !== keep);
+                // Match ONLY by exact URI. Titles are irrelevant. A tab
+                // is closed only if another tab has the identical URI.
+                // Tabs whose URI can't be read are never deduped.
+                const uriOf = (t) => {
+                    try {
+                        if (t.input && t.input.uri) return t.input.uri.toString();
+                    } catch (_) {}
+                    return null;
+                };
+                try {
+                    orbitLog('[orbit] dedup candidates: ' + JSON.stringify(
+                        tabs.map(t => ({ label: t.label, uri: uriOf(t) }))));
+                } catch (_) {}
+                const groups = new Map();
+                for (const t of tabs) {
+                    const u = uriOf(t);
+                    if (!u) continue;
+                    if (!groups.has(u)) groups.set(u, []);
+                    groups.get(u).push(t);
+                }
+                const drop = [];
+                for (const gtabs of groups.values()) {
+                    if (gtabs.length < 2) continue;
+                    const keep = gtabs.find(t => t.isActive) || gtabs[gtabs.length - 1];
+                    for (const t of gtabs) if (t !== keep) drop.push(t);
+                }
                 if (!drop.length) return;
                 dedupRunning = true;
                 try {
                     orbitLog('[orbit] dedup: closing ' + drop.length +
-                        ' duplicate Orbit tab(s); keeping ' +
-                        JSON.stringify(keep.label));
+                        ' duplicate Orbit tab(s) by URI');
                     await vscode.window.tabGroups.close(drop, true);
                 } catch (e) {
                     orbitError('[orbit] dedup close failed:', e && e.message);
@@ -3705,7 +4025,7 @@ module.exports = function (vscode) {
                 // has a live MCP client connection (not stale
                 // vscode.lm.tools entries from a previous session).
                 const servers = orbitRunning
-                    ? await Promise.all(mcpServers.map(async (s) => {
+                    ? await Promise.all(mcpServerControls().map(async (s) => {
                         if (mcpRunning[s.name]) {
                             return { name: s.name, running: true };
                         }
@@ -3726,13 +4046,30 @@ module.exports = function (vscode) {
                     : [];
                 if (mySeq !== postStateSeq) return;
                 if (!currentWebviewView) return;
+                // Build the "local object memories" list: every *.image
+                // the page reported in IndexedDB, plus the primary
+                // "caffeine". running = has a live tether.
+                const live = new Set(liveObjectMemories());
+                // Once a memory's tether is live, drop its boot-grace
+                // hint so it reverts to "stopped" as soon as that
+                // tether goes away.
+                for (const name of live) startedObjectMemories.delete(name);
+                const memNames = new Set(reportedObjectMemories);
+                memNames.add('caffeine');
+                const objectMemories = Array.from(memNames).sort().map((name) => ({
+                    name,
+                    primary: name === 'caffeine',
+                    running: objectMemoryRunning(name, live)
+                }));
                 const payload = {
                     type: 'state',
                     orbitRunning,
                     webdavEnabled: webdavMountEnabled(),
                     singleRoot: isSingleRootWorkspace(),
                     keepSyncEnabled: vscode.workspace.getConfiguration('orbit.keepSync').get('enabled', true),
-                    servers
+                    caffeineMirrorEnabled: vscode.workspace.getConfiguration('orbit').get('caffeineMirror', false),
+                    servers,
+                    objectMemories
                 };
                 try { currentWebviewView.webview.postMessage(payload); } catch (_) {}
             }
@@ -3826,7 +4163,10 @@ module.exports = function (vscode) {
 </head>
 <body>
   <div class="summary">Orbit pair-programs Smalltalk with you.</div>
-  <hr>
+  <hr id="hr-mcp">
+  <div id="mcp-section-label" class="section-label">MCP servers</div>
+  <div id="servers"></div>
+  <hr id="hr-webdav">
   <div id="webdav-section-label" class="section-label">virtual filesystems</div>
   <div id="webdav-row" class="server">
     <input type="checkbox" id="webdav-toggle">
@@ -3836,19 +4176,13 @@ module.exports = function (vscode) {
     Save this folder as a workspace file (<em>File → Save Workspace As…</em>) to enable Smalltalk folder mounting.
   </div>
   <hr id="hr-memory">
-  <div id="memory-section-label" class="section-label">memory</div>
+  <div id="memory-section-label" class="section-label">agentic memory</div>
   <div id="memory-view-row" class="server">
     <button id="keep-view-btn" class="view-btn">view</button>
   </div>
   <div id="memory-row" class="server">
     <input type="checkbox" id="memory-toggle">
     <label for="memory-toggle" class="name">share memory with other Orbits</label>
-  </div>
-  <hr id="hr-twin">
-  <div id="twin-section-label" class="section-label">digital twin</div>
-  <div id="twin-view-row" class="server">
-    <button id="twin-open-btn" class="view-btn">open</button>
-    <span class="name">Lam 2300 cluster tool</span>
   </div>
   <hr id="hr-eval">
   <div id="eval-section-label" class="section-label">evaluations</div>
@@ -3862,9 +4196,21 @@ module.exports = function (vscode) {
     <button id="presentation-start-btn" class="view-btn">start</button>
     <span class="name">Orbit presentation</span>
   </div>
-  <hr id="hr-top">
-  <div id="mcp-section-label" class="section-label">remote systems</div>
-  <div id="servers"></div>
+  <hr id="hr-mirror">
+  <div id="mirror-section-label" class="section-label">Caffeine mirroring</div>
+  <div id="mirror-row" class="server">
+    <input type="checkbox" id="mirror-toggle">
+    <label for="mirror-toggle" class="name">mirror Caffeine windows</label>
+  </div>
+  <hr id="hr-memories">
+  <div id="memories-section-label" class="section-label">local object memories</div>
+  <div id="memories-list"></div>
+  <hr id="hr-twin">
+  <div id="twin-section-label" class="section-label">digital twin</div>
+  <div id="twin-view-row" class="server">
+    <button id="twin-open-btn" class="view-btn">open</button>
+    <span class="name">Lam 2300 cluster tool</span>
+  </div>
   <hr id="hr-bottom">
   <button id="orbit-toggle" class="footer-button">Start Orbit</button>
 
@@ -3874,6 +4220,8 @@ module.exports = function (vscode) {
   const toggleBtn = document.getElementById('orbit-toggle');
   const webdavCb = document.getElementById('webdav-toggle');
   const memoryCb = document.getElementById('memory-toggle');
+  const mirrorCb = document.getElementById('mirror-toggle');
+  const memoriesEl = document.getElementById('memories-list');
 
   toggleBtn.addEventListener('click', () => {
     vscode.postMessage({ type: 'toggleOrbit' });
@@ -3885,6 +4233,10 @@ module.exports = function (vscode) {
 
   memoryCb.addEventListener('change', () => {
     vscode.postMessage({ type: 'toggleKeepSync', desired: memoryCb.checked });
+  });
+
+  mirrorCb.addEventListener('change', () => {
+    vscode.postMessage({ type: 'toggleCaffeineMirror', desired: mirrorCb.checked });
   });
 
   document.getElementById('keep-view-btn').addEventListener('click', () => {
@@ -3905,9 +4257,13 @@ module.exports = function (vscode) {
 
   function render(state) {
     toggleBtn.textContent = state.orbitRunning ? 'Stop Orbit' : 'Start Orbit';
+    const hasServers = state.orbitRunning && state.servers && state.servers.length > 0;
+    document.getElementById('hr-mcp').style.display = hasServers ? '' : 'none';
+    document.getElementById('mcp-section-label').style.display = hasServers ? '' : 'none';
     webdavCb.checked = !!state.webdavEnabled && !state.singleRoot;
     webdavCb.disabled = !!state.singleRoot;
     const showWebdav = !!state.orbitRunning;
+    document.getElementById('hr-webdav').style.display = showWebdav ? '' : 'none';
     document.getElementById('webdav-section-label').style.display = showWebdav ? '' : 'none';
     document.getElementById('webdav-row').style.display = showWebdav ? '' : 'none';
     const noteEl = document.getElementById('webdav-note');
@@ -3918,11 +4274,6 @@ module.exports = function (vscode) {
     document.getElementById('memory-row').style.display = showMemory ? '' : 'none';
     document.getElementById('memory-view-row').style.display = showMemory ? '' : 'none';
     memoryCb.checked = !!state.keepSyncEnabled;
-    // Digital twin section hidden until release.
-    const showTwin = false;
-    document.getElementById('hr-twin').style.display = showTwin ? '' : 'none';
-    document.getElementById('twin-section-label').style.display = showTwin ? '' : 'none';
-    document.getElementById('twin-view-row').style.display = showTwin ? '' : 'none';
     const showEval = !!state.orbitRunning;
     document.getElementById('hr-eval').style.display = showEval ? '' : 'none';
     document.getElementById('eval-section-label').style.display = showEval ? '' : 'none';
@@ -3931,9 +4282,49 @@ module.exports = function (vscode) {
     document.getElementById('hr-presentation').style.display = showPresentation ? '' : 'none';
     document.getElementById('presentation-section-label').style.display = showPresentation ? '' : 'none';
     document.getElementById('presentation-view-row').style.display = showPresentation ? '' : 'none';
-    const hasServers = state.orbitRunning && state.servers && state.servers.length > 0;
-    document.getElementById('hr-top').style.display = hasServers ? '' : 'none';
-    document.getElementById('mcp-section-label').style.display = hasServers ? '' : 'none';
+    const showMirror = !!state.orbitRunning;
+    document.getElementById('hr-mirror').style.display = showMirror ? '' : 'none';
+    document.getElementById('mirror-section-label').style.display = showMirror ? '' : 'none';
+    document.getElementById('mirror-row').style.display = showMirror ? '' : 'none';
+    mirrorCb.checked = !!state.caffeineMirrorEnabled;
+    // Local object memories section.
+    const memories = state.objectMemories || [];
+    const showMemories = !!state.orbitRunning && memories.length > 0;
+    document.getElementById('hr-memories').style.display = showMemories ? '' : 'none';
+    document.getElementById('memories-section-label').style.display = showMemories ? '' : 'none';
+    memoriesEl.style.display = showMemories ? '' : 'none';
+    memoriesEl.innerHTML = '';
+    for (const m of memories) {
+      const row = document.createElement('div');
+      row.className = 'server';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = !!m.running;
+      cb.id = 'mem-' + m.name;
+      cb.addEventListener('change', () => {
+        vscode.postMessage({
+          type: 'toggleObjectMemory',
+          name: m.name,
+          desired: cb.checked
+        });
+      });
+      const label = document.createElement('label');
+      label.className = 'name';
+      label.htmlFor = cb.id;
+      label.textContent = m.name;
+      const status = document.createElement('span');
+      status.className = 'status';
+      status.textContent = m.running ? 'running' : 'stopped';
+      row.appendChild(cb);
+      row.appendChild(label);
+      row.appendChild(status);
+      memoriesEl.appendChild(row);
+    }
+    // Digital twin section hidden until release.
+    const showTwin = false;
+    document.getElementById('hr-twin').style.display = showTwin ? '' : 'none';
+    document.getElementById('twin-section-label').style.display = showTwin ? '' : 'none';
+    document.getElementById('twin-view-row').style.display = showTwin ? '' : 'none';
     document.getElementById('hr-bottom').style.display = state.orbitRunning ? '' : 'none';
     serversEl.innerHTML = '';
     for (const s of state.servers) {
@@ -4002,7 +4393,7 @@ module.exports = function (vscode) {
                             return;
                         }
                         if (msg.type === 'toggleServer') {
-                            const srv = mcpServers.find(s => s.name === msg.name);
+                            const srv = mcpServerControlIfKnown(msg.name);
                             if (!srv) { postState(); return; }
                             const desired = !!msg.desired;
                             if (!!srv.getRunning() === desired) { postState(); return; }
@@ -4091,6 +4482,53 @@ module.exports = function (vscode) {
                             postState();
                             return;
                         }
+                        if (msg.type === 'toggleCaffeineMirror') {
+                            const desired = !!msg.desired;
+                            try {
+                                await vscode.workspace
+                                    .getConfiguration('orbit')
+                                    .update(
+                                        'caffeineMirror',
+                                        desired,
+                                        vscode.ConfigurationTarget.Global
+                                    );
+                            } catch (e) {
+                                orbitError('[orbit] caffeineMirror update failed:', e && e.message);
+                                postState();
+                                return;
+                            }
+                            try {
+                                const bridge = currentApp && currentApp.mcpBridge;
+                                if (bridge && bridge.setCaffeineMirror) {
+                                    await bridge.setCaffeineMirror(desired);
+                                } else {
+                                    orbitLog('[orbit] no Caffeine bridge; mirror toggle recorded, will apply on next connect');
+                                }
+                            } catch (e) {
+                                orbitError('[orbit] setCaffeineMirror apply failed:', e && e.message);
+                            }
+                            postState();
+                            return;
+                        }
+                        if (msg.type === 'toggleObjectMemory') {
+                            const name = String(msg.name || '').trim();
+                            const desired = !!msg.desired;
+                            if (!name) { postState(); return; }
+                            try {
+                                if (name === 'caffeine') {
+                                    if (desired) await showOrbitBrowser(orbitUrl(ORBIT_WEB_PORT));
+                                    else await closeObjectMemoryTab(name);
+                                } else if (desired) {
+                                    await openObjectMemoryTab(name);
+                                } else {
+                                    await closeObjectMemoryTab(name);
+                                }
+                            } catch (e) {
+                                orbitError('[orbit] toggleObjectMemory failed:', e && e.message);
+                            }
+                            postState();
+                            return;
+                        }
                         if (msg.type === 'openKeepViewer') {
                             openKeepViewerOnStartup().catch(e =>
                                 orbitLog(`[keep-viewer] Panel open failed: ${e && e.message}`));
@@ -4130,7 +4568,7 @@ module.exports = function (vscode) {
             mcpStateSubscribers.add(mcpRefresher);
 
             const cfgSub = vscode.workspace.onDidChangeConfiguration((e) => {
-                if (e.affectsConfiguration('orbit.mountWebdav') || e.affectsConfiguration('orbit.keepSync.enabled')) postState();
+                if (e.affectsConfiguration('orbit.mountWebdav') || e.affectsConfiguration('orbit.keepSync.enabled') || e.affectsConfiguration('orbit.caffeineMirror')) postState();
             });
 
             const viewReg = vscode.window.registerWebviewViewProvider(
@@ -4485,18 +4923,7 @@ module.exports = function (vscode) {
         // changes; the file is read each time the participant is
         // created (i.e. whenever the server transitions to running),
         // so a stop/start of the MCP server is enough to re-read.
-        const PER_SERVER_PARTICIPANTS = [
-            {
-                serverName: '2300-backend',
-                participantId: 'orbit.orbit-2300-backend',
-                instructionsFile: 'agents/orbit-2300-backend.agent.md'
-            },
-            {
-                serverName: '2300-ui',
-                participantId: 'orbit.orbit-2300-ui',
-                instructionsFile: 'agents/orbit-2300-ui.agent.md'
-            }
-        ];
+        const PER_SERVER_PARTICIPANTS = [];
         const liveServerParticipants = new Map(); // serverName -> Disposable
 
         function loadServerInstructions(spec) {
@@ -4542,7 +4969,7 @@ module.exports = function (vscode) {
 
         function syncServerParticipants() {
             for (const spec of PER_SERVER_PARTICIPANTS) {
-                const srv = mcpServers.find(s => s.name === spec.serverName);
+                const srv = mcpServerControlIfKnown(spec.serverName);
                 const shouldBeLive = !!server && !!srv && !!srv.getRunning();
                 const isLive = liveServerParticipants.has(spec.serverName);
                 if (shouldBeLive && !isLive) createServerParticipant(spec);

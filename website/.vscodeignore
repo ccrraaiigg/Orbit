@@ -2,6 +2,7 @@
 .vscode-test/**
 .git/**
 secrets/**
+public/uploads/**
 *.code-workspace
 README.txt
 CHANGELOG

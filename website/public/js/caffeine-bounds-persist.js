@@ -1,9 +1,19 @@
 // Persist the Caffeine window (#embeddedSqueak) bounds across page reloads.
 // Saves top, left, width, height to /caffeine-bounds.json via PUT on change.
 // Restores them from the same file (served statically) on load.
+//
+// Bounds are persisted independently for each SqueakJS window: the window is
+// identified by the ?image= query parameter (default "caffeine"), which is
+// passed through to the server so each image remembers its own bounds.
 
 (function() {
-  var BOUNDS_URL = '/caffeine-bounds.json';
+  function imageKey() {
+    try {
+      return new URLSearchParams(location.search).get('image') || 'caffeine';
+    } catch (_) { return 'caffeine'; }
+  }
+
+  var BOUNDS_URL = '/caffeine-bounds.json?image=' + encodeURIComponent(imageKey());
   var saveTimer = null;
 
   function readBounds(el) {

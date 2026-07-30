@@ -699,18 +699,21 @@ class IconManager extends HTMLElement {
 
   get tether() { return this._tether || null; }
 
+  async _loadTetherClass() {
+    if (window.VWBrowserTether) return;
+    await new Promise(function(resolve, reject) {
+      var s = document.createElement('script');
+      s.src = '/js/components/system-browser/vw-browser-tether.js';
+      s.onload = resolve;
+      s.onerror = reject;
+      document.head.appendChild(s);
+    });
+  }
+
   async _connectTether() {
     if (this._tether) return;
     try {
-      if (!window.VWBrowserTether) {
-        await new Promise(function(resolve, reject) {
-          var s = document.createElement('script');
-          s.src = '/js/components/system-browser/vw-browser-tether.js';
-          s.onload = resolve;
-          s.onerror = reject;
-          document.head.appendChild(s);
-        });
-      }
+      await this._loadTetherClass();
       this._tether = new VWBrowserTether();
       await this._tether.connectRaw();
       console.log('[icon-manager] tether connected');
@@ -720,6 +723,37 @@ class IconManager extends HTMLElement {
     }
   }
 
+  // Window keys collide between images, so the owning connection is identified by
+  // the data-tether-url Snowglobe stamps on each window element.
+  _tetherForUrl(url) {
+    if (!this._tethers) this._tethers = new Map();
+    var existing = this._tethers.get(url);
+    if (existing) return existing;
+    var self = this;
+    var promise = this._loadTetherClass()
+      .then(function() {
+        var t = new VWBrowserTether({ url: url });
+        return t.connectRaw().then(function() {
+          console.log('[icon-manager] tether connected:', url);
+          return t;
+        });
+      })
+      .catch(function(e) {
+        self._tethers.delete(url);
+        console.warn('[icon-manager] tether connection failed for', url, e.message);
+        return null;
+      });
+    this._tethers.set(url, promise);
+    return promise;
+  }
+
+  _tetherForCanvas(canvas) {
+    var host = canvas.closest('morphic-window, transient-window');
+    var url = host && host.getAttribute('data-tether-url');
+    if (!url) return Promise.resolve(this._tether);
+    return this._tetherForUrl(url);
+  }
+
   // ---- Clipboard bridge (Ctrl+C/V ↔ VW paste buffer) ----
   //
   // Wraps canvas.onkeydown on each Snowglobe canvas so that on Ctrl+V
@@ -727,6 +761,10 @@ class IconManager extends HTMLElement {
   // buffer via the tether, then call the original Squeak handler.
   // On Ctrl+C/X we let Squeak handle it first, then pull VW's paste
   // buffer out and POST it to /clipboard.
+  //
+  // The page mirrors windows from several VW images at once, each with its own
+  // tether and its own paste buffer, so every transfer is routed to the tether
+  // belonging to the window that has focus.
 
   _installClipboardBridge() {
     this._clipboardBridgeBypass = true; // disable any stale listeners from prior versions
@@ -748,17 +786,18 @@ class IconManager extends HTMLElement {
     this._clipboardObserver.observe(document.body, { childList: true, subtree: true });
 
     // Wrap all existing Snowglobe canvases.
-    document.querySelectorAll('morphic-window:not(#embeddedSqueak) canvas').forEach(function(c) {
+    document.querySelectorAll('morphic-window:not(#embeddedSqueak) canvas, transient-window canvas').forEach(function(c) {
       self._wrapCanvasClipboard(c);
     });
   }
 
   _wrapCanvasClipboard(canvas) {
     if (canvas._clipboardWrapped) return;
-    canvas._clipboardWrapped = true;
-    var self = this;
-    var originalHandler = canvas.onkeydown;
+    var originalHandler = canvas._clipboardOriginalHandler || canvas.onkeydown;
     if (!originalHandler) return;
+    canvas._clipboardWrapped = true;
+    canvas._clipboardOriginalHandler = originalHandler;
+    var self = this;
 
     canvas.onkeydown = function(e) {
       if (!(e.ctrlKey || e.metaKey) || (e.key !== 'v' && e.key !== 'c' && e.key !== 'x')) {
@@ -767,38 +806,44 @@ class IconManager extends HTMLElement {
       if (e._clipboardSynced) {
         return originalHandler.call(this, e);
       }
-      var tether = self._tether;
-      if (!tether) {
-        return originalHandler.call(this, e);
-      }
+      var canvasEl = this;
+      var forward = function() {
+        e._clipboardSynced = true;
+        originalHandler.call(canvasEl, e);
+      };
 
       if (e.key === 'v') {
-        // Paste: fetch macOS clipboard → set VW paste buffer → invoke Squeak handler
-        var canvasEl = this;
-        fetch('/clipboard')
-          .then(function(r) { return r.json(); })
-          .then(function(data) {
-            var text = data && data.text;
-            if (!text) { e._clipboardSynced = true; originalHandler.call(canvasEl, e); return; }
-            return tether.sendToTether('setClipboard:', [text]).then(function() {
-              e._clipboardSynced = true;
-              originalHandler.call(canvasEl, e);
-            });
+        // Paste: macOS clipboard → the owning image's paste buffer → Squeak handler
+        Promise.all([
+          fetch('/clipboard').then(function(r) { return r.json(); }),
+          self._tetherForCanvas(canvasEl)
+        ])
+          .then(function(results) {
+            var text = results[0] && results[0].text;
+            var tether = results[1];
+            if (!text || !tether) { forward(); return; }
+            return tether.sendToTether('setClipboard:', [text]).then(forward);
           })
-          .catch(function() { e._clipboardSynced = true; originalHandler.call(canvasEl, e); });
+          .catch(forward);
       } else {
-        // Copy/Cut: let Squeak handle first, then pull VW paste buffer → macOS
+        // Copy/Cut: let Squeak handle first, then pull the paste buffer → macOS
         originalHandler.call(this, e);
         setTimeout(function() {
-          tether.sendToTether('getClipboard', []).then(function(result) {
-            var text = result && result.text;
-            if (!text) return;
-            fetch('/clipboard', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ text: text })
-            });
-          }).catch(function() {});
+          self._tetherForCanvas(canvasEl)
+            .then(function(tether) {
+              if (!tether) return null;
+              return tether.sendToTether('getClipboard', []);
+            })
+            .then(function(result) {
+              var text = result && result.text;
+              if (!text) return;
+              fetch('/clipboard', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: text })
+              });
+            })
+            .catch(function() {});
         }, 100);
       }
     };

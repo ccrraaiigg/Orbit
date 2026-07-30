@@ -358,6 +358,21 @@ Workaround used in `SnowglobeMorphicService>>sendFrame:`:
 ```
 Send `u8.buffer` (ArrayBuffer) so the WebSocket emits a binary frame.
 
+### The CONSUMER input path had the same latent bug (fixed 2026-07-24)
+`WebEntrance>>send` (the consumer's `connection`, a `Portal` subclass used
+for `HandleMouseEvent`/`HandleKeyboardEvent`/`RequestResizeWindow`) was
+`connection send: self outgoingPayload` — the ByteArray → Latin-1 string →
+**TEXT** frame, so bytes ≥ 0x80 in multi-byte wire integers got UTF-8
+expanded (`0xD6` → `0xC3 0x96`). Fingerprint: values < 128 pass (low mouse
+coords, small window sizes work), values ≥ 128 corrupt. This is exactly why
+mirror-window **resize** (opcode 20, sends width/height ints) resized the
+mirror but not the original — width often < 128 survived, height ≥ 128
+became garbage (e.g. target 470 → 38595). Fix: `WebEntrance>>send` now
+converts the payload to a `Uint8Array` via a lazily-installed JS helper
+`window.__sgInputToU8` (charCodeAt loop, no channel swap) before
+`connection send:`. Same idiom as the producer's `sendFrame:`. LIVE-ONLY in
+the image until snapshot+rebuild.
+
 ## Snowglobe class chain (no Portal `connection` getter)
 `Snowglobe → RemoteMessagingService → Object`. `RemoteMessagingService`
 defines only `connection:` (setter). Access the underlying JSWebSocket via

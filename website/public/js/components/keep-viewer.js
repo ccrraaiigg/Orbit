@@ -26,6 +26,7 @@ class KeepViewer extends HTMLElement {
     this._sortAsc = true;
     this._graphNodes = [];
     this._collapsedGroups = new Set();
+    this._tableCollapsedGroups = new Set();
     this._graphLayout = 'force';
     this._render();
   }
@@ -148,6 +149,7 @@ class KeepViewer extends HTMLElement {
     this._edges = data.edges || [];
     this._edgeTags = data.edgeTags || [];
     if (!this._collapsedGroups) this._collapsedGroups = new Set();
+    if (!this._tableCollapsedGroups) this._tableCollapsedGroups = new Set();
     if (!this._graphLayout) this._graphLayout = 'force';
     this._setupHost();
     this._buildGraph();
@@ -291,6 +293,22 @@ class KeepViewer extends HTMLElement {
         } else {
           self._sortKey = key;
           self._sortAsc = true;
+        }
+        self._render();
+      });
+    });
+    // Table group triangle — toggle open/closed. Handle before the row
+    // click so it doesn't also open the note detail.
+    this.shadowRoot.querySelectorAll('.group-badge[data-gid]').forEach(function(badge) {
+      badge.style.cursor = 'pointer';
+      badge.addEventListener('pointerdown', function(e) { e.stopPropagation(); });
+      badge.addEventListener('click', function(e) {
+        e.stopPropagation();
+        var gid = badge.dataset.gid;
+        if (self._tableCollapsedGroups.has(gid)) {
+          self._tableCollapsedGroups.delete(gid);
+        } else {
+          self._tableCollapsedGroups.add(gid);
         }
         self._render();
       });
@@ -493,13 +511,18 @@ class KeepViewer extends HTMLElement {
       return this._sortAsc ? ' ▲' : ' ▼';
     };
     var childToGroup = this._childToGroup || {};
-    var rows = notes.map(function(n) {
+    var collapsed = this._tableCollapsedGroups;
+    var rows = notes.filter(function(n) {
+      var parent = childToGroup[n.id];
+      return !(parent && collapsed.has(parent));
+    }).map(function(n) {
       var topic = n.tags && n.tags.topic || '';
       var type = n.tags && n.tags.type || '';
       var created = (n.createdAt || '').slice(0, 16).replace('T', ' ');
       var isChild = !!childToGroup[n.id];
       var indent = isChild ? 'padding-left:18px;' : '';
-      var groupBadge = type === 'group' ? '<span class="group-badge">▶</span> ' : '';
+      var isCollapsed = collapsed.has(n.id);
+      var groupBadge = type === 'group' ? '<span class="group-badge" data-gid="' + KeepViewer._esc(n.id) + '">' + (isCollapsed ? '▶' : '▼') + '</span> ' : '';
       return `<tr class="${isChild ? 'child-row' : ''}${type === 'group' ? ' group-row' : ''}" data-note-id="${KeepViewer._esc(n.id)}">
         <td class="id" style="${indent}">${groupBadge}${KeepViewer._esc(n.id)}</td>
         <td class="agent">${KeepViewer._esc(n.agent || (n.tags && n.tags.agent) || '')}</td>

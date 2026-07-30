@@ -22,6 +22,21 @@ app.use(logger('dev'));
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use(cookieParser());
+
+// Per-image Caffeine window bounds: the read route must intercept before
+// express.static, which would otherwise serve the legacy caffeine-bounds.json
+// file for every image regardless of the ?image= query parameter. (The PUT
+// route and the helpers it shares are defined further below.)
+app.get('/caffeine-bounds.json', (req, res) => {
+  const file = boundsFileFor(req.query.image);
+  try {
+    if (!fsmod.existsSync(file)) return res.status(404).end();
+    res.type('application/json').send(fsmod.readFileSync(file, 'utf8'));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.use('/', indexRouter);
@@ -77,12 +92,17 @@ function allowBridgeAccess(req, res) {
 // Served to the Orbit webapp on startup. The page reads
 // window.__ORBIT_BRIDGE_BEARER__ from this script and attaches it
 // as `Authorization: Bearer …` to /clipboard and /workspace-fs/*
-// requests. Mounted before the 404 catchall.
+// requests. It also publishes the webserver's port, which the page
+// records in IndexedDB for the booting object memory. Mounted before
+// the 404 catchall.
 app.get('/orbit-bridge-config.js', (req, res) => {
+    const port = (req.socket && req.socket.localPort) || null;
     res.type('application/javascript')
        .set('Cache-Control', 'no-store')
        .send('window.__ORBIT_BRIDGE_BEARER__ = '
-           + JSON.stringify(pageBearer) + ';\n');
+           + JSON.stringify(pageBearer) + ';\n'
+           + 'window.__ORBIT_PORT__ = '
+           + JSON.stringify(port) + ';\n');
 });
 
 // Exported so the extension (and tests) can read these without
@@ -337,9 +357,27 @@ app.attachSnowglobeServer = function (server) {
 app.snowglobeServer = snowglobeServer;
 
 // Caffeine window bounds persistence: the page PUTs its bounds here
-// so they survive a reload. Served back by express.static as a plain
-// JSON file at /caffeine-bounds.json.
-const BOUNDS_FILE = path.join(__dirname, 'public', 'caffeine-bounds.json');
+// so they survive a reload. Persisted per SqueakJS image (identified by
+// the ?image= query parameter) so each window remembers its own
+// position/extent independently. The default "caffeine" image keeps
+// using the legacy public/caffeine-bounds.json file; other images are
+// stored under public/caffeine-bounds/<image>.json. Read back via the
+// GET route registered before express.static (see above).
+const BOUNDS_DIR = path.join(__dirname, 'public', 'caffeine-bounds');
+const LEGACY_BOUNDS_FILE = path.join(__dirname, 'public', 'caffeine-bounds.json');
+
+function sanitizeImageKey(name) {
+  if (typeof name !== 'string' || !name) return 'caffeine';
+  const cleaned = name.replace(/[^A-Za-z0-9._-]/g, '_');
+  return cleaned || 'caffeine';
+}
+
+function boundsFileFor(imageName) {
+  const key = sanitizeImageKey(imageName);
+  if (key === 'caffeine') return LEGACY_BOUNDS_FILE;
+  return path.join(BOUNDS_DIR, key + '.json');
+}
+
 app.put('/caffeine-bounds.json', (req, res) => {
   const b = req.body;
   if (!b || typeof b !== 'object') {
@@ -351,7 +389,9 @@ app.put('/caffeine-bounds.json', (req, res) => {
     if (typeof b[k] === 'string') clean[k] = b[k];
   }
   try {
-    fsmod.writeFileSync(BOUNDS_FILE, JSON.stringify(clean, null, 2) + '\n');
+    const file = boundsFileFor(req.query.image);
+    if (file !== LEGACY_BOUNDS_FILE) fsmod.mkdirSync(BOUNDS_DIR, { recursive: true });
+    fsmod.writeFileSync(file, JSON.stringify(clean, null, 2) + '\n');
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -427,6 +467,45 @@ app.put('/presentation/deck.html', (req, res) => {
   req.on('error', (err) => {
     res.status(500).json({ error: err.message });
   });
+});
+
+// Caffeine WebDAV bridge: the SqueakJS page hosts a WebDAVServer but, being a
+// browser page, has no listening HTTP WebDAV port. We accept WebDAV HTTP here
+// (same origin as the page) and forward each request to the page's
+// WebDAVServer over the CaffeineBridge tether, mirroring the MCP forwarding.
+app.use('/webdav', (req, res) => {
+  if (!allowBridgeAccess(req, res)) return;
+  const bridge = app.mcpBridge;
+  if (!bridge || typeof bridge.forwardWebdav !== 'function'
+      || !bridge.pageTether || !bridge.pageTether()) {
+    return res.status(503).json({ error: 'Caffeine page tether not connected' });
+  }
+  const chunks = [];
+  req.on('data', (chunk) => chunks.push(chunk));
+  req.on('end', async () => {
+    const content = Buffer.concat(chunks).toString('utf8');
+    const headers = {};
+    for (const [k, v] of Object.entries(req.headers || {})) {
+      headers[k.toLowerCase()] = Array.isArray(v) ? v.join(',') : String(v);
+    }
+    try {
+      const answer = await bridge.forwardWebdav({
+        method: req.method, path: req.originalUrl, headers, content
+      });
+      res.status((answer && answer.status) || 500);
+      for (const pair of ((answer && answer.headers) || [])) {
+        if (Array.isArray(pair) && pair.length === 2 && pair[0]) {
+          const k = String(pair[0]);
+          if (k.toLowerCase() === 'content-length') continue;
+          try { res.setHeader(k, String(pair[1])); } catch (_) {}
+        }
+      }
+      res.send((answer && answer.body != null) ? answer.body : '');
+    } catch (err) {
+      res.status(502).json({ error: (err && err.message) || String(err) });
+    }
+  });
+  req.on('error', () => { try { res.status(400).end(); } catch (_) {} });
 });
 
 // Mount point for routes registered later by the Orbit extension
