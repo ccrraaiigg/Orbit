@@ -344,7 +344,12 @@ class CaffeineBridge {
     _handleControlMessage(ws, tether, msg) {
         if (msg.mcp && msg.mcp.providing) {
             const imageEndpoint = msg.mcp.endpoint;
-            const memory = msg.mcp.memory || null;
+            // Fall back to the extension-supplied tether label
+            // (labelNextTether) when the announce frame carries no
+            // `memory` field, so a secondary memory's servers still
+            // get the suffixed name.
+            const memory = msg.mcp.memory
+                || this.tetherMemory.get(tether) || null;
             if (memory) this.tetherMemory.set(tether, memory);
             let name = msg.mcp.name || 'Caffeine';
 

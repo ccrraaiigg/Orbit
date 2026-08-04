@@ -336,6 +336,9 @@ module.exports = function (vscode) {
         if (!bridge) throw new Error('no Caffeine bridge available');
         await bridge.snapshot();
         orbitLog('[orbit] Caffeine snapshot requested');
+        // The image state is durable now; fold the disk mirror to match.
+        checkpointKeepMirror().catch((e) => orbitLog(
+            `[keep-mirror] checkpoint after snapshot failed: ${e && e.message}`));
         return true;
     }
 
@@ -362,7 +365,13 @@ module.exports = function (vscode) {
     const KEEP_OPS_REL   = path.join(KEEP_DIR_REL, 'ops.jsonl');
     const KEEP_NOTES_REL = path.join(KEEP_DIR_REL, 'notes');
     const KEEP_EDGES_REL = path.join(KEEP_DIR_REL, 'edge-tags.json');
-    let keepOpSeq = null; // lazily initialized from existing line count
+    const KEEP_SNAP_REL  = path.join(KEEP_DIR_REL, 'snapshot.json');
+    const KEEP_OPS_ARCHIVE_REL = path.join(KEEP_DIR_REL, 'ops-archive');
+    let keepOpSeq = null; // lazily initialized: snapshot base + line count
+    // While true, mutations flowing through the bridge are NOT mirrored
+    // — set when the extension itself re-issues ops that are already on
+    // disk (startup reconciliation), to avoid duplicating them.
+    let keepMirrorSuppress = false;
 
     function keepPathFor(rel) {
         const root = localWorkspaceFsPath();
@@ -378,20 +387,40 @@ module.exports = function (vscode) {
             .slice(0, 200) || 'unnamed';
     }
 
-    // Next monotonic op sequence number, initialized once from the
-    // existing ops.jsonl line count so numbering is stable across
-    // extension restarts.
-    function nextKeepSeq(opsFile) {
+    // Current monotonic op sequence number, initialized once from the
+    // checkpoint snapshot's covered seq plus the existing ops.jsonl line
+    // count, so numbering is stable across extension restarts and
+    // continues across op-log rotations.
+    function ensureKeepSeq(opsFile) {
         if (keepOpSeq == null) {
+            let base = 0;
+            try {
+                const snap = JSON.parse(
+                    fs.readFileSync(keepPathFor(KEEP_SNAP_REL), 'utf8'));
+                if (snap && Number.isFinite(snap.seq)) base = snap.seq;
+            } catch (_) { base = 0; }
             let count = 0;
             try {
                 const text = fs.readFileSync(opsFile, 'utf8');
                 count = text.split('\n').filter((l) => l.trim() !== '').length;
             } catch (_) { count = 0; }
-            keepOpSeq = count;
+            keepOpSeq = base + count;
         }
+        return keepOpSeq;
+    }
+
+    function nextKeepSeq(opsFile) {
+        ensureKeepSeq(opsFile);
         keepOpSeq += 1;
         return keepOpSeq;
+    }
+
+    // Extract the full note from a Keep tool's decoded result: keepTag
+    // answers {note: {...}}; keepPut and keepNow answer the bare note.
+    function keepNoteFromResult(res) {
+        if (!res || typeof res !== 'object') return null;
+        if (res.note && typeof res.note === 'object') return res.note;
+        return (res.id != null && 'content' in res) ? res : null;
     }
 
     // Render a note's Markdown projection: JSON-encoded scalars in the
@@ -449,12 +478,13 @@ module.exports = function (vscode) {
     // record for the mutation, then update the Markdown/edge-tag
     // projection. Best-effort — never allowed to break an MCP call.
     function mirrorKeepMutation(params, result) {
+        if (keepMirrorSuppress) return;
         const opsFile = keepPathFor(KEEP_OPS_REL);
         if (!opsFile) return;
         const name = params && params.name;
         const args = (params && params.arguments) || {};
         const res  = (result && typeof result === 'object') ? result : {};
-        const note = res.note && typeof res.note === 'object' ? res.note : null;
+        const note = keepNoteFromResult(res);
         const id = (note && note.id) != null ? note.id
             : (res.id != null ? res.id : args.id);
 
@@ -553,8 +583,11 @@ module.exports = function (vscode) {
             CLEAR_EVAL_COMMAND, clearEvaluateMarkersCommand);
         const snapshotCmd = vscode.commands.registerCommand(
             CAFFEINE_SNAPSHOT_COMMAND, caffeineSnapshotCommand);
+        const keepCheckpointCmd = vscode.commands.registerCommand(
+            'orbit.keepCheckpoint', checkpointKeepMirror);
         if (context && context.subscriptions) {
-            context.subscriptions.push(appendCmd, clearCmd, snapshotCmd);
+            context.subscriptions.push(appendCmd, clearCmd, snapshotCmd,
+                keepCheckpointCmd);
         }
         orbitLog('[orbit] evaluate marker commands armed' + (file ? ' on ' + file : ''));
     }
@@ -578,6 +611,26 @@ module.exports = function (vscode) {
         return announced[0] || null;
     }
 
+    // The endpoint a bridge backend may claim as its own for MCP
+    // registration purposes. Discovered backends own their announced
+    // endpoint. The static "Caffeine" anchor owns its resolved endpoint
+    // only when the page announced it under the plain 'Caffeine' name —
+    // i.e. the primary object memory, or an older image announcing no
+    // name. A secondary object memory always announces a suffixed name
+    // (e.g. 'Caffeine-ableton', see caffeine-bridge.js), even when it
+    // owns the primary endpoint because the primary page isn't open;
+    // discoveredBridgeBackends() surfaces it under that name, and the
+    // anchor must not also claim it, or VS Code would list the same
+    // server mislabeled "Caffeine".
+    function ownedBridgeEndpointFor(backend) {
+        const ep = bridgeEndpointFor(backend);
+        if (!ep) return null;
+        if (backend && backend.endpoint) return ep;
+        const bridge = currentApp && currentApp.mcpBridge;
+        if (!bridge || typeof bridge.mcpServerNameFor !== 'function') return ep;
+        return bridge.mcpServerNameFor(ep) === 'Caffeine' ? ep : null;
+    }
+
     // Turn an endpoint path into a stable, prefix-safe backend name for
     // any non-primary MCP server the page announces, e.g.
     // '/mcp/inventory' -> 'Caffeine-inventory'.
@@ -590,7 +643,10 @@ module.exports = function (vscode) {
     // announced beyond the primary Caffeine server. Each announced
     // endpoint corresponds to an MCPServer subclass in the image; the
     // primary endpoint (/mcp/smalltalk) is represented by the static
-    // "Caffeine" backend, so it is skipped here. The rest become extra
+    // "Caffeine" backend, so it is skipped here — but only while it is
+    // announced under the plain 'Caffeine' name. When a secondary
+    // object memory owns it (announced as e.g. 'Caffeine-ableton'), it
+    // is surfaced here under that name instead. The rest become extra
     // bridge backends whose name comes from the serverInfo the image
     // supplied with its providing-frame (falling back to a name derived
     // from the endpoint path).
@@ -600,7 +656,8 @@ module.exports = function (vscode) {
         if (typeof bridge.discoveredEndpoints !== 'function') return [];
         const out = [];
         for (const { endpoint, name } of bridge.discoveredEndpoints()) {
-            if (endpoint === PRIMARY_BRIDGE_ENDPOINT) continue;
+            if (endpoint === PRIMARY_BRIDGE_ENDPOINT
+                && (!name || name === 'Caffeine')) continue;
             const serverName = name || bridgeBackendNameFromEndpoint(endpoint);
             out.push({
                 name: serverName,
@@ -633,14 +690,14 @@ module.exports = function (vscode) {
     // is no longer connected.
     function bridgeVscodeConnected(backend) {
         if (!currentApp || !currentApp.mcpBridge) return false;
-        const ep = bridgeEndpointFor(backend);
+        const ep = ownedBridgeEndpointFor(backend);
         if (!ep) return false;
         return currentApp.mcpBridge.lastInitializeAt.has(ep);
     }
 
     function mcpUrlFor(backend) {
         if (backend.kind === 'bridge') {
-            const ep = bridgeEndpointFor(backend);
+            const ep = ownedBridgeEndpointFor(backend);
             if (!ep) return null;
             // The Orbit webserver always runs on the same machine
             // as VS Code, so target localhost regardless of the
@@ -666,7 +723,7 @@ module.exports = function (vscode) {
             // reached over the CaffeineBridge tether, proxied same-origin at the
             // Orbit webserver's /webdav route (see app-impl.js). Only usable once
             // the page tether has announced itself.
-            return bridgeEndpointFor(backend)
+            return ownedBridgeEndpointFor(backend)
                 ? `http://localhost:${ORBIT_WEB_PORT}/webdav`
                 : null;
         }
@@ -720,8 +777,9 @@ module.exports = function (vscode) {
             let reachable;
             if (b.kind === 'bridge') {
                 // Caffeine now serves both MCP and WebDAV over the bridge tether, so it
-                // is reachable for either kind whenever the page tether has announced.
-                reachable = !!bridgeEndpointFor(b);
+                // is reachable for either kind whenever the page tether has announced
+                // an endpoint this backend owns (see ownedBridgeEndpointFor).
+                reachable = !!ownedBridgeEndpointFor(b);
             } else {
                 const port = kind === 'mcp' ? b.mcpPort : b.webdavPort;
                 const host = kind === 'mcp' ? mcpHost : backendHost;
@@ -3126,7 +3184,7 @@ module.exports = function (vscode) {
         const probes = await Promise.all(allBackends().map(async (b) => {
             let mcp;
             if (mcpRunning[b.name]) mcp = true;
-            else if (b.kind === 'bridge') mcp = !!bridgeEndpointFor(b);
+            else if (b.kind === 'bridge') mcp = !!ownedBridgeEndpointFor(b);
             else mcp = await probeTcp(mcpHost, b.mcpPort, 800);
             return { b, mcp };
         }));
@@ -3194,7 +3252,11 @@ module.exports = function (vscode) {
     // every backend is activated.
 
     // Open the Keep viewer on the Orbit page via the Caffeine MCP bridge.
-    async function openKeepViewerOnStartup() {
+    // By default (startup) passes restore:false so an existing collapsed
+    // window is refreshed without ever being un-hidden or raised; the
+    // panel's explicit "view" action passes { restore: true }.
+    async function openKeepViewerOnStartup(opts) {
+        const restore = !!(opts && opts.restore);
         const bridgeEp = bridgeEndpointFor(backendByName('Caffeine'));
         if (!bridgeEp) {
             orbitLog('[keep-viewer] Caffeine bridge not available; skipping');
@@ -3204,7 +3266,7 @@ module.exports = function (vscode) {
             jsonrpc: '2.0',
             id: Date.now(),
             method: 'tools/call',
-            params: { name: 'openKeepViewer', arguments: {} }
+            params: { name: 'openKeepViewer', arguments: { restore } }
         });
         try {
             await new Promise((resolve, reject) => {
@@ -3371,50 +3433,253 @@ module.exports = function (vscode) {
         }
     }
 
+    // POST a single tools/call to the Caffeine MCP bridge and return
+    // the decoded tool result (JSON parsed from the result's text
+    // content, or the raw text when it isn't JSON).
+    async function callCaffeineTool(name, toolArgs) {
+        const bridgeEp = bridgeEndpointFor(backendByName('Caffeine'));
+        if (!bridgeEp) throw new Error('Caffeine bridge not available');
+        const rpcBody = JSON.stringify({
+            jsonrpc: '2.0',
+            id: Date.now(),
+            method: 'tools/call',
+            params: { name, arguments: toolArgs || {} }
+        });
+        const raw = await new Promise((resolve, reject) => {
+            const r = require('http').request({
+                hostname: 'localhost',
+                port: ORBIT_WEB_PORT,
+                path: bridgeEp,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(rpcBody)
+                }
+            }, (resp) => {
+                let d = '';
+                resp.on('data', c => { d += c; });
+                resp.on('end', () => {
+                    if (resp.statusCode >= 200 && resp.statusCode < 300) resolve(d);
+                    else reject(new Error(`bridge ${resp.statusCode}: ${d.slice(0, 200)}`));
+                });
+            });
+            r.on('error', reject);
+            r.write(rpcBody);
+            r.end();
+        });
+        try {
+            const rpc = JSON.parse(raw);
+            const text = rpc && rpc.result && rpc.result.content
+                && rpc.result.content[0] && rpc.result.content[0].text;
+            if (typeof text !== 'string') return rpc && rpc.result;
+            try { return JSON.parse(text); } catch (_) { return text; }
+        } catch (_) { return raw; }
+    }
+
     // Replay Keep state from the Caffeine-managed IndexedDB audit log.
     // Called once on startup after the Caffeine MCP bridge is available.
     // The Caffeine image handles its own persistence via the keepReplayAudit
     // tool, which reads ops from the page's IndexedDB and replays them into
     // the in-memory KStore.
     async function replayAuditTrailIntoKeep() {
-        const bridgeEp = bridgeEndpointFor(backendByName('Caffeine'));
-        if (!bridgeEp) {
-            orbitLog('[keep-sync] Audit replay: Caffeine bridge not available');
-            return;
-        }
-        const rpcBody = JSON.stringify({
-            jsonrpc: '2.0',
-            id: Date.now(),
-            method: 'tools/call',
-            params: { name: 'keepReplayAudit', arguments: {} }
-        });
         try {
-            const result = await new Promise((resolve, reject) => {
-                const r = require('http').request({
-                    hostname: 'localhost',
-                    port: ORBIT_WEB_PORT,
-                    path: bridgeEp,
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Content-Length': Buffer.byteLength(rpcBody)
-                    }
-                }, (resp) => {
-                    let d = '';
-                    resp.on('data', c => { d += c; });
-                    resp.on('end', () => {
-                        if (resp.statusCode >= 200 && resp.statusCode < 300) resolve(d);
-                        else reject(new Error(`bridge ${resp.statusCode}: ${d.slice(0, 200)}`));
-                    });
-                });
-                r.on('error', reject);
-                r.write(rpcBody);
-                r.end();
-            });
-            orbitLog(`[keep-sync] Audit replay complete (Caffeine IndexedDB): ${result}`);
+            const result = await callCaffeineTool('keepReplayAudit', {});
+            orbitLog('[keep-sync] Audit replay complete (Caffeine IndexedDB): '
+                + JSON.stringify(result));
         } catch (e) {
             orbitLog(`[keep-sync] Audit replay failed: ${e.message}`);
         }
+    }
+
+    // --- Keep mirror lifecycle: replay, reconcile, checkpoint ---------
+    //
+    // The read side of the .orbit/keep/ mirror (see
+    // designs/keep-fs-persistence.md). Disk artifacts:
+    //   snapshot.json   full-store checkpoint {at, seq, edgeTags, notes}
+    //   ops.jsonl       mutations since the last checkpoint
+    //   ops-archive/    rotated pre-checkpoint op logs (history)
+    // Expected store state = snapshot notes + ops.jsonl applied in
+    // order. At startup (after the IndexedDB audit replay) the expected
+    // state is compared against the live KStore and missing/stale notes
+    // are re-put, so a git clone alone reconstructs the store.
+
+    function keepReadJsonl(file) {
+        let text;
+        try { text = fs.readFileSync(file, 'utf8'); }
+        catch (_) { return []; }
+        const out = [];
+        for (const line of text.split('\n')) {
+            const t = line.trim();
+            if (!t || t[0] !== '{') continue;
+            try { out.push(JSON.parse(t)); } catch (_) { /* skip bad line */ }
+        }
+        return out;
+    }
+
+    // Materialize the expected final store state from snapshot.json +
+    // ops.jsonl. Uses each op's recorded *result* note (the full body
+    // after the mutation), so no Keep semantics are re-implemented.
+    // keepArchive results carry no note bodies, so archived tags lag —
+    // the same known limitation as the Markdown projection.
+    function computeExpectedKeepState() {
+        const notes = new Map();
+        const snapFile = keepPathFor(KEEP_SNAP_REL);
+        let snap = null;
+        if (snapFile) {
+            try { snap = JSON.parse(fs.readFileSync(snapFile, 'utf8')); }
+            catch (_) { snap = null; }
+        }
+        if (snap && Array.isArray(snap.notes)) {
+            for (const n of snap.notes) {
+                if (n && n.id != null) notes.set(String(n.id), n);
+            }
+        }
+        const opsFile = keepPathFor(KEEP_OPS_REL);
+        for (const rec of (opsFile ? keepReadJsonl(opsFile) : [])) {
+            const note = keepNoteFromResult(rec.result);
+            switch (rec.tool) {
+            case 'keepPut':
+            case 'keepTag':
+            case 'keepNow':
+                if (note && note.id != null) notes.set(String(note.id), note);
+                break;
+            case 'keepRemove':
+                if (rec.id != null) notes.delete(String(rec.id));
+                break;
+            default:
+                break;
+            }
+        }
+        return notes;
+    }
+
+    // Compare the expected on-disk state against the live store and
+    // repair additively: re-put notes that are missing or whose content
+    // differs. Store-only notes are never removed (the disk log may
+    // legitimately miss history predating it, or notes restored from an
+    // image snapshot); they are only reported. Also refreshes the
+    // notes/*.md projection from the expected state.
+    async function reconcileKeepMirror() {
+        const opsFile = keepPathFor(KEEP_OPS_REL);
+        if (!opsFile) return;
+        const expected = computeExpectedKeepState();
+        if (expected.size === 0) return;
+        let actualNotes;
+        try {
+            const q = await callCaffeineTool('keepQuery',
+                { query: '', limit: 1000000 });
+            actualNotes = (q && Array.isArray(q.notes)) ? q.notes : [];
+        } catch (e) {
+            orbitLog(`[keep-mirror] reconcile skipped (query failed): ${e && e.message}`);
+            return;
+        }
+        const actual = new Map();
+        for (const n of actualNotes) {
+            if (n && n.id != null) actual.set(String(n.id), n);
+        }
+        const toRestore = [];
+        for (const [id, note] of expected) {
+            const live = actual.get(id);
+            if (!live || (live.content || '') !== (note.content || '')) {
+                toRestore.push(note);
+            }
+        }
+        const storeOnly = [...actual.keys()].filter((id) => !expected.has(id));
+        // Suppress mirroring while re-issuing ops that are already on
+        // disk. (Startup window: a concurrent agent mutation would go
+        // unmirrored; accepted.)
+        keepMirrorSuppress = true;
+        try {
+            for (const note of toRestore) {
+                const tags = (note.tags && typeof note.tags === 'object')
+                    ? note.tags : {};
+                await callCaffeineTool('keepPut', {
+                    id: String(note.id),
+                    agent: note.agent || tags.agent || 'keep-mirror',
+                    content: typeof note.content === 'string' ? note.content : '',
+                    summary: typeof note.summary === 'string' ? note.summary : '',
+                    tags: JSON.stringify(tags)
+                });
+            }
+        } finally {
+            keepMirrorSuppress = false;
+        }
+        try {
+            for (const note of expected.values()) keepWriteNoteFile(note);
+        } catch (_) { /* projection refresh is best-effort */ }
+        orbitLog(`[keep-mirror] reconcile: ${expected.size} on disk, `
+            + `${actual.size} in store, restored ${toRestore.length}`
+            + (storeOnly.length
+                ? `; ${storeOnly.length} store-only left untouched: `
+                    + storeOnly.slice(0, 10).join(', ')
+                    + (storeOnly.length > 10 ? ', …' : '')
+                : ''));
+    }
+
+    // Checkpoint: fold the full live store into snapshot.json, rotate
+    // ops.jsonl into ops-archive/, regenerate the notes/*.md projection
+    // (including orphan removal — the snapshot is the authoritative full
+    // state), then clear the IndexedDB crash buffer, which is safe only
+    // once the disk checkpoint is durably written. Triggered by the
+    // orbit.caffeineSnapshot command and available standalone as
+    // orbit.keepCheckpoint.
+    async function checkpointKeepMirror() {
+        const opsFile  = keepPathFor(KEEP_OPS_REL);
+        const snapFile = keepPathFor(KEEP_SNAP_REL);
+        if (!opsFile || !snapFile) return { ok: false, reason: 'no local workspace' };
+        const q = await callCaffeineTool('keepQuery',
+            { query: '', limit: 1000000 });
+        const notes = (q && Array.isArray(q.notes)) ? q.notes : null;
+        if (!notes) throw new Error('unexpected keepQuery result');
+        const seq = ensureKeepSeq(opsFile);
+        let edgeTags = {};
+        try {
+            edgeTags = JSON.parse(
+                fs.readFileSync(keepPathFor(KEEP_EDGES_REL), 'utf8')) || {};
+        } catch (_) { edgeTags = {}; }
+        const snapshot = {
+            at: new Date().toISOString(),
+            seq,
+            noteCount: notes.length,
+            edgeTags,
+            notes
+        };
+        fs.mkdirSync(path.dirname(snapFile), { recursive: true });
+        const tmp = snapFile + '.tmp';
+        fs.writeFileSync(tmp, JSON.stringify(snapshot, null, 1) + '\n', 'utf8');
+        fs.renameSync(tmp, snapFile);
+        try {
+            if (fs.existsSync(opsFile)) {
+                const archiveDir = keepPathFor(KEEP_OPS_ARCHIVE_REL);
+                fs.mkdirSync(archiveDir, { recursive: true });
+                fs.renameSync(opsFile, path.join(archiveDir,
+                    snapshot.at.replace(/[:.]/g, '-') + '-ops.jsonl'));
+            }
+        } catch (e) {
+            orbitLog(`[keep-mirror] checkpoint: op-log rotation failed: ${e && e.message}`);
+        }
+        try {
+            const notesDir = keepPathFor(KEEP_NOTES_REL);
+            fs.mkdirSync(notesDir, { recursive: true });
+            const want = new Set(notes.map((n) => keepSafeId(n && n.id) + '.md'));
+            for (const f of fs.readdirSync(notesDir)) {
+                if (f.endsWith('.md') && !want.has(f)) {
+                    fs.unlinkSync(path.join(notesDir, f));
+                }
+            }
+            for (const n of notes) keepWriteNoteFile(n);
+        } catch (e) {
+            orbitLog(`[keep-mirror] checkpoint: projection refresh failed: ${e && e.message}`);
+        }
+        try {
+            await callCaffeineTool('evaluate', {
+                source: "JS evaluate: 'window.top.__keepAudit.clear(); return true'"
+            });
+        } catch (e) {
+            orbitLog(`[keep-mirror] checkpoint: __keepAudit.clear failed (non-fatal): ${e && e.message}`);
+        }
+        orbitLog(`[keep-mirror] checkpoint: ${notes.length} notes folded at seq ${seq}`);
+        return { ok: true, notes: notes.length, seq };
     }
 
     let activateBackendsTimer = null;
@@ -3432,8 +3697,15 @@ module.exports = function (vscode) {
             // which may never come up).
             if (!auditReplayFired && mcpRunning['Caffeine']) {
                 auditReplayFired = true;
-                replayAuditTrailIntoKeep().catch(e =>
-                    orbitLog(`[keep-sync] Audit replay failed: ${e && e.message}`));
+                // IndexedDB crash-buffer replay first, then the disk
+                // reconcile pass (snapshot.json + ops.jsonl), so a git
+                // clone alone reconstructs the store.
+                replayAuditTrailIntoKeep()
+                    .catch(e =>
+                        orbitLog(`[keep-sync] Audit replay failed: ${e && e.message}`))
+                    .then(() => reconcileKeepMirror())
+                    .catch(e =>
+                        orbitLog(`[keep-mirror] reconcile failed: ${e && e.message}`));
                 openKeepViewerOnStartup().catch(e =>
                     orbitLog(`[keep-viewer] Startup open failed: ${e && e.message}`));
             }
@@ -4211,6 +4483,12 @@ module.exports = function (vscode) {
     <button id="twin-open-btn" class="view-btn">open</button>
     <span class="name">Lam 2300 cluster tool</span>
   </div>
+  <hr id="hr-release-notes">
+  <div id="release-notes-section-label" class="section-label">release notes</div>
+  <div id="release-notes-view-row" class="server">
+    <button id="release-notes-view-btn" class="view-btn">view</button>
+    <span class="name">changes in this release</span>
+  </div>
   <hr id="hr-bottom">
   <button id="orbit-toggle" class="footer-button">Start Orbit</button>
 
@@ -4253,6 +4531,10 @@ module.exports = function (vscode) {
 
   document.getElementById('presentation-start-btn').addEventListener('click', () => {
     vscode.postMessage({ type: 'startPresentation' });
+  });
+
+  document.getElementById('release-notes-view-btn').addEventListener('click', () => {
+    vscode.postMessage({ type: 'viewReleaseNotes' });
   });
 
   function render(state) {
@@ -4325,6 +4607,10 @@ module.exports = function (vscode) {
     document.getElementById('hr-twin').style.display = showTwin ? '' : 'none';
     document.getElementById('twin-section-label').style.display = showTwin ? '' : 'none';
     document.getElementById('twin-view-row').style.display = showTwin ? '' : 'none';
+    const showReleaseNotes = !!state.orbitRunning;
+    document.getElementById('hr-release-notes').style.display = showReleaseNotes ? '' : 'none';
+    document.getElementById('release-notes-section-label').style.display = showReleaseNotes ? '' : 'none';
+    document.getElementById('release-notes-view-row').style.display = showReleaseNotes ? '' : 'none';
     document.getElementById('hr-bottom').style.display = state.orbitRunning ? '' : 'none';
     serversEl.innerHTML = '';
     for (const s of state.servers) {
@@ -4530,7 +4816,7 @@ module.exports = function (vscode) {
                             return;
                         }
                         if (msg.type === 'openKeepViewer') {
-                            openKeepViewerOnStartup().catch(e =>
+                            openKeepViewerOnStartup({ restore: true }).catch(e =>
                                 orbitLog(`[keep-viewer] Panel open failed: ${e && e.message}`));
                             return;
                         }
@@ -4547,6 +4833,17 @@ module.exports = function (vscode) {
                         if (msg.type === 'startPresentation') {
                             startPresentationOnPage().catch(e =>
                                 orbitLog(`[presentation] Panel open failed: ${e && e.message}`));
+                            return;
+                        }
+                        if (msg.type === 'viewReleaseNotes') {
+                            try {
+                                const notesUri = vscode.Uri.file(path.join(
+                                    context.extensionPath, 'RELEASE-NOTES.md'));
+                                await vscode.commands.executeCommand(
+                                    'markdown.showPreview', notesUri);
+                            } catch (e) {
+                                orbitError('[orbit] viewReleaseNotes failed:', e && e.message);
+                            }
                             return;
                         }
                     });

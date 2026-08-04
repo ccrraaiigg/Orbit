@@ -2,14 +2,20 @@
 
 ### NEVER reload the webpage, and NEVER snapshot the Squeak object memory yourself
 
-NEVER — with one exception. When the user asks you to rebuild the
-extension, make exactly one snapshot just before exporting
-`caffeine.image` and `caffeine.changes` from the SqueakJS IndexedDB,
-via the `orbit.caffeineSnapshot` VSCode command, having first called
-the `mcp_caffeine_prepareForRelease` MCP tool (see "always refresh
-the Caffeine memory before building"). That is the only snapshot you
-may ever make, and only on an explicit rebuild request — never when
-rebuilding for any other reason. Outside that one step, NEVER.
+NEVER — with one exception. Whenever you rebuild the extension and
+you (the agent) have made changes to the live Caffeine image —
+compiled or removed methods, changed class definitions, mutated
+persistent image state — since the last snapshot, make exactly one
+snapshot just before exporting `caffeine.image` and `caffeine.changes`
+from the SqueakJS IndexedDB, via the `orbit.caffeineSnapshot` VSCode
+command, having first called the `mcp_caffeine_prepareForRelease` MCP
+tool (see "always refresh the Caffeine memory before building").
+Never package a snapshot that is behind changes you made to the live
+image: a rebuild must ship the current live image if you have changed
+it. If you have made no image changes, skip the snapshot and export
+the existing IndexedDB state as-is. That is the only snapshot you may
+ever make, and only as part of a rebuild. Outside that one step,
+NEVER.
 
 ### NEVER stop the Orbit server or the page without consent
 
@@ -610,6 +616,30 @@ already-installed VSIX (e.g. after a manual reinstall overwrote them),
 run ./scripts/js/install-extension.js instead. It does no build and no
 version bump.
 
+#### write release notes before building
+
+Every time you build, first update `website/RELEASE-NOTES.md` with
+release notes describing the changes since the last *published*
+version of the extension — the version shown on the Marketplace page
+at
+<https://marketplace.visualstudio.com/items?itemName=BlackPageDigital.orbit-agentic-pair-programming-for-smalltalk>.
+Fetch that page to learn the published version number, then summarize
+the user-visible changes made since it (from git history and the
+current working-tree changes, including the changes prompting this
+build). Keep the notes user-facing and concise: what changed and why
+it matters, not implementation detail. The file is cumulative: it has
+a top-level `# Orbit release notes` heading followed by one `##
+Changes since <published version>` section per published version,
+newest first. On each build, update the newest section in place if its
+`<published version>` still matches the currently-published version;
+when the Marketplace shows a newer published version, start a fresh
+`## Changes since <new published version>` section above the old ones.
+Never delete or rewrite older sections — they are the project's
+history. The file ships in the
+VSIX and is opened by the **view** button in the "release notes"
+section of the Orbit panel (just above the Stop Orbit button), so it
+must be current before `./scripts/js/build-extension.js` runs.
+
 #### always refresh the Caffeine memory before building
 
 Every time you are asked to run the build script
@@ -636,17 +666,20 @@ lot of otherwise-collectable garbage — into the released image. Call it
 every time, immediately before `orbit.caffeineSnapshot`; it is
 idempotent and never removes the session class you are using.
 
-Then make a snapshot so the exported image
-is current: invoke the `orbit.caffeineSnapshot` command via
+Then, if you have made changes to the live image since the last
+snapshot, make a snapshot so the exported image is current: invoke the
+`orbit.caffeineSnapshot` command via
 `run_vscode_command` (with `skipCheck: true`, no arguments). The
 extension owns this command; it sends `snapshot` to the page tether in
 the Caffeine bridge (`CaffeineBridge.snapshot`), which writes the live
 image to the IndexedDB the export reads. This is the one sanctioned
 exception to the prohibition on snapshotting the Squeak object memory
 yourself (see "NEVER reload the webpage, and NEVER snapshot the Squeak
-object memory yourself"), and it applies only when a user has asked
-you to rebuild the extension — not when you are rebuilding it for any
-other reason. Do this snapshot first, before reading the IndexedDB
+object memory yourself"), and it applies to any rebuild, whoever
+initiated it — never package a snapshot that is behind image changes
+you made. If you have made no image changes, skip the snapshot and
+export the existing IndexedDB state as-is. Do the snapshot (when
+needed) first, before reading the IndexedDB
 bytes. (If you are bootstrapping a rebuild on an installed extension
 that predates the `orbit.caffeineSnapshot` command, snapshot instead
 with a one-off `mcp_caffeine_evaluate` of

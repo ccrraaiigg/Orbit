@@ -26,13 +26,28 @@ Mechanism:
   no chat Keep/Undo controls attach (same discipline as the Evaluate
   ledger).
 
-Projection rules: put/tag/now-write → write `notes/<id>.md` from full
-`result.note`; remove → delete the file; declareEdgeTag → merge into
-`edge-tags.json`; archive → op-log only (per-note `archived` flag lags
-until the note is next put/tagged — known limitation).
+Projection rules: put/tag/now-write → write `notes/<id>.md` from the
+full result note (bare dict for keepPut/keepNow, `{note}` for keepTag —
+normalized by `keepNoteFromResult`; a bug where only `{note}` was
+recognized, so keepPut never wrote projections, was fixed 2026-08-04);
+remove → delete the file; declareEdgeTag → merge into `edge-tags.json`;
+archive → op-log only (healed at the next checkpoint's full projection
+refresh).
 
 Best-effort: wrapped in try/catch on both sides; a filesystem error
 degrades to "not mirrored", never a failed MCP call.
 
-Not yet built: write-back/replay recovery tool, op-log compaction,
-SQLite mirror.
+Lifecycle (added 2026-08-04, see design doc):
+- **Startup reconcile** (`reconcileKeepMirror`): after the IndexedDB
+  `keepReplayAudit` pass, expected state from `snapshot.json` +
+  `ops.jsonl` is compared against the live store; missing/stale notes
+  are re-put (additively — store-only notes are reported, never
+  removed). Mirroring is suppressed during the repair puts.
+- **Checkpoint** (`checkpointKeepMirror`): folds the full store into
+  `snapshot.json`, rotates `ops.jsonl` → `ops-archive/`, regenerates
+  all projections (incl. orphan removal), then clears the IndexedDB
+  `keep-audit` crash buffer. Runs after `orbit.caffeineSnapshot`, or
+  manually via `orbit.keepCheckpoint`.
+
+Not yet built: write-back from notes/*.md edits, threshold-triggered
+checkpoints, SQLite mirror.

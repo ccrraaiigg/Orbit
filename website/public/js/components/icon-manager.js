@@ -79,16 +79,12 @@ class IconManager extends HTMLElement {
       if (self._hoveredWindow) self._hoveredWindow.style.removeProperty('background-color');
       self._hoveredWindow = null;
     });
+    // On page load, keep the Caffeine window out of the list; collapsing
+    // and expanding the icon manager (which resets _suppressed) reveals it.
+    var caffeine = document.getElementById('embeddedSqueak');
+    if (caffeine) this._suppressed.add(caffeine);
     this.refresh();
     this._bindWindowHoverTracking();
-
-    document.addEventListener('morphic-collapse', function(e) {
-      var win = e.target;
-      if (win && win.id === 'embeddedSqueak') {
-        self._suppressed.add(win);
-        self.refresh();
-      }
-    }, true);
 
     this._installIframePointerForwarders();
     this._connectTether();
