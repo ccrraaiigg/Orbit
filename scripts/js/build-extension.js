@@ -48,6 +48,21 @@ function bumpVersion() {
     const newVersion = `${m[2]}.${Number(m[3]) + 1}.0`;
     fs.writeFileSync(pkgPath, src.replace(m[0], m[1] + newVersion + m[5]));
     console.log(`Bumped version to ${newVersion} (was ${oldVersion})`);
+    updateReleaseNotesVersion(newVersion);
+}
+
+// Keep the "Current version" subtitle at the top of RELEASE-NOTES.md in sync.
+function updateReleaseNotesVersion(version) {
+    const notesPath = path.join(WEBSITE, 'RELEASE-NOTES.md');
+    const src = fs.readFileSync(notesPath, 'utf8');
+    const subtitle = `_Current version: ${version}_`;
+    let out;
+    if (/^_Current version: .*_$/m.test(src)) {
+        out = src.replace(/^_Current version: .*_$/m, subtitle);
+    } else {
+        out = src.replace(/^(# Orbit release notes\n)/, `$1\n${subtitle}\n`);
+    }
+    fs.writeFileSync(notesPath, out);
 }
 
 // ─── Package info ───────────────────────────────────────────────────────────

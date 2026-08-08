@@ -26,7 +26,9 @@
     <script src="js/squeakjs/squeak.js"></script>
     <script src="js/html/utilities.js"></script>
     <script src="js/zlib/bower_components/pako/dist/pako_inflate.min.js"></script>
+    <script src="js/orbit-idb-backup.js"></script>
     <script src="js/orbit-version-check.js"></script>
+    <script src="js/orbit-image-guard.js"></script>
     <script src="js/orbit-vscode-file.js"></script>
     <script src="js/orbit-workspace-fs.js"></script>
 
@@ -40,6 +42,12 @@
 	    zipUrl,
 	    windowTitle,
 	    isCustomSnapshot
+
+	// Back up the squeak IndexedDB to <workspace>/backups/<timestamp>/
+	// before anything (version check, vscode-file write, the VM) can
+	// modify it. Never blocks boot on failure.
+	try {await window.orbitBackupSqueakIDB()}
+	catch (e) {console.warn('squeak IndexedDB backup failed', e)}
 
 	const urlParams = new URLSearchParams(window.top.location.search)
 
@@ -90,6 +98,22 @@
 	// read it. After the version check, which may erase the database.
 	try {await window.orbitWriteVSCodeFile()}
 	catch (e) {console.warn('could not write the vscode file', e)}
+
+	// Refuse to auto-boot caffeine.image when the squeak IndexedDB
+	// holds more than one *.image file: the user has extra object
+	// memories stored, so don't clobber them by booting Caffeine.
+	// Any explicitly-named image (?image=/?snapshot=) still boots.
+	if (imageName === "caffeine") {
+	  try {
+	    const imageCount = await window.orbitCountSqueakImages()
+	    if (imageCount > 1) {
+	      console.warn(
+	        'Not starting caffeine.image: ' + imageCount +
+	        ' .image files present in the squeak IndexedDB.')
+	      return
+	    }
+	  } catch (e) {console.warn('image-count guard failed; starting anyway', e)}
+	}
 
 	console.log('Starting Snowglobe')
 

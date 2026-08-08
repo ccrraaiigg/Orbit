@@ -440,6 +440,147 @@ app.put('/upload/:filename', (req, res) => {
   });
 });
 
+// IndexedDB backup sink: on every boot, the page (js/orbit-idb-backup.js,
+// invoked from squeak.html before anything can modify the "squeak"
+// database) POSTs each stored file here. Bodies are streamed to
+// <workspace>/backups/<timestamp>/<file>, preserving any subdirectory
+// structure in the Squeak file path. Files whose size is unchanged from
+// a previous backup are not re-sent: the page consults GET
+// /idb-backup/manifest (which scans previous backups newest-first) and
+// requests a link (?linkTo=<prevTs>) to the backed-up file instead.
+// Gated like the other bridge routes (loopback or bearer).
+//
+// Backups belong to the open workspace, not the extension install
+// directory (__dirname differs between a plain install and the
+// symlinked dev setup). Fall back to <repo>/backups only when running
+// standalone (bin/www) with no vscode API.
+const workspaceRoot =
+  _vscode && _vscode.workspace && _vscode.workspace.workspaceFolders
+    && _vscode.workspace.workspaceFolders.length
+    ? _vscode.workspace.workspaceFolders[0].uri.fsPath
+    : path.join(__dirname, '..');
+const BACKUPS_DIR = path.join(workspaceRoot, 'backups');
+const BACKUP_TS_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+// Aggregated manifest: for every file present in any previous backup,
+// the newest backup containing it — file path → { size, ts }. Backups
+// are scanned in reverse chronological order, so partial (basename-
+// scoped) backups don't hide files from older full ones. Dangling
+// symlinks are skipped.
+app.get('/idb-backup/manifest', (req, res) => {
+  if (!allowBridgeAccess(req, res)) return;
+  let dirs = [];
+  try {
+    dirs = fsmod.readdirSync(BACKUPS_DIR)
+      .filter((d) => /^\d{4}-\d{2}-\d{2}T/.test(d) && BACKUP_TS_RE.test(d))
+      .sort().reverse();
+  } catch (_) {}
+  const files = {};
+  for (const ts of dirs) {
+    try {
+      (function walk(dir, prefix) {
+        for (const ent of fsmod.readdirSync(dir, { withFileTypes: true })) {
+          const p = path.join(dir, ent.name);
+          const rel = prefix + '/' + ent.name;
+          if (ent.isDirectory()) { walk(p, rel); continue; }
+          if (files[rel]) continue;
+          try { files[rel] = { size: fsmod.statSync(p).size, ts }; }
+          catch (_) {}
+        }
+      })(path.join(BACKUPS_DIR, ts), '');
+    } catch (_) {}
+  }
+  res.json({ files });
+});
+
+app.post('/idb-backup', (req, res) => {
+  if (!allowBridgeAccess(req, res)) return;
+  const ts = String(req.query.ts || '');
+  const name = String(req.query.name || '');
+  if (!BACKUP_TS_RE.test(ts)) {
+    return res.status(400).json({ error: 'invalid ts' });
+  }
+  // Squeak file paths may contain subdirectories; forbid traversal.
+  const relative = name.replace(/^\/+/, '');
+  if (!relative || relative.split('/').some(
+        (seg) => !seg || seg === '.' || seg === '..')) {
+    return res.status(400).json({ error: 'invalid name' });
+  }
+  const dest = path.join(BACKUPS_DIR, ts, relative);
+  if (!dest.startsWith(path.join(BACKUPS_DIR, ts) + path.sep)) {
+    return res.status(400).json({ error: 'invalid name' });
+  }
+  const linkTo = String(req.query.linkTo || '');
+  if (linkTo) {
+    // Link to the previous copy. Windows: hard links, which need no
+    // privileges (file symlinks do). Everywhere else: symlinks
+    // (human-readable pointers). Fallback chain covers both, then a
+    // plain copy for filesystems supporting neither. realpath
+    // resolves symlink chains so links always target the original.
+    if (!BACKUP_TS_RE.test(linkTo) || linkTo === ts) {
+      return res.status(400).json({ error: 'invalid linkTo' });
+    }
+    let real;
+    try { real = fsmod.realpathSync(path.join(BACKUPS_DIR, linkTo, relative)); }
+    catch (_) { return res.status(404).json({ error: 'no such previous file' }); }
+    if (!real.startsWith(BACKUPS_DIR + path.sep)) {
+      return res.status(400).json({ error: 'invalid linkTo' });
+    }
+    req.resume();
+    try {
+      fsmod.mkdirSync(path.dirname(dest), { recursive: true });
+      const symlink = () =>
+        fsmod.symlinkSync(path.relative(path.dirname(dest), real), dest);
+      const hardlink = () => fsmod.linkSync(real, dest);
+      const primary = process.platform === 'win32' ? hardlink : symlink;
+      const secondary = process.platform === 'win32' ? symlink : hardlink;
+      try { primary(); }
+      catch (_) {
+        try { secondary(); }
+        catch (_) { fsmod.copyFileSync(real, dest); }
+      }
+      res.json({ ok: true, path: dest, linkedTo: real });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+    return;
+  }
+  try { fsmod.mkdirSync(path.dirname(dest), { recursive: true }); }
+  catch (err) { return res.status(500).json({ error: err.message }); }
+  const out = fsmod.createWriteStream(dest);
+  let size = 0;
+  req.on('data', (chunk) => { size += chunk.length; });
+  req.pipe(out);
+  out.on('finish', () => res.json({ ok: true, path: dest, size }));
+  out.on('error', (err) => res.status(500).json({ error: err.message }));
+  req.on('error', () => { out.destroy(); try { fsmod.unlinkSync(dest); } catch (_) {} });
+});
+
+// Caffeine memory export sink: before an extension build, the agent has
+// the page POST the live caffeine.image / caffeine.changes ArrayBuffers
+// from the squeak IndexedDB here; they land in public/memories/ where
+// build-extension.js repackages caffeine.zip from them. Replaces the
+// standalone scripts/js/caffeine-export-sink.js process. Names are
+// allowlisted; gated like the other bridge routes.
+const MEMORIES_DIR = path.join(__dirname, 'public', 'memories');
+const EXPORTABLE_MEMORIES = new Set(['caffeine.image', 'caffeine.changes']);
+
+app.post('/export-memory', (req, res) => {
+  if (!allowBridgeAccess(req, res)) return;
+  const name = String(req.query.name || '');
+  if (!EXPORTABLE_MEMORIES.has(name)) {
+    return res.status(400).json({ error: 'invalid name' });
+  }
+  try { fsmod.mkdirSync(MEMORIES_DIR, { recursive: true }); }
+  catch (err) { return res.status(500).json({ error: err.message }); }
+  const dest = path.join(MEMORIES_DIR, name);
+  const out = fsmod.createWriteStream(dest);
+  let size = 0;
+  req.on('data', (chunk) => { size += chunk.length; });
+  req.pipe(out);
+  out.on('finish', () => res.json({ ok: true, path: dest, size }));
+  out.on('error', (err) => res.status(500).json({ error: err.message }));
+  req.on('error', () => { out.destroy(); try { fsmod.unlinkSync(dest); } catch (_) {} });
+});
+
 // Presentation deck persistence: the deck's reload button PUTs the
 // edited deck HTML here before reloading the iframe, so in-place slide
 // edits survive the reload. Written back to the same file express.static

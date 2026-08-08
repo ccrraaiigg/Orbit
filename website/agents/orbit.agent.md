@@ -9,7 +9,7 @@ persistent image state — since the last snapshot, make exactly one
 snapshot just before exporting `caffeine.image` and `caffeine.changes`
 from the SqueakJS IndexedDB, via the `orbit.caffeineSnapshot` VSCode
 command, having first called the `mcp_caffeine_prepareForRelease` MCP
-tool (see "always refresh the Caffeine memory before building").
+tool (see "ensure that the Caffeine memory ZIP is current before building").
 Never package a snapshot that is behind changes you made to the live
 image: a rebuild must ship the current live image if you have changed
 it. If you have made no image changes, skip the snapshot and export
@@ -84,6 +84,22 @@ and obey it, without fail.
 Do not create additional steering files. When steering needs to be
 updated, modify this file by editing existing sections or adding new
 sections.
+
+There is only ONE real steering file, reachable under three paths:
+
+- `website/agents/orbit.agent.md` — the canonical source.
+- `.github/agents/orbit.agent.md` — a **hardlink** to the same inode,
+  so it *is* the same file (same bytes, same inode number).
+- `.github/copilot-instructions.md` — a **symlink** pointing at
+  `website/agents/orbit.agent.md`.
+
+Because all three resolve to a single underlying file, one edit updates
+all of them at once. Do NOT try to "edit both/all" copies — a
+string-replace edit applied a second time will fail to find its
+now-already-replaced target (or, worse, double-apply). Edit
+`website/agents/orbit.agent.md` once and you are done. (Verify with
+`ls -li` if unsure: the hardlinked paths share an inode number.)
+
 
 ### project memories
 
@@ -637,10 +653,10 @@ when the Marketplace shows a newer published version, start a fresh
 Never delete or rewrite older sections — they are the project's
 history. The file ships in the
 VSIX and is opened by the **view** button in the "release notes"
-section of the Orbit panel (just above the Stop Orbit button), so it
+section of the Orbit panel, so it
 must be current before `./scripts/js/build-extension.js` runs.
 
-#### always refresh the Caffeine memory before building
+#### ensure that the Caffeine memory ZIP is current before building
 
 Every time you are asked to run the build script
 (./scripts/js/build-extension.js), first export the live Caffeine
@@ -649,6 +665,16 @@ into ./website/public/memories, so the build packages the current
 image. The build script repackages `caffeine.zip` from those two files
 (and deletes them) when they're present, so they must be on disk
 *before* you invoke it.
+
+But this export is only needed when there's a *new* snapshot — i.e.
+when the snapshot criteria below hold (you made changes to the live
+image, or the IndexedDB `caffeine.image`/`caffeine.changes` is
+meaningfully newer than the IndexedDB `caffeine.zip`) and you therefore
+snapshotted (see below). If you are
+not snapshotting, skip the export entirely: the existing `caffeine.zip`
+already in ./website/public/memories suffices, and the build will ship
+it unchanged. Don't export the two files just to repackage an identical
+`caffeine.zip`.
 
 Do this export through a shared page at the `localhost:8089` origin
 (any such page works — `orbit.html`, `files.html`, etc.; you do not
@@ -666,8 +692,26 @@ lot of otherwise-collectable garbage — into the released image. Call it
 every time, immediately before `orbit.caffeineSnapshot`; it is
 idempotent and never removes the session class you are using.
 
-Then, if you have made changes to the live image since the last
-snapshot, make a snapshot so the exported image is current: invoke the
+Then decide whether to snapshot. Snapshot if *either* of these holds:
+(a) you have made changes to the live image since the last snapshot;
+or (b) the IndexedDB `caffeine.image` or `caffeine.changes` has a
+modified timestamp that is later than the IndexedDB `caffeine.zip` by
+at least a minute. `caffeine.zip` is written into the
+`squeak` IndexedDB when the extension is installed, so either of those
+files being newer than it means the live image was snapshotted
+after the last install and the packaged zip is stale — export the
+current image even if *this* conversation made no changes. Require the
+gap to be at least 60 seconds: the three files are written at slightly
+different instants, so a sub-minute difference is just write-ordering
+jitter, not a genuinely newer snapshot, and should not trigger an
+export. Read the timestamps from the SqueakJS `squeak:/` directory
+listing in `localStorage` (each entry is `[name, created, modified,
+isDirectory, size]`, times in Squeak epoch seconds); compare the
+`modified` field of both `caffeine.image` and `caffeine.changes`
+against that of `caffeine.zip`, and treat the newer of the two data
+files as decisive. If either
+condition holds, make a snapshot so the exported image is current:
+invoke the
 `orbit.caffeineSnapshot` command via
 `run_vscode_command` (with `skipCheck: true`, no arguments). The
 extension owns this command; it sends `snapshot` to the page tether in
@@ -677,7 +721,7 @@ exception to the prohibition on snapshotting the Squeak object memory
 yourself (see "NEVER reload the webpage, and NEVER snapshot the Squeak
 object memory yourself"), and it applies to any rebuild, whoever
 initiated it — never package a snapshot that is behind image changes
-you made. If you have made no image changes, skip the snapshot and
+you made. If neither condition holds, skip the snapshot and
 export the existing IndexedDB state as-is. Do the snapshot (when
 needed) first, before reading the IndexedDB
 bytes. (If you are bootstrapping a rebuild on an installed extension
@@ -689,20 +733,21 @@ The Playwright script sandbox is locked down (no `require`, `fs`,
 `fetch`, or dynamic `import` — only `page`), and the Integrated
 Browser's download `saveAs` hangs because it never reports completion
 over CDP. So don't try to write the files from the sandbox or via a
-browser download. Instead:
+browser download. Instead, use the export sink built into the Orbit
+webserver itself (since v1.268.0; no separate process to start):
 
-1. Start the committed loopback sink
-   ./scripts/js/caffeine-export-sink.js (`node
-   scripts/js/caffeine-export-sink.js`). Reuse this script — do NOT
-   recreate a throwaway sink inline. It listens on `127.0.0.1:8791`,
-   is CORS-open, accepts `POST /upload?name=caffeine.image|caffeine.changes`
-   (allowlisted) and writes the body to ./website/public/memories/, and
-   also exposes `POST /diag` (it logs the body to stdout) as an
-   out-of-band diagnostics channel — handy because the page snapshot /
-   `read_page` does NOT reliably surface `console.*` output.
+1. The running Orbit webserver accepts
+   `POST /export-memory?name=caffeine.image|caffeine.changes`
+   (allowlisted; see app-impl.js) and streams the body to
+   ./website/public/memories/<name>. It is same-origin with the page,
+   so no CORS setup is needed. (The old standalone
+   scripts/js/caffeine-export-sink.js on 127.0.0.1:8791 is superseded;
+   only fall back to it when the installed extension predates the
+   route.)
 2. In the page context (`page.evaluate`), open the `squeak` IndexedDB,
-   read an `ArrayBuffer`, and `fetch`-POST it to the sink (the page
-   *does* have `fetch`, unlike the sandbox). Export the two files **one
+   read an `ArrayBuffer`, and `fetch`-POST it to
+   `/export-memory?name=<name>` (the page *does* have `fetch`, unlike
+   the sandbox). Export the two files **one
    at a time, in separate `page.evaluate` calls** — do `caffeine.image`
    first, let that call fully return, then do `caffeine.changes`. The
    image is large (~45 MB); reading both buffers at once, or firing any
@@ -713,11 +758,10 @@ browser download. Instead:
    each call read one key, POST it, and don't retain the reference;
    `db.close()` when done; never run a concurrent page call during the
    export; and poll the deferred result patiently instead of prodding
-   the page.
+   the page. The route replies `{"ok":true,"path":…,"size":N}`; return
+   that JSON from the `page.evaluate` call.
 3. Verify the on-disk byte counts match the source `ArrayBuffer`
-   lengths, then kill the sink and remove any temporary DOM/blob
-   elements you injected. Leave the sink *script* on disk for next
-   time; only stop the running process.
+   lengths, then remove any temporary DOM/blob elements you injected.
 
 When you drive the page with `run_playwright_code`, pass the code as
 **direct statements** with `page` and top-level `await` already in

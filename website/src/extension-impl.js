@@ -678,8 +678,14 @@ module.exports = function (vscode) {
     // servers the page adds at runtime (reachability probes, the MCP
     // definition provider, activation). The activity-bar UI machinery
     // continues to key off the static BACKENDS array.
+    //
+    // Backends we've abandoned (see abandonUnconnected2300Backends) are
+    // filtered out here, which removes them from the MCP definition
+    // provider (VS Code's MCP servers list), the Orbit panel checkbox
+    // rows, and the activation/reconnect machinery in one stroke.
     function allBackends() {
-        return BACKENDS.concat(discoveredBridgeBackends());
+        return BACKENDS.concat(discoveredBridgeBackends())
+            .filter(b => !mcpAbandoned.has(b.name));
     }
 
     // Whether VS Code's MCP client has actually contacted the bridge
@@ -1154,6 +1160,21 @@ module.exports = function (vscode) {
     // when the user starts the server again (or on orbit.start/stop).
     const mcpUserStopped = new Set();
 
+    // Backends we've permanently given up on for this run: 2300-*
+    // servers that never established an MCP connection within one
+    // minute of the Orbit extension starting. Once a name is in this
+    // set, allBackends() filters it out — so it vanishes from the MCP
+    // servers list in the Orbit panel and we stop trying to connect to
+    // it (see abandonUnconnected2300Backends). Reset on orbit.start so
+    // a manual restart gives those backends a fresh chance.
+    const mcpAbandoned = new Set();
+
+    // Backends that have connected at least once this run. Populated by
+    // notifyMcpState when a server goes running, and consulted by the
+    // abandonment timer so a backend that connected (even if it later
+    // dropped) is never abandoned.
+    const mcpEverConnected = new Set();
+
     // Per-server control objects backing the Orbit panel checkboxes.
     // Built lazily and cached by name so that dynamically-discovered
     // bridge servers (extra MCPServer subclasses the page announces)
@@ -1241,6 +1262,7 @@ module.exports = function (vscode) {
     // { name, running }.
     const mcpStateSubscribers = new Set();
     function notifyMcpState(name, running) {
+        if (running) mcpEverConnected.add(name);
         notifyPageEvent({ name, running });
     }
     // Broadcast an arbitrary payload on the same channel (used for
@@ -3684,7 +3706,69 @@ module.exports = function (vscode) {
 
     let activateBackendsTimer = null;
     let auditReplayFired = false;
+
+    // --- 2300-* abandonment ------------------------------------------
+    //
+    // The 2300 backends live in separate VisualWorks images that may
+    // not be running at all. If none of them can be reached within one
+    // minute of the Orbit extension starting, we give up: remove them
+    // from the MCP servers list in the Orbit panel and stop trying to
+    // connect. This keeps the panel from perpetually showing three
+    // dead 2300 rows (and keeps the retry loop from probing dead ports
+    // forever) on machines where the 2300 cluster tool isn't present.
+    const ABANDON_2300_MS = 60000;
+    let abandon2300Timer = null;
+    function is2300Backend(name) {
+        return typeof name === 'string' && name.startsWith('2300-');
+    }
+    function abandonUnconnected2300Backends() {
+        abandon2300Timer = null;
+        let changed = false;
+        for (const b of BACKENDS) {
+            if (!is2300Backend(b.name)) continue;
+            // Keep any 2300 backend that has connected (or is connected
+            // right now) \u2014 the deadline is only about establishing a
+            // connection at least once.
+            if (mcpRunning[b.name] || mcpEverConnected.has(b.name)) continue;
+            if (mcpAbandoned.has(b.name)) continue;
+            mcpAbandoned.add(b.name);
+            mcpReachable.delete(b.name);
+            changed = true;
+            orbitLog(`[orbit] abandoning ${b.name}: no MCP connection within ` +
+                `${ABANDON_2300_MS / 1000}s of start; removing from panel and halting reconnect`);
+        }
+        if (!changed) return;
+        // Re-query the MCP definition provider (drops the abandoned
+        // servers from VS Code's list) and refresh the Orbit panel
+        // (drops their checkbox rows). The retry loop will settle on
+        // its next tick since allBackends() no longer includes them.
+        if (mcpDefinitionsChanged) { try { mcpDefinitionsChanged.fire(); } catch (_) {} }
+        if (orbitTreeChangeFire) { try { orbitTreeChangeFire(); } catch (_) {} }
+    }
+    function armAbandon2300Timer() {
+        if (abandon2300Timer) return;
+        abandon2300Timer = setTimeout(abandonUnconnected2300Backends, ABANDON_2300_MS);
+    }
+    function clearAbandon2300Timer() {
+        if (abandon2300Timer) { clearTimeout(abandon2300Timer); abandon2300Timer = null; }
+    }
+    // Un-abandon every 2300 backend and re-arm a fresh one-minute
+    // window. Called on orbit.start so a manual restart gives the 2300
+    // backends another chance to connect.
+    function resetAbandon2300() {
+        clearAbandon2300Timer();
+        if (mcpAbandoned.size) {
+            mcpAbandoned.clear();
+            if (mcpDefinitionsChanged) { try { mcpDefinitionsChanged.fire(); } catch (_) {} }
+            if (orbitTreeChangeFire) { try { orbitTreeChangeFire(); } catch (_) {} }
+        }
+        armAbandon2300Timer();
+    }
+
     function scheduleBackendActivationRetries() {
+        // Begin the one-minute abandonment countdown when we start
+        // trying to connect (extension activation or orbit.start).
+        armAbandon2300Timer();
         if (activateBackendsTimer) return;
         let attempt = 0;
         const tick = async () => {
@@ -3955,6 +4039,9 @@ module.exports = function (vscode) {
                 mcpEnabled = true;
                 if (mcpDefinitionsChanged) mcpDefinitionsChanged.fire();
             }
+            // A manual start gives the 2300 backends a fresh one-minute
+            // window to connect before they're abandoned again.
+            resetAbandon2300();
             // Best-effort: start every reachable Orbit MCP backend so
             // the user doesn't have to do it by hand. The retry
             // scheduler picks up any backend that wasn't yet reachable
@@ -4069,6 +4156,9 @@ module.exports = function (vscode) {
             // A full teardown clears any per-server user-stop intent;
             // the next orbit.start should bring every backend back up.
             mcpUserStopped.clear();
+            // Stop the pending abandonment countdown; orbit.start
+            // re-arms a fresh one.
+            clearAbandon2300Timer();
             if (mcpEnabled) {
                 mcpEnabled = false;
                 if (mcpDefinitionsChanged) mcpDefinitionsChanged.fire();
@@ -4297,8 +4387,9 @@ module.exports = function (vscode) {
                 // has a live MCP client connection (not stale
                 // vscode.lm.tools entries from a previous session).
                 const servers = orbitRunning
-                    ? await Promise.all(mcpServerControls().map(async (s) => {
+                    ? (await Promise.all(mcpServerControls().map(async (s) => {
                         if (mcpRunning[s.name]) {
+                            mcpEverConnected.add(s.name);
                             return { name: s.name, running: true };
                         }
                         // Respect an explicit user stop: report it as
@@ -4312,9 +4403,17 @@ module.exports = function (vscode) {
                         const connected = await isMcpServerConnected(s.name);
                         if (connected) {
                             mcpRunning[s.name] = true;
+                            mcpEverConnected.add(s.name);
                         }
                         return { name: s.name, running: connected };
-                    }))
+                    })))
+                        // Hide servers that have never connected this
+                        // run, so the panel list starts empty and each
+                        // server only appears once it first connects.
+                        // Ones that connected and later dropped (or were
+                        // user-stopped) stay visible so they remain
+                        // toggleable.
+                        .filter(s => s.running || mcpEverConnected.has(s.name))
                     : [];
                 if (mySeq !== postStateSeq) return;
                 if (!currentWebviewView) return;
@@ -4435,6 +4534,8 @@ module.exports = function (vscode) {
 </head>
 <body>
   <div class="summary">Orbit pair-programs Smalltalk with you.</div>
+  <hr id="hr-toggle-top">
+  <button id="orbit-toggle" class="footer-button">Start Orbit</button>
   <hr id="hr-mcp">
   <div id="mcp-section-label" class="section-label">MCP servers</div>
   <div id="servers"></div>
@@ -4451,6 +4552,7 @@ module.exports = function (vscode) {
   <div id="memory-section-label" class="section-label">agentic memory</div>
   <div id="memory-view-row" class="server">
     <button id="keep-view-btn" class="view-btn">view</button>
+    <span class="name">memory graph</span>
   </div>
   <div id="memory-row" class="server">
     <input type="checkbox" id="memory-toggle">
@@ -4489,8 +4591,6 @@ module.exports = function (vscode) {
     <button id="release-notes-view-btn" class="view-btn">view</button>
     <span class="name">changes in this release</span>
   </div>
-  <hr id="hr-bottom">
-  <button id="orbit-toggle" class="footer-button">Start Orbit</button>
 
 <script nonce="${nonce}">
   const vscode = acquireVsCodeApi();
@@ -4611,7 +4711,7 @@ module.exports = function (vscode) {
     document.getElementById('hr-release-notes').style.display = showReleaseNotes ? '' : 'none';
     document.getElementById('release-notes-section-label').style.display = showReleaseNotes ? '' : 'none';
     document.getElementById('release-notes-view-row').style.display = showReleaseNotes ? '' : 'none';
-    document.getElementById('hr-bottom').style.display = state.orbitRunning ? '' : 'none';
+    document.getElementById('hr-toggle-top').style.display = state.orbitRunning ? '' : 'none';
     serversEl.innerHTML = '';
     for (const s of state.servers) {
       const row = document.createElement('div');

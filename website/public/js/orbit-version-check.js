@@ -5,10 +5,11 @@
 // On a fresh page (no record): records sizes silently; the squeak IDB is
 // either empty or about to be populated by SqueakJS.
 // On a load where sizes match: does nothing.
-// On a load where sizes differ: shows an in-page modal asking whether to
-// erase the local "squeak" IndexedDB. On confirm, deletes the DB and
-// records the new sizes. On decline, leaves both alone (so the user is
-// asked again next reload).
+// On a load where sizes differ: erases the local "squeak" IndexedDB and
+// records the new sizes, so the updated extension's image boots. No
+// prompt: any user-modified image was already saved by the boot-time
+// backup (js/orbit-idb-backup.js), which squeak.html runs before this
+// check.
 
 (function () {
   const ZIP_URL = 'memories/caffeine.zip';
@@ -57,45 +58,6 @@
     });
   }
 
-  function showModal() {
-    return new Promise(resolve => {
-      const overlay = document.createElement('div');
-      overlay.style.cssText =
-        'position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:99999;' +
-        'display:flex;align-items:center;justify-content:center;' +
-        'font-family:sans-serif;';
-      const box = document.createElement('div');
-      box.style.cssText =
-        'background:#222;color:#eee;padding:20px 24px;border-radius:8px;' +
-        'max-width:560px;box-shadow:0 4px 24px rgba(0,0,0,0.5);';
-      const msg = document.createElement('div');
-      msg.style.cssText = 'margin-bottom:16px;line-height:1.4;';
-      msg.textContent =
-        "The Orbit extension has been updated, and you've made changes " +
-        "to its webapp. Would you like to keep them?";
-      const btnBar = document.createElement('div');
-      btnBar.style.cssText = 'text-align:right;';
-      const no = document.createElement('button');
-      no.textContent = 'No';
-      no.style.cssText =
-        'margin-left:8px;padding:6px 14px;background:#c33;color:white;' +
-        'border:0;border-radius:4px;cursor:pointer;';
-      const yes = document.createElement('button');
-      yes.textContent = 'Yes';
-      yes.style.cssText =
-        'margin-left:8px;padding:6px 14px;background:#444;color:white;' +
-        'border:0;border-radius:4px;cursor:pointer;';
-      // "keep" === true means user wants to keep their local changes.
-      yes.onclick = () => { overlay.remove(); resolve(true); };
-      no.onclick = () => { overlay.remove(); resolve(false); };
-      btnBar.append(no, yes);
-      box.append(msg, btnBar);
-      overlay.append(box);
-      document.body.append(overlay);
-      yes.focus();
-    });
-  }
-
   async function check() {
     let newSizes;
     try {
@@ -120,31 +82,12 @@
     const changed = TRACKED.some(n => recorded[n] !== newSizes[n]);
     if (!changed) return;
 
-    const keep = await showModal();
-
-    if (keep) {
-      // Record the new sizes so we don't re-prompt on every reload after
-      // the user has chosen to keep their local image. The next time the
-      // zip sizes change (i.e. another extension update), we'll prompt
-      // again.
-      try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(newSizes));
-      } catch (e) {
-        console.warn('[orbit-version-check] could not record sizes', e);
-      }
-      console.log('[orbit-version-check] user kept local changes; leaving DB intact, recorded new sizes', newSizes);
-      try {
-        window.open('http://localhost:8089/files.html', '_blank');
-      } catch (e) {
-        console.warn('[orbit-version-check] could not open files.html', e);
-      }
-      return;
-    }
-
+    // Any user-modified image was already saved by the boot-time backup.
     try {
       await deleteIDB(DB_NAME);
       localStorage.setItem(STORAGE_KEY, JSON.stringify(newSizes));
-      console.log('[orbit-version-check] erased', DB_NAME,
+      console.log('[orbit-version-check] extension updated: erased', DB_NAME,
+                  '(previous contents are in the latest workspace backup)',
                   '; recorded new sizes', newSizes);
     } catch (e) {
       console.error('[orbit-version-check] failed to erase DB', e);

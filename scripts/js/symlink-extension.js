@@ -44,6 +44,8 @@ function symlinkExtension(extDir, website) {
     );
     symlink(path.join(srcCss, 'caffeine.css'), path.join(dstCss, 'caffeine.css'), 'css/caffeine.css');
 
+    symlink(path.join(website, 'RELEASE-NOTES.md'), path.join(extDir, 'RELEASE-NOTES.md'), 'RELEASE-NOTES.md');
+
     // Shim app.js
     const appShim = `// Auto-generated shim — see build-extension.js\nlet vscode = null;\ntry { vscode = require('vscode'); } catch (_) {}\nmodule.exports = require('${website}/app-impl.js')(vscode);\n`;
     fs.writeFileSync(path.join(extDir, 'app.js'), appShim);

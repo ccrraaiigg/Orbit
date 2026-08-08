@@ -18,6 +18,9 @@ logs/
 commentary/
 audit/
 
+# Boot-time IndexedDB backups (see js/orbit-idb-backup.js)
+backups/
+
 # Keep sync local state
 .keep-sync-peer-tokens.json
 .keep-sync-machine-id
@@ -25,3 +28,6 @@ audit/
 
 # Local secrets (e.g. keep-sync GitHub token) — never commit.
 secrets/
+
+# locally-persisted Orbit info, including the local Keep Store
+.orbit/

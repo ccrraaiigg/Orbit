@@ -2,6 +2,11 @@
 //
 // caffeine-export-sink.js
 //
+// SUPERSEDED (v1.268.0): the Orbit webserver now has this sink built
+// in as POST /export-memory?name=… (see website/app-impl.js). Keep
+// this standalone script only as a fallback for installed extensions
+// that predate that route.
+//
 // Loopback HTTP sink used when refreshing the Caffeine memory before a
 // build (see the "always refresh the Caffeine memory before building"
 // section of .github/copilot-instructions.md). Start it, then have the
